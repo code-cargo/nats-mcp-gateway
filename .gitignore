@@ -1,0 +1,4 @@
+bin/
+test-results*.xml
+*.test
+.DS_Store
