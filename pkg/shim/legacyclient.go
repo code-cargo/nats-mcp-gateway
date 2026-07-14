@@ -1,0 +1,165 @@
+//   Copyright 2026 BoxBuild Inc DBA CodeCargo
+//
+//   Licensed under the Apache License, Version 2.0 (the "License");
+//   you may not use this file except in compliance with the License.
+//   You may obtain a copy of the License at
+//
+//       http://www.apache.org/licenses/LICENSE-2.0
+//
+//   Unless required by applicable law or agreed to in writing, software
+//   distributed under the License is distributed on an "AS IS" BASIS,
+//   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//   See the License for the specific language governing permissions and
+//   limitations under the License.
+
+package shim
+
+import (
+	"context"
+	"encoding/json"
+	"time"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
+)
+
+// legacyClient is the mirror-image compat wing at the client edge: engaged
+// automatically when the client's first request is `initialize` (every
+// 2025-11-25 client, Claude Code included). It answers the legacy handshake
+// locally from server/discover, absorbs the legacy methods the modern wire
+// has no home for (ping, logging/setLevel), and injects the three required
+// _meta keys on everything that goes over NATS. This is what upholds
+// "2026-07-28 only on the wire".
+type legacyClient struct {
+	clientInfo json.RawMessage // from initialize params, echoed into _meta
+	clientCaps json.RawMessage
+}
+
+const discoverTimeout = 30 * time.Second
+
+// engageLegacy handles the initialize request that triggered legacy mode.
+func (s *Shim) engageLegacy(ctx context.Context, msg *jsonrpc.Message) {
+	var p struct {
+		ClientInfo   json.RawMessage `json:"clientInfo"`
+		Capabilities json.RawMessage `json:"capabilities"`
+	}
+	_ = json.Unmarshal(msg.Params, &p)
+	s.legacy = &legacyClient{clientInfo: p.ClientInfo, clientCaps: p.Capabilities}
+	s.log.Info("legacy client detected, bridging initialize to server/discover")
+
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.answerInitialize(ctx, msg.ID)
+	}()
+}
+
+// answerInitialize calls server/discover over the wire and translates its
+// DiscoverResult into the InitializeResult the legacy client expects.
+func (s *Shim) answerInitialize(ctx context.Context, initID json.RawMessage) {
+	ctx, cancel := context.WithTimeout(ctx, discoverTimeout)
+	defer cancel()
+
+	params, _ := json.Marshal(map[string]any{
+		"_meta": map[string]string{mcpspec.MetaProtocolVersion: mcpspec.ProtocolVersion},
+	})
+	body, _ := jsonrpc.Encode(jsonrpc.NewRequest("shim-discover", mcpspec.MethodDiscover, params))
+	stream, err := s.wc.Do(ctx, &wire.Request{
+		Server:          s.cfg.Server,
+		Method:          mcpspec.MethodDiscover,
+		ProtocolVersion: mcpspec.ProtocolVersion,
+		Body:            body,
+	})
+	if err != nil {
+		s.writeLocalError(initID, err)
+		return
+	}
+
+	var terminal wire.Frame
+	for f := range stream.C {
+		terminal = f
+	}
+	switch {
+	case terminal.Err != nil:
+		s.writeError(initID, terminal.Err.Code, terminal.Err.Message)
+		return
+	case terminal.Kind != wire.FrameEnd || len(terminal.Body) == 0:
+		s.writeError(initID, jsonrpc.CodeInternalError, "server/discover yielded no response")
+		return
+	}
+	resp, err := jsonrpc.Decode(terminal.Body)
+	if err != nil || resp.Error != nil {
+		if resp != nil && resp.Error != nil {
+			s.writeError(initID, resp.Error.Code, resp.Error.Message)
+		} else {
+			s.writeError(initID, jsonrpc.CodeInternalError, "bad server/discover response")
+		}
+		return
+	}
+
+	var d struct {
+		Capabilities json.RawMessage `json:"capabilities"`
+		ServerInfo   json.RawMessage `json:"serverInfo"`
+		Instructions json.RawMessage `json:"instructions"`
+	}
+	if err := json.Unmarshal(resp.Result, &d); err != nil {
+		s.writeError(initID, jsonrpc.CodeInternalError, "bad DiscoverResult")
+		return
+	}
+	// DiscoverResult -> InitializeResult is nearly field-for-field; the
+	// protocolVersion is the LEGACY one because that is the face this edge
+	// presents.
+	init := map[string]any{
+		"protocolVersion": mcpspec.LegacyProtocolVersion,
+		"capabilities":    orEmptyObject(d.Capabilities),
+		"serverInfo":      orEmptyObject(d.ServerInfo),
+	}
+	if len(d.Instructions) > 0 {
+		init["instructions"] = d.Instructions
+	}
+	raw, _ := json.Marshal(init)
+	respBody, err := jsonrpc.Encode(jsonrpc.NewResponse(initID, raw))
+	if err != nil {
+		return
+	}
+	s.writeLine(respBody)
+}
+
+// interceptLegacyRequest answers requests the modern wire cannot carry.
+// Returns true if the request was fully handled locally.
+func (s *Shim) interceptLegacyRequest(msg *jsonrpc.Message) bool {
+	switch msg.Method {
+	case mcpspec.MethodPing, mcpspec.MethodLoggingSetLevel:
+		// ping: removed in 2026-07-28, but legacy clients health-check with
+		// it constantly — forwarding would turn every check into
+		// method-not-found. setLevel: no modern equivalent.
+		body, err := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, nil))
+		if err == nil {
+			s.writeLine(body)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+// legacyMeta returns the _meta entries to inject on every outbound request.
+func (l *legacyClient) legacyMeta() map[string]json.RawMessage {
+	verRaw, _ := json.Marshal(mcpspec.ProtocolVersion)
+	m := map[string]json.RawMessage{mcpspec.MetaProtocolVersion: verRaw}
+	if len(l.clientInfo) > 0 {
+		m[mcpspec.MetaClientInfo] = l.clientInfo
+	}
+	if len(l.clientCaps) > 0 {
+		m[mcpspec.MetaClientCapabilities] = l.clientCaps
+	}
+	return m
+}
+
+func orEmptyObject(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	return raw
+}
