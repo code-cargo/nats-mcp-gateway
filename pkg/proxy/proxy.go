@@ -21,6 +21,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync/atomic"
+	"time"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
@@ -41,11 +43,45 @@ func New(pool *backend.Pool, log *slog.Logger) *Proxy {
 	return &Proxy{pool: pool, log: log}
 }
 
-// Handler returns the wire.Handler for this proxy.
+// Handler returns the wire.Handler for this proxy. Every request logs one
+// summary line on completion — the gateway is a policy plane, and a request
+// crossing it should be visible.
 func (p *Proxy) Handler() wire.Handler {
 	return func(ctx context.Context, in *wire.Inbound, w wire.StreamWriter) error {
+		start := time.Now()
+		var notifications atomic.Int64
+		outcome := "ok"
+		var errCode int
+
+		reqLog := p.log.With(
+			"tenant", in.Subject.Tenant,
+			"server", in.Subject.Server,
+			"method", in.Subject.Method,
+		)
+		if in.Header.Get(wire.HeaderName) != "" {
+			reqLog = reqLog.With("name", in.Header.Get(wire.HeaderName))
+		}
+		defer func() {
+			attrs := []any{
+				"outcome", outcome,
+				"duration", time.Since(start).Round(time.Millisecond).String(),
+			}
+			if n := notifications.Load(); n > 0 {
+				attrs = append(attrs, "notifications", n)
+			}
+			if errCode != 0 {
+				attrs = append(attrs, "code", errCode)
+			}
+			reqLog.Info("request", attrs...)
+		}()
+		fail := func(code int, message string, data any) error {
+			outcome, errCode = "error", code
+			return w.Err(code, message, data)
+		}
+
 		if cerr := Check(in); cerr != nil {
-			return w.Err(cerr.Code, cerr.Message, cerr.Data)
+			reqLog.Warn("integrity check rejected request", "reason", cerr.Message)
+			return fail(cerr.Code, cerr.Message, cerr.Data)
 		}
 
 		key := backend.Key{
@@ -55,9 +91,10 @@ func (p *Proxy) Handler() wire.Handler {
 		mux, release, err := p.pool.Get(ctx, key)
 		if err != nil {
 			if ctx.Err() != nil {
+				outcome = "cancelled"
 				return nil // cancelled while waiting: wrapper writes the empty end
 			}
-			return w.Err(wire.ErrCodeStreamLost, err.Error(), nil)
+			return fail(wire.ErrCodeStreamLost, err.Error(), nil)
 		}
 		defer release()
 
@@ -69,7 +106,10 @@ func (p *Proxy) Handler() wire.Handler {
 			if err := w.Msg(body); err != nil {
 				p.log.Warn("dropping notification", "err", err,
 					"server", key.Server, "tenant", key.Tenant)
+				return
 			}
+			notifications.Add(1)
+			reqLog.Debug("notification forwarded", "notif_method", n.Method)
 		}
 
 		resp, err := mux.Call(ctx, in.Msg, notify)
@@ -77,16 +117,22 @@ func (p *Proxy) Handler() wire.Handler {
 		case err == nil:
 			body, encErr := jsonrpc.Encode(resp)
 			if encErr != nil {
-				return w.Err(jsonrpc.CodeInternalError, "response encoding failed", nil)
+				return fail(jsonrpc.CodeInternalError, "response encoding failed", nil)
+			}
+			if resp.Error != nil {
+				// The backend answered with a JSON-RPC error: forwarded
+				// verbatim, but worth distinguishing in the summary line.
+				outcome, errCode = "backend-error", resp.Error.Code
 			}
 			return w.End(body)
 		case ctx.Err() != nil:
+			outcome = "cancelled"
 			return nil // cancelled or draining: the wire wrapper terminates
 		case errors.Is(err, backend.ErrConnDead):
-			return w.Err(wire.ErrCodeStreamLost,
+			return fail(wire.ErrCodeStreamLost,
 				"backend connection lost mid-request, re-issue the request", nil)
 		default:
-			return w.Err(wire.ErrCodeStreamLost, err.Error(), nil)
+			return fail(wire.ErrCodeStreamLost, err.Error(), nil)
 		}
 	}
 }

@@ -111,6 +111,7 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 		dead:    make(chan struct{}),
 		workDir: workDir,
 	}
+	c.log.Info("backend subprocess started", "args", b.Args)
 	go c.stdoutLoop(stdout)
 	go c.stderrLoop(stderr)
 	go c.waitLoop()
@@ -193,6 +194,8 @@ func (c *stdioConn) waitLoop() {
 		}
 		c.ringMu.Unlock()
 		c.log.Warn("backend subprocess exited", "err", err, "stderr_tail", tail)
+	} else {
+		c.log.Info("backend subprocess exited cleanly")
 	}
 	_ = os.RemoveAll(c.workDir)
 }

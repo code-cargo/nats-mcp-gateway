@@ -107,6 +107,67 @@ point; clients never see backend secrets. Set `max_payload: 8MB` on the NATS
 server: MCP results carry base64 blobs, and oversize messages fail with a
 legible `-32012` instead of a hang.
 
+## Config sources / hot reload
+
+The **server set reloads at runtime** — add, remove, or re-credential a fronted
+MCP server without restarting the gateway. (The NATS connection, subject
+prefix, and queue group are fixed at boot; only servers reload.) Reloads are
+safe: a malformed revision is rejected and the last good config keeps serving,
+a removed server stops answering (clients get `-32011` and re-issue), and a
+changed server's pooled processes are evicted so the next call spawns from the
+new definition. In-flight calls on a removed/changed server fail retryably
+(`-32010`); unchanged servers are never disturbed.
+
+Config comes from a **source**, selected by flag:
+
+```
+natsmcp gateway --config /etc/natsmcp.json          # file; SIGHUP or poll reloads
+natsmcp gateway --config-subject mcp.v1.cfg.request # fetch over NATS request/reply
+```
+
+- **File** (`--config`, `--reload-interval` default 10s): re-reads on change and
+  on `SIGHUP`. Good for demos and simple deployments. On K8s, a ConfigMap mount
+  updates atomically, so polling picks it up.
+- **NATS fetch** (`--config-subject`, `--config-events-subject`,
+  `--config-refetch`): requests the config JSON over NATS and re-fetches when a
+  change event is published (with a periodic re-fetch as the missed-event safety
+  net). Secrets stay in the controller and ride only the authenticated NATS
+  connection — nothing at rest in a ConfigMap or KV bucket. **Controller
+  contract:** respond to the request subject with the same config JSON the file
+  source parses, and publish any message to the events subject on change; NATS
+  permissions fence both subjects to the controller.
+
+### Reloading from something else
+
+The reload machinery is a small building block, not a fixed pair of modes. The
+whole extension surface is one interface in `pkg/configsource`:
+
+```go
+type Source interface { Watch(ctx context.Context) <-chan Update }
+```
+
+Three ways to hot-reload from a new backend, cheapest first:
+
+1. **Use a built-in** — `configsource.NewFile(...)` or `&configsource.NATS{...}`.
+2. **Wrap a fetch function** with `configsource.Poll` — for HTTP, Vault, a KV
+   store, S3, a database. You write one fetch; change-detection, the initial
+   load, and lifecycle come for free:
+   ```go
+   src := configsource.Poll(30*time.Second, func(ctx context.Context) (*config.Config, error) {
+       raw, err := fetchFromVault(ctx)
+       if err != nil { return nil, err }
+       return config.Parse(raw)
+   })
+   ```
+3. **Implement `Source`** — for push systems (a Kubernetes informer, a webhook)
+   that already know when config changed. Wrap it in `configsource.Dedup` to
+   suppress no-op emissions.
+
+`pkg/reconcile.Reconciler` is the source-agnostic engine that applies a config
+to the running wire + pool; `configsource.Run` is the consume loop that keeps
+the last good config live on error. An embedder can drive `Reconciler.Apply`
+from its own control loop and skip `Source` entirely.
+
 Client side (`.mcp.json`):
 
 ```json

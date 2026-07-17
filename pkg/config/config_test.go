@@ -60,7 +60,6 @@ func TestLoadRejects(t *testing.T) {
 		content string
 		wantIn  string
 	}{
-		{"no servers", `{"nats":{}}`, "no servers"},
 		{"bad server name", `{"servers":{"bad name":{"command":"x"}}}`, "not subject-token safe"},
 		{"bad protocol", `{"servers":{"s":{"command":"x","protocol":"2024-01-01"}}}`, "unknown protocol"},
 		{"stdio without command", `{"servers":{"s":{"transport":"stdio"}}}`, "requires command"},
@@ -75,4 +74,19 @@ func TestLoadRejects(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.wantIn)
 		})
 	}
+}
+
+// An empty server set is the valid steady state of a gateway whose servers
+// have all been removed via reload — Parse must accept it.
+func TestParseEmptyServersValid(t *testing.T) {
+	cfg, err := Parse([]byte(`{"nats":{"url":"nats://x:4222"}}`))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.ServerNames())
+}
+
+// Parse and Load share one validator: the same bytes fail identically.
+func TestParseRejectsSameAsLoad(t *testing.T) {
+	_, err := Parse([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown transport")
 }

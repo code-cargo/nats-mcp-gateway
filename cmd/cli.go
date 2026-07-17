@@ -15,6 +15,8 @@
 package cmd
 
 import (
+	"time"
+
 	"github.com/alecthomas/kong"
 )
 
@@ -34,9 +36,24 @@ type CLI struct {
 	Call    CallCmd    `cmd:"" help:"Send a single MCP request over NATS and print the reply frames (debug)."`
 }
 
-// GatewayCmd runs the gateway process.
+// GatewayCmd runs the gateway process. Its config comes from exactly one
+// source: a local file (--config) or over NATS request/reply
+// (--config-subject). Either way, only the SERVER SET reloads at runtime; the
+// NATS connection, subject prefix, and queue group are fixed at boot.
 type GatewayCmd struct {
-	Config string `help:"Path to gateway config JSON." required:"" type:"existingfile" env:"NATSMCP_CONFIG"`
+	// File source.
+	Config         string        `help:"Path to gateway config JSON (file source; SIGHUP reloads)." type:"existingfile" env:"NATSMCP_CONFIG" xor:"source"`
+	ReloadInterval time.Duration `help:"File source: poll interval for change detection (0 disables polling)." default:"10s" env:"NATSMCP_RELOAD_INTERVAL"`
+
+	// NATS fetch source. Connection params come from flags here, because the
+	// gateway must connect before it can fetch its config.
+	ConfigSubject       string        `help:"NATS subject to request config JSON from (fetch source)." env:"NATSMCP_CONFIG_SUBJECT" xor:"source"`
+	ConfigEventsSubject string        `help:"NATS subject that signals a config change (fetch source)." default:"mcp.v1.cfg.changed" env:"NATSMCP_CONFIG_EVENTS_SUBJECT"`
+	ConfigRefetch       time.Duration `help:"Fetch source: periodic re-fetch as the missed-event safety net." default:"60s" env:"NATSMCP_CONFIG_REFETCH"`
+	NatsURL             string        `help:"NATS URL (fetch source)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
+	NatsCreds           string        `help:"NATS credentials file (fetch source)." env:"NATSMCP_NATS_CREDS"`
+	SubjectPrefix       string        `help:"Wire subject prefix (fetch source)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
+	QueueGroup          string        `help:"Wire queue group (fetch source)." default:"mcpgw" env:"NATSMCP_QUEUE_GROUP"`
 
 	// Version is injected by main.
 	Version string `kong:"-"`

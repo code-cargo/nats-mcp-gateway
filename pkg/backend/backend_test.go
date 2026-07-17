@@ -223,6 +223,48 @@ func TestPoolTenantIsolation(t *testing.T) {
 	assert.NotEqual(t, pidA1, pidB, "different tenants must never share a process")
 }
 
+func TestEvictServer(t *testing.T) {
+	p := NewPool(PoolConfig{}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	pidOf := func(server, tenant string) float64 {
+		mux, release, err := p.Get(context.Background(), Key{Server: server, Tenant: tenant})
+		require.NoError(t, err)
+		defer release()
+		resp, err := mux.Call(context.Background(), callTool("i", "echo", `{}`, ""), nil)
+		require.NoError(t, err)
+		var r struct {
+			PID float64 `json:"pid"`
+		}
+		require.NoError(t, json.Unmarshal(resp.Result, &r))
+		return r.PID
+	}
+
+	// Two servers, one with two tenants: evicting "a" must drop both of a's
+	// processes and leave b's untouched.
+	a1 := pidOf("a", "acme")
+	a2 := pidOf("a", "bravo")
+	b := pidOf("b", "acme")
+
+	// Hold a live mux for server a to prove in-flight calls fail on evict.
+	mux, release, err := p.Get(context.Background(), Key{Server: "a", Tenant: "acme"})
+	require.NoError(t, err)
+	defer release()
+
+	p.EvictServer("a")
+
+	// In-flight mux is now closed.
+	_, err = mux.Call(context.Background(), callTool("x", "echo", `{}`, ""), nil)
+	require.Error(t, err, "evicted server's live mux must fail")
+
+	// b is untouched (same pid, same process).
+	assert.Equal(t, b, pidOf("b", "acme"), "unrelated server must survive eviction")
+
+	// a respawns fresh for both tenants (new pids).
+	assert.NotEqual(t, a1, pidOf("a", "acme"), "evicted server must respawn")
+	assert.NotEqual(t, a2, pidOf("a", "bravo"), "evicted server must respawn per tenant")
+}
+
 func TestPoolTenantQuota(t *testing.T) {
 	p := NewPool(PoolConfig{MaxProcsPerTenant: 2}, poolFactory, nil)
 	t.Cleanup(p.Shutdown)

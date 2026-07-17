@@ -1,0 +1,21 @@
+{
+  "nats": {
+    "url": "nats://gateway:gateway@127.0.0.1:4222"
+  },
+  "servers": {
+    "everything": {
+      "protocol": "2025-11-25",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-everything"],
+      "env": { "npm_config_cache": "/tmp/natsmcp-npm-cache" }
+    },
+    "filesystem": {
+      "protocol": "2025-11-25",
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp/natsmcp-demo"],
+      "env": { "npm_config_cache": "/tmp/natsmcp-npm-cache" }
+    }
+  }
+}

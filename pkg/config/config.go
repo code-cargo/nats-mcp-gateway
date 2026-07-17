@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
@@ -72,12 +73,28 @@ type Pool struct {
 	MaxLifetime       string `json:"maxLifetime"`
 }
 
-// Load reads, env-expands, parses, and validates a config file.
+// Load reads a config file and parses it. It is a thin wrapper over Parse so
+// the file source and any over-the-wire source share one validator.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
+	cfg, err := Parse(raw)
+	if err != nil {
+		return nil, fmt.Errorf("config: %s: %w", path, err)
+	}
+	return cfg, nil
+}
+
+// Parse env-expands (${VAR} from the process environment), decodes, and
+// validates config bytes. Every config source funnels through here, so a
+// malformed config is rejected identically no matter where it came from —
+// which is what lets a reload keep serving the last good config on error.
+//
+// A config with zero servers is valid: it is the legitimate steady state of a
+// gateway whose servers have all been removed.
+func Parse(raw []byte) (*Config, error) {
 	expanded := os.Expand(string(raw), func(key string) string {
 		return os.Getenv(key)
 	})
@@ -85,18 +102,15 @@ func Load(path string) (*Config, error) {
 	dec := json.NewDecoder(strings.NewReader(expanded))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&cfg); err != nil {
-		return nil, fmt.Errorf("config: parse %s: %w", path, err)
+		return nil, fmt.Errorf("parse: %w", err)
 	}
 	if err := cfg.validate(); err != nil {
-		return nil, fmt.Errorf("config: %s: %w", path, err)
+		return nil, err
 	}
 	return &cfg, nil
 }
 
 func (c *Config) validate() error {
-	if len(c.Servers) == 0 {
-		return fmt.Errorf("no servers configured")
-	}
 	for name, s := range c.Servers {
 		if !wire.TokenSafe(name) {
 			return fmt.Errorf("server name %q is not subject-token safe (%s)", name, `A-Za-z0-9_-`)
@@ -122,11 +136,13 @@ func (c *Config) validate() error {
 	return nil
 }
 
-// ServerNames returns the configured server names.
+// ServerNames returns the configured server names, sorted, so callers (the
+// wire's initial server set, reload logs) see a deterministic order.
 func (c *Config) ServerNames() []string {
 	names := make([]string, 0, len(c.Servers))
 	for name := range c.Servers {
 		names = append(names, name)
 	}
+	sort.Strings(names)
 	return names
 }

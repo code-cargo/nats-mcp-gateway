@@ -244,8 +244,37 @@ func (p *Pool) reap() {
 		idle := e.inflight == 0 && now.Sub(e.lastUsed) > p.cfg.IdleTTL
 		old := e.inflight == 0 && now.Sub(e.born) > p.cfg.MaxLifetime
 		if dead || idle || old {
+			p.log.Info("reaping backend connection",
+				"server", k.Server, "tenant", k.Tenant,
+				"dead", dead, "idle", idle, "over_max_lifetime", old)
 			victims = append(victims, e.mux)
 			delete(p.entries, k)
+		}
+	}
+	p.mu.Unlock()
+	for _, m := range victims {
+		_ = m.Close()
+	}
+}
+
+// EvictServer closes every pooled connection for the named server (across all
+// tenants) and clears its circuit-breaker state. Used on config reload when a
+// server is removed or its definition changes: in-flight calls on those muxes
+// fail with ErrConnDead (the proxy maps that to ErrCodeStreamLost, and the
+// client re-issues), and the next Get spawns a fresh backend from the new
+// definition.
+func (p *Pool) EvictServer(server string) {
+	p.mu.Lock()
+	var victims []*Mux
+	for k, e := range p.entries {
+		if k.Server == server {
+			victims = append(victims, e.mux)
+			delete(p.entries, k)
+		}
+	}
+	for k := range p.broken {
+		if k.Server == server {
+			delete(p.broken, k)
 		}
 	}
 	p.mu.Unlock()

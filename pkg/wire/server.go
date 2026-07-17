@@ -85,20 +85,30 @@ type ServerConfig struct {
 	KeepAlive time.Duration
 }
 
-// Server is a running wire endpoint fleet member.
+// Server is a running wire endpoint fleet member. It runs one micro service
+// per fronted MCP server, so the set can be reconciled at runtime
+// (SetServers) — nats.go exposes Service.Stop but not per-endpoint removal,
+// so per-server services are how a server is dropped without a restart.
 type Server struct {
-	svc       micro.Service
-	nc        *nats.Conn
-	keepAlive time.Duration
+	nc         *nats.Conn
+	handler    Handler
+	prefix     string
+	queueGroup string
+	name       string
+	version    string
+	keepAlive  time.Duration
+
+	svcMu sync.Mutex
+	svcs  map[string]micro.Service // server name -> its micro service
 
 	base   context.Context
 	cancel context.CancelCauseFunc
 	wg     sync.WaitGroup
 }
 
-// Serve registers one micro endpoint per configured MCP server and starts
-// handling requests. Each request runs in its own goroutine; per-backend
-// concurrency limits belong to the backend pool, not the wire.
+// Serve starts the wire server with the given initial server set. Each
+// request runs in its own goroutine; per-backend concurrency limits belong to
+// the backend pool, not the wire.
 func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	if cfg.QueueGroup == "" {
 		cfg.QueueGroup = "mcpgw"
@@ -112,58 +122,101 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	if cfg.KeepAlive <= 0 {
 		cfg.KeepAlive = DefaultKeepAlive
 	}
-	if len(cfg.Servers) == 0 {
-		return nil, fmt.Errorf("wire: no servers configured")
-	}
-
-	base, cancel := context.WithCancelCause(context.Background())
-	s := &Server{nc: nc, keepAlive: cfg.KeepAlive, base: base, cancel: cancel}
-
-	svc, err := micro.AddService(nc, micro.Config{
-		Name:    cfg.Name,
-		Version: cfg.Version,
-	})
-	if err != nil {
-		cancel(nil)
-		return nil, fmt.Errorf("wire: add micro service: %w", err)
-	}
-	s.svc = svc
-
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = DefaultPrefix
 	}
-	for _, server := range cfg.Servers {
-		subject, err := EndpointSubject(prefix, server)
-		if err != nil {
-			_ = svc.Stop()
-			cancel(nil)
-			return nil, err
-		}
-		err = svc.AddEndpoint(
-			endpointName(server),
-			micro.HandlerFunc(func(req micro.Request) { s.dispatch(prefix, req, handler) }),
-			micro.WithEndpointSubject(subject),
-			micro.WithEndpointQueueGroup(cfg.QueueGroup),
-		)
-		if err != nil {
-			_ = svc.Stop()
-			cancel(nil)
-			return nil, fmt.Errorf("wire: add endpoint %q: %w", server, err)
-		}
+
+	base, cancel := context.WithCancelCause(context.Background())
+	s := &Server{
+		nc:         nc,
+		handler:    handler,
+		prefix:     prefix,
+		queueGroup: cfg.QueueGroup,
+		name:       cfg.Name,
+		version:    cfg.Version,
+		keepAlive:  cfg.KeepAlive,
+		svcs:       make(map[string]micro.Service),
+		base:       base,
+		cancel:     cancel,
+	}
+
+	if err := s.SetServers(cfg.Servers); err != nil {
+		_ = s.stopAllServices()
+		cancel(nil)
+		return nil, err
 	}
 	return s, nil
 }
 
-// endpointName maps a server name to a micro endpoint name (must satisfy
-// micro's name rules; our server tokens already do).
-func endpointName(server string) string { return "mcp-" + server }
+// SetServers reconciles the running micro services to exactly names: it stops
+// services for servers no longer present and starts one for each new server.
+// Existing services (unchanged servers) are left untouched, so their in-flight
+// requests are undisturbed. It is safe to call repeatedly while serving.
+//
+// A stopped service stops answering its subject, so a subsequent request to a
+// removed server hits NATS no-responders and the client sees ErrCodeNoGateway.
+// Removal does NOT cancel in-flight handlers — only Shutdown does.
+func (s *Server) SetServers(names []string) error {
+	desired := make(map[string]struct{}, len(names))
+	for _, n := range names {
+		desired[n] = struct{}{}
+	}
 
-// Shutdown drains: stop accepting requests, terminate every live stream with
-// ErrCodeStreamLost so clients re-issue immediately, then wait for handlers
-// up to ctx's deadline.
+	s.svcMu.Lock()
+	defer s.svcMu.Unlock()
+
+	for name, svc := range s.svcs {
+		if _, ok := desired[name]; !ok {
+			_ = svc.Stop()
+			delete(s.svcs, name)
+		}
+	}
+
+	for _, name := range names {
+		if _, ok := s.svcs[name]; ok {
+			continue
+		}
+		subject, err := EndpointSubject(s.prefix, name)
+		if err != nil {
+			return err
+		}
+		svc, err := micro.AddService(s.nc, micro.Config{
+			Name:    s.name + "-" + name,
+			Version: s.version,
+			Endpoint: &micro.EndpointConfig{
+				Subject:    subject,
+				Handler:    micro.HandlerFunc(func(req micro.Request) { s.dispatch(s.prefix, req, s.handler) }),
+				QueueGroup: s.queueGroup,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("wire: add service %q: %w", name, err)
+		}
+		s.svcs[name] = svc
+	}
+	return nil
+}
+
+// stopAllServices stops every running micro service.
+func (s *Server) stopAllServices() error {
+	s.svcMu.Lock()
+	defer s.svcMu.Unlock()
+	var errs []error
+	for name, svc := range s.svcs {
+		if err := svc.Stop(); err != nil {
+			errs = append(errs, err)
+		}
+		delete(s.svcs, name)
+	}
+	return errors.Join(errs...)
+}
+
+// Shutdown drains: stop accepting requests on every server, terminate every
+// live stream with ErrCodeStreamLost so clients re-issue immediately, then
+// wait for handlers up to ctx's deadline.
 func (s *Server) Shutdown(ctx context.Context) error {
-	err := s.svc.Stop()
+	err := s.stopAllServices()
 	s.cancel(errDraining)
 	done := make(chan struct{})
 	go func() {
