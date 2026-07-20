@@ -18,6 +18,8 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6
@@ -49,6 +51,8 @@ jobs:
       contents: read
       checks: write
     steps:
+      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - uses: actions/setup-go@v6

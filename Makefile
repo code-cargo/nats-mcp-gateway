@@ -1,15 +1,16 @@
 VERSION ?= develop
 GOARCH ?= $(shell go env GOARCH)
 
-# Common directories
-bin_dir := bin
-
-# Common build flags
-LDFLAGS := -w -s -X main.version=$(VERSION)
-
 ifdef CI_VERSION
 VERSION := $(CI_VERSION)
 endif
+
+# Common directories
+bin_dir := bin
+
+# Common build flags. Deferred (=) so $(VERSION) resolves at recipe time,
+# after any CI_VERSION override above — with := it would bake in "develop".
+LDFLAGS = -w -s -X main.version=$(VERSION)
 
 # Define color codes
 GREEN := \033[32m
