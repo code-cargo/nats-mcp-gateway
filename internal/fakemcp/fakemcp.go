@@ -16,7 +16,8 @@
 // binaries re-exec themselves into it (TestMain checks EnvFlag), so
 // subprocess tests need no separate build step.
 //
-// Tools: echo, slow (N progress notifications then a result), crash (exits
+// Tools: echo, env (returns one env var, for credential-injection
+// assertions), slow (N progress notifications then a result), crash (exits
 // mid-request), huge (returns > 1 MiB), wedge (never responds), sample
 // (initiates a server->client request, which the gateway must reject without
 // wedging this process).
@@ -202,6 +203,18 @@ func (s *server) handleToolCall(msg *jsonrpc.Message) {
 			"resultType": mcpspec.ResultTypeComplete,
 			"pid":        os.Getpid(),
 			"content":    []map[string]any{{"type": "text", "text": string(p.Arguments)}},
+		})
+	case "env":
+		// Returns one env var's value (arguments: {"name": "VAR"}), so tests
+		// can assert credential injection per process.
+		var args struct {
+			Name string `json:"name"`
+		}
+		_ = json.Unmarshal(p.Arguments, &args)
+		s.result(msg.ID, map[string]any{
+			"resultType": mcpspec.ResultTypeComplete,
+			"pid":        os.Getpid(),
+			"value":      os.Getenv(args.Name),
 		})
 	case "slow":
 		// Three progress notifications, then the result. Progress requires

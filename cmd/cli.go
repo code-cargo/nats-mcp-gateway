@@ -54,6 +54,8 @@ type GatewayCmd struct {
 	NatsCreds           string        `help:"NATS credentials file (fetch source)." env:"NATSMCP_NATS_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch source)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	QueueGroup          string        `help:"Wire queue group (fetch source)." default:"mcpgw" env:"NATSMCP_QUEUE_GROUP"`
+	ScopeTenant         string        `help:"Serve only this tenant's subjects (scoped/per-user pod mode; requires --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
+	ScopeUser           string        `help:"Serve only this user's subjects (scoped/per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 
 	// Version is injected by main.
 	Version string `kong:"-"`
@@ -70,6 +72,7 @@ type ShimCmd struct {
 	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
 	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
 	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
+	User          string `help:"User subject token for attribution ('_' if unset). Must match the token this caller's NATS creds are scoped to under per-user auth." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
 }
@@ -87,6 +90,7 @@ type CallCmd struct {
 	NatsURL string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
 	Creds   string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
 	Tenant  string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
+	User    string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
 }
 
 func (c *CallCmd) Run(g *Globals) error {

@@ -24,6 +24,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
@@ -42,6 +43,13 @@ type NATS struct {
 	CredsFile     string `json:"credsFile"`
 	SubjectPrefix string `json:"subjectPrefix"`
 	QueueGroup    string `json:"queueGroup"`
+	// Tenant/User, when set (always together), scope this instance to one
+	// caller: it binds {prefix}.req.{tenant}.{user}.{server}.> instead of
+	// the all-callers wildcard. This is the per-user pod shape — the
+	// instance fronts its servers for exactly one identity, typically with
+	// that identity's credentials injected into its environment.
+	Tenant string `json:"tenant"`
+	User   string `json:"user"`
 }
 
 // Server declares one fronted MCP server.
@@ -63,6 +71,109 @@ type Server struct {
 
 	// DiscoverTTLMs is served in DiscoverResult.ttlMs (default 300000).
 	DiscoverTTLMs int `json:"discoverTtlMs"`
+
+	// Auth selects how backend credentials are resolved (absent = static =
+	// env/headers above). Additive by design: an older gateway ignoring this
+	// field (the forward-compatible parse) runs the server with no resolved
+	// credentials — per-user modes keep secrets out of env/headers, so it
+	// fails closed rather than leaking a shared secret.
+	Auth *Auth `json:"auth"`
+}
+
+// Auth mode names. Modes marked per-user resolve a distinct credential per
+// caller; the rest resolve one credential shared by the server's callers.
+const (
+	AuthStatic                 = "static"                   // config env/headers (default)
+	AuthExec                   = "exec"                     // per-user: credential-helper command
+	AuthFile                   = "file"                     // mounted/rotated credentials file
+	AuthOAuthClientCredentials = "oauth-client-credentials" // RFC 6749 service identity
+	AuthOAuthTokenExchange     = "oauth-token-exchange"     // per-user: RFC 8693
+	AuthOAuthRefresh           = "oauth-refresh"            // per-user: refresh_token grant
+	AuthNATS                   = "nats"                     // per-user: controller over request/reply
+)
+
+// Auth configures a server's credential resolution (pkg/backend/cred). Only
+// the fields for the selected mode apply; per-user modes must not put user
+// secrets in the server's env/headers.
+type Auth struct {
+	Mode string `json:"mode"`
+
+	// exec mode.
+	Command string            `json:"command,omitempty"`
+	Args    []string          `json:"args,omitempty"`
+	Env     map[string]string `json:"env,omitempty"`
+
+	// file mode. Path may contain {tenant}/{user}/{server}; TTL (Go
+	// duration) applies when the file carries no expiresAt.
+	Path string `json:"path,omitempty"`
+	TTL  string `json:"ttl,omitempty"`
+
+	// oauth-* modes.
+	TokenURL         string `json:"tokenUrl,omitempty"`
+	ClientID         string `json:"clientId,omitempty"`
+	ClientSecret     string `json:"clientSecret,omitempty"`
+	Scope            string `json:"scope,omitempty"`
+	Audience         string `json:"audience,omitempty"`
+	SubjectTokenFile string `json:"subjectTokenFile,omitempty"` // oauth-token-exchange
+	SubjectTokenType string `json:"subjectTokenType,omitempty"` // oauth-token-exchange
+	RefreshTokenFile string `json:"refreshTokenFile,omitempty"` // oauth-refresh
+
+	// nats mode: subject prefix override (default "mcp.v1.cred").
+	Subject string `json:"subject,omitempty"`
+}
+
+// Dynamic reports whether credentials come from a resolver rather than the
+// server's static env/headers.
+func (a *Auth) Dynamic() bool {
+	return a != nil && a.Mode != "" && a.Mode != AuthStatic
+}
+
+// PerUser reports whether resolved credentials differ per caller — these
+// servers are pooled per user, the rest stay shared per tenant.
+func (a *Auth) PerUser() bool {
+	if a == nil {
+		return false
+	}
+	switch a.Mode {
+	case AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh:
+		return true
+	}
+	return false
+}
+
+// validate rejects unknown modes and missing per-mode parameters.
+func (a *Auth) validate(server string) error {
+	switch a.Mode {
+	case "", AuthStatic, AuthNATS:
+	case AuthExec:
+		if a.Command == "" {
+			return fmt.Errorf("server %q: auth mode %q requires command", server, a.Mode)
+		}
+	case AuthFile:
+		if a.Path == "" {
+			return fmt.Errorf("server %q: auth mode %q requires path", server, a.Mode)
+		}
+	case AuthOAuthClientCredentials:
+		if a.TokenURL == "" || a.ClientID == "" || a.ClientSecret == "" {
+			return fmt.Errorf("server %q: auth mode %q requires tokenUrl, clientId, clientSecret", server, a.Mode)
+		}
+	case AuthOAuthTokenExchange:
+		if a.TokenURL == "" || a.SubjectTokenFile == "" {
+			return fmt.Errorf("server %q: auth mode %q requires tokenUrl and subjectTokenFile", server, a.Mode)
+		}
+	case AuthOAuthRefresh:
+		if a.TokenURL == "" || a.ClientID == "" || a.RefreshTokenFile == "" {
+			return fmt.Errorf("server %q: auth mode %q requires tokenUrl, clientId, refreshTokenFile", server, a.Mode)
+		}
+	default:
+		return fmt.Errorf("server %q: unknown auth mode %q", server, a.Mode)
+	}
+	if a.TTL != "" {
+		if _, err := time.ParseDuration(a.TTL); err != nil {
+			return fmt.Errorf("server %q: auth ttl: %w", server, err)
+		}
+	}
+	return nil
 }
 
 // Pool mirrors backend.PoolConfig knobs.
@@ -73,8 +184,8 @@ type Pool struct {
 	MaxLifetime       string `json:"maxLifetime"`
 }
 
-// Load reads a config file and parses it. It is a thin wrapper over Parse so
-// the file source and any over-the-wire source share one validator.
+// Load reads a config FILE and parses it strictly (unknown fields are an
+// error), because a hand-authored file's typo should fail loudly.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -87,20 +198,40 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// Parse env-expands (${VAR} from the process environment), decodes, and
-// validates config bytes. Every config source funnels through here, so a
-// malformed config is rejected identically no matter where it came from —
-// which is what lets a reload keep serving the last good config on error.
+// Parse env-expands, decodes STRICTLY (unknown fields rejected), and
+// validates config bytes. Use for human-authored config (the file source),
+// where an unknown key almost certainly means a typo.
 //
 // A config with zero servers is valid: it is the legitimate steady state of a
 // gateway whose servers have all been removed.
 func Parse(raw []byte) (*Config, error) {
+	return parse(raw, true)
+}
+
+// ParseForwardCompatible parses config bytes IGNORING unknown fields, so a
+// gateway can consume a config emitted by a NEWER controller that added
+// fields this build does not know yet. This is the fleet forward-compat path
+// (the NATS/fetch source): during a rolling upgrade the whole fleet reads the
+// same controller-emitted config, and an older gateway must not reject it
+// wholesale just because a newer field appeared.
+//
+// Discipline this implies: new config fields must be ADDITIVE and safe for an
+// older gateway to ignore. A change that an old gateway ignoring would make
+// UNSAFE (e.g. a mandatory sandbox flag) must instead be gated behind an
+// explicit, rejected version bump — never a silently-dropped field.
+func ParseForwardCompatible(raw []byte) (*Config, error) {
+	return parse(raw, false)
+}
+
+func parse(raw []byte, strict bool) (*Config, error) {
 	expanded := os.Expand(string(raw), func(key string) string {
 		return os.Getenv(key)
 	})
-	var cfg Config
 	dec := json.NewDecoder(strings.NewReader(expanded))
-	dec.DisallowUnknownFields()
+	if strict {
+		dec.DisallowUnknownFields()
+	}
+	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
 	}
@@ -111,9 +242,25 @@ func Parse(raw []byte) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if (c.NATS.Tenant == "") != (c.NATS.User == "") {
+		return fmt.Errorf("nats: scoping requires both tenant and user (got tenant=%q, user=%q)", c.NATS.Tenant, c.NATS.User)
+	}
+	if c.NATS.Tenant != "" && !wire.TokenSafe(c.NATS.Tenant) {
+		return fmt.Errorf("nats: tenant %q is not subject-token safe (%s)", c.NATS.Tenant, `A-Za-z0-9_-`)
+	}
+	if c.NATS.User != "" && !wire.TokenSafe(c.NATS.User) {
+		return fmt.Errorf("nats: user %q is not subject-token safe (%s)", c.NATS.User, `A-Za-z0-9_-`)
+	}
 	for name, s := range c.Servers {
 		if !wire.TokenSafe(name) {
 			return fmt.Errorf("server name %q is not subject-token safe (%s)", name, `A-Za-z0-9_-`)
+		}
+		// "__" is reserved as the tool-namespacing delimiter (mcp__<server>__
+		// <tool>) that aggregating clients use to flatten many servers into one
+		// toolset. A server named with "__" could collide with a different
+		// (server, tool) pair's namespaced name, so forbid it up front.
+		if strings.Contains(name, "__") {
+			return fmt.Errorf("server name %q must not contain \"__\" (reserved as the tool-namespacing delimiter)", name)
 		}
 		switch s.Protocol {
 		case "", mcpspec.LegacyProtocolVersion, mcpspec.ProtocolVersion:
@@ -131,6 +278,11 @@ func (c *Config) validate() error {
 			}
 		default:
 			return fmt.Errorf("server %q: unknown transport %q", name, s.Transport)
+		}
+		if s.Auth != nil {
+			if err := s.Auth.validate(name); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

@@ -47,6 +47,7 @@ func runShim(c *ShimCmd, g *Globals) error {
 	wc, err := wire.NewClient(nc, wire.ClientConfig{
 		Prefix: c.SubjectPrefix,
 		Tenant: c.Tenant,
+		User:   c.User,
 	})
 	if err != nil {
 		return err

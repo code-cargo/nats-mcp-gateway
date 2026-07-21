@@ -66,6 +66,7 @@ func TestLoadRejects(t *testing.T) {
 		{"http without url", `{"servers":{"s":{"transport":"http"}}}`, "requires url"},
 		{"unknown transport", `{"servers":{"s":{"transport":"grpc"}}}`, "unknown transport"},
 		{"unknown field", `{"serverz":{}}`, "unknown field"},
+		{"double underscore in server name", `{"servers":{"a__b":{"command":"x"}}}`, "reserved as the tool-namespacing delimiter"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -89,4 +90,99 @@ func TestParseRejectsSameAsLoad(t *testing.T) {
 	_, err := Parse([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown transport")
+}
+
+// Forward-compat: a strict Parse rejects an unknown field (typo protection for
+// human-authored files), but ParseForwardCompatible ignores it — an older
+// gateway must tolerate a config a newer controller emitted with fields it
+// doesn't know yet, rather than reject the whole config mid-rolling-upgrade.
+func TestParseForwardCompatibleIgnoresUnknownFields(t *testing.T) {
+	raw := []byte(`{"servers":{"github":{"transport":"stdio","command":"gh-mcp","futureField":true}}}`)
+
+	_, err := Parse(raw)
+	require.Error(t, err, "strict Parse must reject unknown fields")
+	assert.Contains(t, err.Error(), "unknown field")
+
+	cfg, err := ParseForwardCompatible(raw)
+	require.NoError(t, err, "forward-compatible Parse must ignore unknown fields")
+	assert.Equal(t, []string{"github"}, cfg.ServerNames())
+	// Known fields still parse; the unknown one is simply dropped.
+	assert.Equal(t, "gh-mcp", cfg.Servers["github"].Command)
+}
+
+// ParseForwardCompatible still enforces validation — leniency is about
+// unknown fields, not about accepting invalid config.
+func TestParseForwardCompatibleStillValidates(t *testing.T) {
+	_, err := ParseForwardCompatible([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown transport")
+
+	_, err = ParseForwardCompatible([]byte(`{"servers":{"a__b":{"command":"x"}}}`))
+	require.Error(t, err, "reserved __ delimiter still rejected on the fetch path")
+}
+
+func TestAuthValidation(t *testing.T) {
+	valid := []string{
+		`{"servers":{"s":{"command":"x","auth":{"mode":"static"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"nats"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"exec","command":"helper"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"file","path":"/p","ttl":"30s"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-client-credentials","tokenUrl":"https://idp/t","clientId":"c","clientSecret":"s"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/tok/{user}"}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-refresh","tokenUrl":"https://idp/t","clientId":"c","refreshTokenFile":"/rt/{user}"}}}}`,
+	}
+	for _, raw := range valid {
+		_, err := Parse([]byte(raw))
+		assert.NoError(t, err, raw)
+	}
+
+	invalid := []struct{ raw, wantIn string }{
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"wat"}}}}`, "unknown auth mode"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"exec"}}}}`, "requires command"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"file"}}}}`, "requires path"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-client-credentials","tokenUrl":"u"}}}}`, "requires tokenUrl, clientId, clientSecret"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"u"}}}}`, "subjectTokenFile"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-refresh","tokenUrl":"u"}}}}`, "refreshTokenFile"},
+		{`{"servers":{"s":{"command":"x","auth":{"mode":"file","path":"/p","ttl":"soon"}}}}`, "auth ttl"},
+	}
+	for _, tt := range invalid {
+		_, err := Parse([]byte(tt.raw))
+		require.Error(t, err, tt.raw)
+		assert.Contains(t, err.Error(), tt.wantIn)
+	}
+}
+
+func TestAuthGrain(t *testing.T) {
+	perUser := []string{AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh}
+	for _, mode := range perUser {
+		a := &Auth{Mode: mode}
+		assert.True(t, a.PerUser(), mode)
+		assert.True(t, a.Dynamic(), mode)
+	}
+	shared := []string{AuthFile, AuthOAuthClientCredentials}
+	for _, mode := range shared {
+		a := &Auth{Mode: mode}
+		assert.False(t, a.PerUser(), mode)
+		assert.True(t, a.Dynamic(), mode)
+	}
+	assert.False(t, (&Auth{Mode: AuthStatic}).Dynamic())
+	assert.False(t, (&Auth{}).Dynamic())
+	var nilAuth *Auth
+	assert.False(t, nilAuth.Dynamic())
+	assert.False(t, nilAuth.PerUser())
+}
+
+func TestNATSScopingValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"nats":{"tenant":"acme","user":"u1"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "acme", cfg.NATS.Tenant)
+	assert.Equal(t, "u1", cfg.NATS.User)
+
+	_, err = Parse([]byte(`{"nats":{"tenant":"acme"},"servers":{}}`))
+	require.Error(t, err, "tenant without user must be rejected")
+	assert.Contains(t, err.Error(), "both tenant and user")
+
+	_, err = Parse([]byte(`{"nats":{"tenant":"bad tenant","user":"u1"},"servers":{}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not subject-token safe")
 }

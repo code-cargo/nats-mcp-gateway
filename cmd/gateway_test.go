@@ -21,6 +21,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/configsource"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
@@ -75,21 +77,34 @@ func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 	t.Cleanup(clientNC.Close)
 
 	a := &assembled{nc: nc, clientNC: clientNC}
-	pool := backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {
+	registry := &credRegistry{nc: nc, log: testLogger()}
+	lookupServer := func(name string) (config.Server, bool) {
 		cur := a.rec.Current()
 		if cur == nil {
-			return nil, fmt.Errorf("no config yet")
+			return config.Server{}, false
 		}
-		s, ok := cur.Servers[key.Server]
+		s, ok := cur.Servers[name]
+		return s, ok
+	}
+	pool := backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {
+		s, ok := lookupServer(key.Server)
 		if !ok {
 			return nil, fmt.Errorf("unknown server %q", key.Server)
 		}
-		return buildBackend(key, s, testLogger()), nil
+		resolver, _ := registry.lookup(key.Server, s)
+		return buildBackend(key, s, resolver, testLogger())
 	}, testLogger())
 	t.Cleanup(pool.Shutdown)
 
-	ws, err := wire.Serve(nc, wire.ServerConfig{KeepAlive: 50 * time.Millisecond},
-		proxy.New(pool, testLogger()).Handler())
+	px := proxy.New(pool, testLogger())
+	px.Creds = func(server string) (*cred.CachedResolver, bool) {
+		s, ok := lookupServer(server)
+		if !ok {
+			return nil, false
+		}
+		return registry.lookup(server, s)
+	}
+	ws, err := wire.Serve(nc, wire.ServerConfig{KeepAlive: 50 * time.Millisecond}, px.Handler())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -292,4 +307,91 @@ func waitServing(t *testing.T, a *assembled, serverName string) {
 	require.Eventually(t, func() bool {
 		return a.call(t, serverName, "echo").Kind == wire.FrameEnd
 	}, 8*time.Second, 100*time.Millisecond, "server %q never began serving", serverName)
+}
+
+// callAs is call with an explicit user identity and tool arguments.
+func (a *assembled) callAs(t *testing.T, user, serverName, tool string, args map[string]any) wire.Frame {
+	t.Helper()
+	c, err := wire.NewClient(a.clientNC, wire.ClientConfig{Tenant: "demo", User: user, Inactivity: 3 * time.Second})
+	require.NoError(t, err)
+	if args == nil {
+		args = map[string]any{}
+	}
+	params, _ := json.Marshal(map[string]any{
+		"name": tool, "arguments": args,
+		"_meta": map[string]any{mcpspec.MetaProtocolVersion: mcpspec.ProtocolVersion},
+	})
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": "1", "method": "tools/call",
+		"params": json.RawMessage(params),
+	})
+	s, err := c.Do(context.Background(), &wire.Request{
+		Server: serverName, Method: "tools/call", Name: tool,
+		ProtocolVersion: mcpspec.ProtocolVersion, Body: body,
+	})
+	require.NoError(t, err)
+	var last wire.Frame
+	for f := range s.C {
+		last = f
+	}
+	return last
+}
+
+// The full config-driven per-user path: an auth.mode=exec server resolves a
+// distinct credential per caller (credRegistry -> Cached(Exec) -> proxy pool
+// key -> buildBackend env merge), while config env non-secrets survive.
+func TestGatewayPerUserExecCredentials(t *testing.T) {
+	nc, url := fetchNATS(t)
+	a := assemble(t, nc, url)
+
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+echo "{\"env\":{\"TOKEN\":\"tok-$NATSMCP_CRED_USER\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	serverJSON := fmt.Sprintf(`"a":{"protocol":%q,"transport":"stdio","command":%q,"env":{%q:"1","REGION":"eu-1"},"auth":{"mode":"exec","command":%q}}`,
+		mcpspec.ProtocolVersion, os.Args[0], fakemcp.EnvFlag, script)
+
+	mc := &mutableConfig{nc: nc}
+	mc.set(serverJSON)
+	mc.serve(t)
+
+	src := &configsource.NATS{
+		Conn:           nc,
+		RequestSubject: "mcp.cfg.request",
+		Refetch:        time.Hour,
+		Logger:         testLogger(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = configsource.Run(ctx, testLogger(), src, func(cfg *config.Config) error {
+			_, err := a.rec.Apply(cfg)
+			return err
+		})
+	}()
+	waitServing(t, a, "a")
+
+	envOf := func(user, name string) (float64, string) {
+		f := a.callAs(t, user, "a", "env", map[string]any{"name": name})
+		require.Equal(t, wire.FrameEnd, f.Kind, "expected result, got %+v", f)
+		m, err := jsonrpc.Decode(f.Body)
+		require.NoError(t, err)
+		require.Nil(t, m.Error)
+		var r struct {
+			PID   float64 `json:"pid"`
+			Value string  `json:"value"`
+		}
+		require.NoError(t, json.Unmarshal(m.Result, &r))
+		return r.PID, r.Value
+	}
+
+	pidAlice, tokAlice := envOf("alice", "TOKEN")
+	pidBob, tokBob := envOf("bob", "TOKEN")
+	_, region := envOf("alice", "REGION")
+
+	assert.Equal(t, "tok-alice", tokAlice)
+	assert.Equal(t, "tok-bob", tokBob)
+	assert.NotEqual(t, pidAlice, pidBob, "per-user servers must not share a process across users")
+	assert.Equal(t, "eu-1", region, "config env non-secrets must survive the credential merge")
 }

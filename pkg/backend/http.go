@@ -41,12 +41,25 @@ import (
 type HTTPBackend struct {
 	URL string
 	// Headers are injected on every request (Authorization etc.) — the
-	// credential-injection point for HTTP backends.
+	// static credential-injection point for HTTP backends.
 	Headers map[string]string
+	// TokenSource, when set, supplies additional per-request headers
+	// resolved at call time (per-user bearer tokens), overriding Headers on
+	// collision. Because it is consulted per request, a refreshed token
+	// applies without rebuilding the conn.
+	TokenSource TokenSource
 	// Legacy enables Mcp-Session-Id capture/echo/DELETE.
 	Legacy bool
 	Client *http.Client
 	Logger *slog.Logger
+}
+
+// TokenSource resolves credential headers per request. Invalidate is called
+// after an authorization failure (HTTP 401) before the single retry, so
+// implementations drop any cached token first.
+type TokenSource interface {
+	Headers(ctx context.Context) (map[string]string, error)
+	Invalidate()
 }
 
 // Connect validates the config; HTTP needs no persistent socket.
@@ -115,14 +128,38 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 		return err
 	}
 
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), http.MethodPost, c.backend.URL, bytes.NewReader(body))
+	// The response may be a long SSE stream: run the exchange in the
+	// background so Write keeps the Conn contract (non-blocking beyond the
+	// POST itself). The request is (re)built inside so the single 401 retry
+	// gets a fresh body reader and freshly-resolved headers.
+	c.inflight.Add(1)
+	go func() {
+		defer c.inflight.Done()
+		c.roundTrip(context.WithoutCancel(ctx), body, msg)
+	}()
+	return nil
+}
+
+// newRequest builds one POST with the static headers, the token source's
+// current headers, and the MCP framing headers.
+func (c *httpConn) newRequest(ctx context.Context, body []byte, msg *jsonrpc.Message) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.backend.URL, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	for k, v := range c.backend.Headers {
 		req.Header.Set(k, v)
+	}
+	if ts := c.backend.TokenSource; ts != nil {
+		hdrs, err := ts.Headers(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("resolving credentials: %w", err)
+		}
+		for k, v := range hdrs {
+			req.Header.Set(k, v)
+		}
 	}
 	if msg.Kind() == jsonrpc.KindRequest {
 		// Required by 2026-07-28; harmless extras for legacy servers.
@@ -141,22 +178,32 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 		req.Header.Set("Mcp-Session-Id", c.sessionID)
 	}
 	c.mu.Unlock()
-
-	// The response may be a long SSE stream: pump it in the background so
-	// Write keeps the Conn contract (non-blocking beyond the POST itself).
-	c.inflight.Add(1)
-	go func() {
-		defer c.inflight.Done()
-		c.roundTrip(req, msg)
-	}()
-	return nil
+	return req, nil
 }
 
-func (c *httpConn) roundTrip(req *http.Request, msg *jsonrpc.Message) {
-	resp, err := c.client.Do(req)
-	if err != nil {
-		c.fail(msg, fmt.Sprintf("http request failed: %v", err))
-		return
+func (c *httpConn) roundTrip(ctx context.Context, body []byte, msg *jsonrpc.Message) {
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		req, err := c.newRequest(ctx, body, msg)
+		if err != nil {
+			c.fail(msg, err.Error())
+			return
+		}
+		resp, err = c.client.Do(req)
+		if err != nil {
+			c.fail(msg, fmt.Sprintf("http request failed: %v", err))
+			return
+		}
+		// One retry on 401 with freshly-resolved credentials. Safe for any
+		// method, idempotent or not: a 401 rejects the request before the
+		// server executes it.
+		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 && c.backend.TokenSource != nil {
+			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			c.backend.TokenSource.Invalidate()
+			continue
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -259,6 +306,15 @@ func (c *httpConn) Close() error {
 				req.Header.Set("Mcp-Session-Id", sid)
 				for k, v := range c.backend.Headers {
 					req.Header.Set(k, v)
+				}
+				if ts := c.backend.TokenSource; ts != nil {
+					// Best-effort: the DELETE is a courtesy; an unresolvable
+					// token must not block teardown.
+					if hdrs, err := ts.Headers(ctx); err == nil {
+						for k, v := range hdrs {
+							req.Header.Set(k, v)
+						}
+					}
 				}
 				if resp, err := c.client.Do(req); err == nil {
 					resp.Body.Close() // 405 is a legal "we don't support DELETE"

@@ -82,7 +82,10 @@ func (s *NATS) fetch(ctx context.Context) (*config.Config, error) {
 	if svcErr := msg.Header.Get("Nats-Service-Error"); svcErr != "" {
 		return nil, fmt.Errorf("config responder error: %s", svcErr)
 	}
-	cfg, err := config.Parse(msg.Data)
+	// Forward-compatible: an older gateway in a mixed fleet must tolerate a
+	// config the controller emitted with fields a newer build added, rather
+	// than reject the whole config during a rolling upgrade.
+	cfg, err := config.ParseForwardCompatible(msg.Data)
 	if err != nil {
 		return nil, fmt.Errorf("config from %q: %w", s.RequestSubject, err)
 	}

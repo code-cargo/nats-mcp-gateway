@@ -92,4 +92,10 @@ const (
 	// ErrCodePermissionDenied: the NATS server refused the publish — the
 	// caller's subject permissions do not cover this server/method/tool.
 	ErrCodePermissionDenied = -32013
+	// ErrCodeCredentialUnavailable: the gateway could not resolve backend
+	// credentials for this (tenant, user, server). Unlike ErrCodeStreamLost,
+	// re-issuing is not always the answer: the message says whether the
+	// failure is transient (resolver unreachable — retry later) or
+	// authoritative (the credential source said no — do not retry).
+	ErrCodeCredentialUnavailable = -32014
 )

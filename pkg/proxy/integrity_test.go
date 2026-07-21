@@ -84,25 +84,25 @@ func TestIntegrityMatrix(t *testing.T) {
 	}{
 		{
 			name:    "tools/call all consistent",
-			subject: "mcp.v1.req.acme.gh.tools.call.get_issue",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call.get_issue",
 			hMethod: "tools/call", hName: "get_issue",
 			body: body("tools/call", "get_issue", true),
 		},
 		{
 			name:    "tools/list all consistent",
-			subject: "mcp.v1.req.acme.gh.tools.list._",
+			subject: "mcp.v1.req.acme.u1.gh.tools.list._",
 			hMethod: "tools/list",
 			body:    body("tools/list", "", true),
 		},
 		{
 			name:    "resources/read uri on underscore subject",
-			subject: "mcp.v1.req.acme.gh.resources.read._",
+			subject: "mcp.v1.req.acme.u1.gh.resources.read._",
 			hMethod: "resources/read", hName: "file:///x/y",
 			body: body("resources/read", "file:///x/y", true),
 		},
 		{
 			name:    "THE attack: authorized subject, different body method",
-			subject: "mcp.v1.req.acme.gh.tools.list._",
+			subject: "mcp.v1.req.acme.u1.gh.tools.list._",
 			hMethod: "tools/list",
 			body:    body("tools/call", "delete_repo", true),
 			// header matches subject but not body
@@ -110,55 +110,55 @@ func TestIntegrityMatrix(t *testing.T) {
 		},
 		{
 			name:    "THE attack v2: authorized tool subject, different body tool",
-			subject: "mcp.v1.req.acme.gh.tools.call.get_issue",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call.get_issue",
 			hMethod: "tools/call", hName: "get_issue",
 			body:     body("tools/call", "delete_repo", true),
 			wantCode: mcpspec.ErrHeaderMismatch,
 		},
 		{
 			name:    "ACL dodge: token-safe name published to underscore subject",
-			subject: "mcp.v1.req.acme.gh.tools.call._",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call._",
 			hMethod: "tools/call", hName: "delete_repo",
 			body:     body("tools/call", "delete_repo", true),
 			wantCode: mcpspec.ErrHeaderMismatch,
 		},
 		{
 			name:    "unsafe name legitimately on underscore subject",
-			subject: "mcp.v1.req.acme.gh.tools.call._",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call._",
 			hMethod: "tools/call", hName: "crème.brûlée",
 			body: body("tools/call", "crème.brûlée", true),
 		},
 		{
 			name:    "header method differs from body",
-			subject: "mcp.v1.req.acme.gh.tools.call.get_issue",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call.get_issue",
 			hMethod: "tools/list", hName: "get_issue",
 			body:     body("tools/call", "get_issue", true),
 			wantCode: mcpspec.ErrHeaderMismatch,
 		},
 		{
 			name:    "header name differs from body name",
-			subject: "mcp.v1.req.acme.gh.tools.call.get_issue",
+			subject: "mcp.v1.req.acme.u1.gh.tools.call.get_issue",
 			hMethod: "tools/call", hName: "other_tool",
 			body:     body("tools/call", "get_issue", true),
 			wantCode: mcpspec.ErrHeaderMismatch,
 		},
 		{
 			name:     "named method missing name in body",
-			subject:  "mcp.v1.req.acme.gh.tools.call._",
+			subject:  "mcp.v1.req.acme.u1.gh.tools.call._",
 			hMethod:  "tools/call",
 			body:     `{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}}`,
 			wantCode: mcpspec.ErrHeaderMismatch,
 		},
 		{
 			name:     "missing protocol version in _meta",
-			subject:  "mcp.v1.req.acme.gh.tools.list._",
+			subject:  "mcp.v1.req.acme.u1.gh.tools.list._",
 			hMethod:  "tools/list",
 			body:     body("tools/list", "", false),
 			wantCode: mcpspec.ErrHeaderMismatch, // header says 2026-07-28, body says ""
 		},
 		{
 			name:     "notification is not a request",
-			subject:  "mcp.v1.req.acme.gh.tools.list._",
+			subject:  "mcp.v1.req.acme.u1.gh.tools.list._",
 			hMethod:  "tools/list",
 			body:     `{"jsonrpc":"2.0","method":"tools/list","params":{}}`,
 			wantCode: jsonrpc.CodeInvalidRequest,
@@ -182,7 +182,7 @@ func TestIntegrityUnsupportedVersion(t *testing.T) {
 	// Header and body agree on a legacy version: consistent, but unsupported.
 	b := fmt.Sprintf(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{"_meta":{%q:%q}}}`,
 		mcpspec.MetaProtocolVersion, mcpspec.LegacyProtocolVersion)
-	in := inbound(t, "mcp.v1.req.acme.gh.tools.list._", "tools/list", "", b)
+	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.list._", "tools/list", "", b)
 	in.Header.Set(wire.HeaderProtocolVersion, mcpspec.LegacyProtocolVersion)
 
 	got := Check(in)

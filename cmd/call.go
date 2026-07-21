@@ -68,7 +68,7 @@ func runCall(c *CallCmd, g *Globals) error {
 		name = s
 	}
 
-	wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: c.Tenant})
+	wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: c.Tenant, User: c.User})
 	if err != nil {
 		return err
 	}

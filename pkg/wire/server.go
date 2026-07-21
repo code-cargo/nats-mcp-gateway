@@ -76,6 +76,14 @@ type ServerConfig struct {
 	Prefix string
 	// QueueGroup for load-balancing gateway replicas (default "mcpgw").
 	QueueGroup string
+	// Tenant/User, when set (always together), scope every endpoint to one
+	// caller: the instance binds {prefix}.req.{tenant}.{user}.{server}.>
+	// instead of the all-callers wildcard form. This is how a per-user pod
+	// claims exactly its slice of the subject space. A scoped instance must
+	// not share a queue group with an unscoped gateway serving the same
+	// server names, or the two would compete for the scoped traffic.
+	Tenant string
+	User   string
 	// Servers is the list of MCP server names to register endpoints for.
 	Servers []string
 	// Name/Version identify the micro service ($SRV.INFO).
@@ -94,6 +102,8 @@ type Server struct {
 	handler    Handler
 	prefix     string
 	queueGroup string
+	tenant     string
+	user       string
 	name       string
 	version    string
 	keepAlive  time.Duration
@@ -127,12 +137,18 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		prefix = DefaultPrefix
 	}
 
+	if (cfg.Tenant == "") != (cfg.User == "") {
+		return nil, fmt.Errorf("wire: endpoint scoping requires both Tenant and User (got tenant=%q, user=%q)", cfg.Tenant, cfg.User)
+	}
+
 	base, cancel := context.WithCancelCause(context.Background())
 	s := &Server{
 		nc:         nc,
 		handler:    handler,
 		prefix:     prefix,
 		queueGroup: cfg.QueueGroup,
+		tenant:     cfg.Tenant,
+		user:       cfg.User,
 		name:       cfg.Name,
 		version:    cfg.Version,
 		keepAlive:  cfg.KeepAlive,
@@ -177,7 +193,7 @@ func (s *Server) SetServers(names []string) error {
 		if _, ok := s.svcs[name]; ok {
 			continue
 		}
-		subject, err := EndpointSubject(s.prefix, name)
+		subject, err := EndpointSubject(s.prefix, s.tenant, s.user, name)
 		if err != nil {
 			return err
 		}

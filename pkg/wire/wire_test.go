@@ -128,6 +128,34 @@ func TestStreamMsgsThenEnd(t *testing.T) {
 	assert.Contains(t, string(frames[2].Body), `"ok":true`)
 }
 
+func TestUserAttribution(t *testing.T) {
+	nc := runNATS(t, nil)
+	gotUser := make(chan string, 1)
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		gotUser <- in.Subject.User
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	// A client with a user token: the gateway parses it off the subject.
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", User: "u_9f3a", Inactivity: time.Second})
+	require.NoError(t, err)
+	_ = collect(t, mustDo(t, c, testRequest("1", "tools/call")))
+	assert.Equal(t, "u_9f3a", <-gotUser, "gateway sees the caller's user token")
+
+	// A client with no user token defaults to the unattributed placeholder.
+	c2, err := NewClient(nc, ClientConfig{Tenant: "acme", Inactivity: time.Second})
+	require.NoError(t, err)
+	_ = collect(t, mustDo(t, c2, testRequest("2", "tools/call")))
+	assert.Equal(t, UserUnattributed, <-gotUser, "unset user is the '_' placeholder")
+}
+
+func mustDo(t *testing.T, c *Client, req *Request) *Stream {
+	t.Helper()
+	s, err := c.Do(context.Background(), req)
+	require.NoError(t, err)
+	return s
+}
+
 func TestErrTerminal(t *testing.T) {
 	nc := runNATS(t, nil)
 	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
@@ -280,7 +308,7 @@ func TestBadWireVersionRejected(t *testing.T) {
 	reply := nc.NewRespInbox()
 	sub, err := nc.SubscribeSync(reply)
 	require.NoError(t, err)
-	subj, err := BuildSubject("", "acme", "test", "tools/list", "")
+	subj, err := BuildSubject("", "acme", "_", "test", "tools/list", "")
 	require.NoError(t, err)
 	require.NoError(t, nc.PublishMsg(&nats.Msg{
 		Subject: subj,
@@ -295,4 +323,43 @@ func TestBadWireVersionRejected(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m.Error)
 	assert.Equal(t, jsonrpc.CodeInvalidRequest, m.Error.Code)
+}
+
+// A scoped instance (per-user pod shape) binds only its own
+// {tenant}.{user} slice of the subject space: its user's requests reach it,
+// anyone else's hit no-responders. It must NOT share a queue group with an
+// instance serving the same server names for everyone.
+func TestScopedEndpointServesOnlyItsUser(t *testing.T) {
+	nc := runNATS(t, nil)
+	serve(t, nc, ServerConfig{Tenant: "acme", User: "u1", QueueGroup: "qg-acme-u1"},
+		func(ctx context.Context, in *Inbound, w StreamWriter) error {
+			assert.Equal(t, "acme", in.Subject.Tenant)
+			assert.Equal(t, "u1", in.Subject.User)
+			return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{"served_by":"scoped"}}`))
+		})
+
+	asUser := func(user string) []Frame {
+		c, err := NewClient(nc, ClientConfig{Tenant: "acme", User: user, Inactivity: 2 * time.Second})
+		require.NoError(t, err)
+		s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+		require.NoError(t, err)
+		return collect(t, s)
+	}
+
+	frames := asUser("u1")
+	require.Len(t, frames, 1)
+	assert.Equal(t, FrameEnd, frames[0].Kind)
+	assert.Contains(t, string(frames[0].Body), "scoped")
+
+	frames = asUser("u2")
+	require.Len(t, frames, 1)
+	require.NotNil(t, frames[0].Err, "another user's request must not reach the scoped instance")
+	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
+}
+
+func TestServeRejectsHalfScoping(t *testing.T) {
+	nc := runNATS(t, nil)
+	_, err := Serve(nc, ServerConfig{Tenant: "acme", Servers: []string{"test"}}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "both Tenant and User")
 }

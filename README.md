@@ -37,10 +37,13 @@ are bridged at the edges (`pkg/shim/legacyclient.go`, `pkg/backend/legacy`),
 never on the bus.
 
 ```
-REQUEST   mcp.v1.req.{tenant}.{server}.{method-tokens}.{name}
+REQUEST   mcp.v1.req.{tenant}.{user}.{server}.{method-tokens}.{name}
 REPLY     one inbox per request; frames tagged Mcp-Frame: msg|end|err|ka
 CONTROL   {reply}.ctl — cancellation
 ```
+
+`{user}` carries the caller's identity for attribution (see "User attribution"
+below); it is `_` when a deployment does not use per-user auth.
 
 Frames: `msg` carries one JSON-RPC notification; `end` carries the response
 (empty body = cancelled, no response exists); `err` carries a
@@ -55,9 +58,10 @@ everything:
 
 ```
 # this user may list tools and call exactly one tool on one server
+# ("_" is the user token — see User attribution)
 publish: [
-  "mcp.v1.req.acme.github.tools.list._",
-  "mcp.v1.req.acme.github.tools.call.get_issue",
+  "mcp.v1.req.acme._.github.tools.list._",
+  "mcp.v1.req.acme._.github.tools.call.get_issue",
   "_INBOX.>"
 ]
 subscribe: ["_INBOX.>"]
@@ -77,6 +81,40 @@ Two things make that real:
 Tool names that are not subject-token-safe (`A-Za-z0-9_-`) map to the `_`
 token; per-tool grants for those are all-or-nothing, and the integrity check
 prevents token-safe names from hiding under `_`.
+
+## User attribution
+
+The `{user}` subject token records *who* made each request. It is trustworthy
+for the same reason `{tenant}` is: core NATS never tells the gateway who
+published a message, but it *does* enforce which subjects a connection may
+publish to. So attribution rides the subject and is verified by NATS, with no
+crypto in the gateway.
+
+The intended setup is **NATS auth callout**: your callout service authenticates
+the caller and mints a NATS user JWT scoped to `mcp.v1.req.{tenant}.{user}.>`.
+The caller then can't publish under anyone else's `{user}` token, and the
+gateway trusts the token it parses — logging it on every request and, because
+the scoping is per-user, letting you write per-user tool grants for free:
+
+```
+# callout mints, for user u_9f3a in tenant acme:
+publish: [
+  "mcp.v1.req.acme.u_9f3a.>",          # everything as this user, or finer:
+  "mcp.v1.req.acme.u_9f3a.github.tools.call.get_issue",
+  "_INBOX_acme_u_9f3a.>"
+]
+```
+
+Clients pass their user token via `--user` / `NATSMCP_USER` (shim, call). The
+user id must be subject-token-safe (`A-Za-z0-9_-`), so map emails/etc. to a
+stable handle or UUID in the callout. Deployments without per-user auth use the
+`_` placeholder ("unattributed") and the gateway logs `user=_`.
+
+Attribution is isolation only when credentials are per-user: with a static
+server the pool key stays `(server, tenant)` and processes are shared per
+tenant regardless of user; a server with a per-user `auth` mode (below) keys
+its backends per `(server, tenant, user, credential-generation)`, so users
+never share a process or a credential.
 
 ## Configuration
 
@@ -106,6 +144,115 @@ prevents token-safe names from hiding under `_`.
 point; clients never see backend secrets. Set `max_payload: 8MB` on the NATS
 server: MCP results carry base64 blobs, and oversize messages fail with a
 legible `-32012` instead of a hang.
+
+## Per-user backend credentials
+
+By default every server runs with **one shared credential** from its config
+`env`/`headers`. For curated third-party servers (AWS, Grafana, GitHub…)
+callers should not share an identity: a per-server `auth` block selects how
+credentials are **resolved per (tenant, user, server)** and injected — as
+`headers` on every HTTP request or as `env` on the spawned subprocess, merged
+OVER the config's static values (config keeps non-secrets like `AWS_REGION`;
+resolved credentials win on collision). The end user never sees the
+credential, and per-user modes keep secrets out of the config entirely.
+
+```json
+"grafana": { "transport": "http", "url": "https://grafana.internal/mcp",
+             "auth": { "mode": "nats" } },
+"jira":    { "transport": "http", "url": "https://jira.internal/mcp",
+             "auth": { "mode": "oauth-token-exchange",
+                       "tokenUrl": "https://idp/token", "audience": "jira",
+                       "clientId": "${OAUTH_CLIENT_ID}", "clientSecret": "${OAUTH_CLIENT_SECRET}",
+                       "subjectTokenFile": "/var/run/assertions/{user}.jwt" } },
+"aws":     { "transport": "stdio", "command": "uvx", "args": ["awslabs.aws-api-mcp-server"],
+             "auth": { "mode": "exec", "command": "aws-cred-helper" } }
+```
+
+| mode | grain | resolves via |
+|---|---|---|
+| `static` (default) | shared | config `env`/`headers` — today's behavior |
+| `file` | shared | mounted/rotated JSON file (`path`, optional `ttl`) |
+| `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`) |
+| `exec` | per-user | a credential-helper command (the universal adapter, below) |
+| `oauth-token-exchange` | per-user | RFC 8693: the user's identity assertion → a scoped access token |
+| `oauth-refresh` | per-user | refresh_token grant over per-user token files |
+| `nats` | per-user | request/reply to a controller (below) |
+
+Per-user servers are pooled per `(server, tenant, user, credential
+generation)`: two users of one server get separate processes with their own
+credentials, a refreshed credential drains the old backend, and the pool
+recycles a backend before its credentials expire (an in-flight call at expiry
+fails with `-32010` and the client re-issues). Credential-resolution failures
+surface as **`-32014`**; the message says whether to retry (resolver
+unreachable) or not (the source refused). Mind `pool.maxProcsPerTenant`
+(default 16): per-user stdio servers count each `(user, server)` process
+against it, so size it to roughly users × stdio servers per tenant.
+
+Adding a credential source has the same three tiers as config reloading
+(`pkg/backend/cred`), cheapest first:
+
+1. **Use a built-in** — the modes above, RFC 8693 included.
+2. **Wrap a script with `exec`** — the helper runs with a scrubbed
+   environment plus `NATSMCP_CRED_{TENANT,USER,SERVER}` and prints
+   `{"headers"|"env": {...}, "expiresAt": "RFC3339"}`. Any credential system
+   integrates in ~20 lines; e.g. AWS STS with no SDK in the gateway:
+   ```sh
+   #!/bin/sh
+   aws sts assume-role-with-web-identity \
+     --role-arn "arn:aws:iam::123456789:role/mcp-${NATSMCP_CRED_USER}" \
+     --role-session-name "$NATSMCP_CRED_USER" \
+     --web-identity-token "$(cat /var/run/assertions/$NATSMCP_CRED_USER.jwt)" \
+     --query 'Credentials' --output json |
+   jq '{env: {AWS_ACCESS_KEY_ID: .AccessKeyId, AWS_SECRET_ACCESS_KEY: .SecretAccessKey,
+              AWS_SESSION_TOKEN: .SessionToken}, expiresAt: .Expiration}'
+   ```
+3. **Implement `cred.Resolver`** — one method; wrap it in `cred.Cached` for
+   the TTL cache, single-flight, and failure backoff every mode gets.
+
+**Controller contract (`mode: "nats"`):** respond to
+`mcp.v1.cred.{tenant}.{user}.{server}` with the same
+`{"headers"|"env", "expiresAt"}` JSON — how the controller produced it
+(authorization-code + refresh, STS, RFC 8693 token exchange) is invisible to
+the gateway and can evolve freely. Refuse with a `Nats-Service-Error` header;
+refusals are authoritative and not retried beyond a backoff. NATS permissions
+fence the subject to controller ↔ gateway. The gateway always asks with the
+NATS-verified caller identity, so it cannot be tricked into fetching another
+user's credential. Revocation rides expiry: keep `expiresAt` short (~1h);
+there is no push-revoke.
+
+## Local and remote servers
+
+The gateway runs MCP servers in two shapes; the MCP server itself is vanilla
+and gateway-unaware in both:
+
+- **Local (in-process):** the shapes above — stdio subprocesses spawned by
+  the gateway, HTTP endpoints called by it. Right for single-binary
+  deployments and for hosted HTTP servers, which take per-user credentials as
+  request headers.
+- **Remote scoped instances (per-user pods):** stdio-only servers can't be
+  networked, so to run one *outside* the gateway (its own pod, with its own
+  resources), run this same binary in front of it as the container
+  entrypoint, **scoped** to one caller:
+
+  ```json
+  { "nats": { "url": "nats://nats:4222", "tenant": "acme", "user": "u_9f3a" },
+    "servers": { "aws": { "transport": "stdio", "command": "uvx",
+                           "args": ["awslabs.aws-api-mcp-server"],
+                           "env": { "AWS_ACCESS_KEY_ID": "${AWS_ACCESS_KEY_ID}",
+                                    "AWS_SECRET_ACCESS_KEY": "${AWS_SECRET_ACCESS_KEY}",
+                                    "AWS_SESSION_TOKEN": "${AWS_SESSION_TOKEN}" } } } }
+  ```
+
+  A scoped instance binds `mcp.v1.req.acme.u_9f3a.{server}.>` instead of the
+  all-callers wildcard (flags: `--scope-tenant`/`--scope-user` in fetch
+  mode), so NATS routes exactly that user's traffic to the pod — no inbound
+  Service, DNS, or ingress; the pod only dials out. Whatever creates the pod
+  injects the user's credentials into its environment, and the pod's lifetime
+  bounds the credential's. Two rules: a server name must be served by
+  **either** the central gateway **or** scoped instances, never both (they
+  would compete for the same subjects — scoped instances therefore default to
+  their own queue group), and the scoped pod's NATS identity should be fenced
+  to its own `{tenant}.{user}` subjects.
 
 ## Config sources / hot reload
 

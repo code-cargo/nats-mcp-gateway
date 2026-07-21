@@ -25,14 +25,27 @@ import (
 	"time"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
+
+// CredLookup returns the credential resolver for a server (nil when its
+// credentials are static — the config env/headers path needs no resolution
+// here) and whether they are per-user. Per-user servers are pooled per
+// caller; shared dynamic servers resolve under wire.UserUnattributed.
+type CredLookup func(server string) (resolver *cred.CachedResolver, perUser bool)
 
 // Proxy routes wire requests to pooled backends.
 type Proxy struct {
 	pool *backend.Pool
 	log  *slog.Logger
+
+	// Creds, when set, is consulted per request to resolve backend
+	// credentials BEFORE the pool: the resolved generation becomes the pool
+	// key's CredVersion, so a refreshed credential yields a new pool entry
+	// and the old backend drains. Set it before Handler is first called.
+	Creds CredLookup
 }
 
 // New builds a proxy over a pool.
@@ -55,6 +68,7 @@ func (p *Proxy) Handler() wire.Handler {
 
 		reqLog := p.log.With(
 			"tenant", in.Subject.Tenant,
+			"user", in.Subject.User,
 			"server", in.Subject.Server,
 			"method", in.Subject.Method,
 		)
@@ -87,6 +101,31 @@ func (p *Proxy) Handler() wire.Handler {
 		key := backend.Key{
 			Server: in.Subject.Server,
 			Tenant: in.Subject.Tenant,
+		}
+		if p.Creds != nil {
+			if resolver, perUser := p.Creds(in.Subject.Server); resolver != nil {
+				credUser := wire.UserUnattributed
+				if perUser {
+					credUser = in.Subject.User
+				}
+				// The resolve is NATS-verified-identity in, generation out:
+				// the caller cannot reach another user's credential because
+				// in.Subject.User is enforced by NATS, and the generation in
+				// the key drains stale backends on refresh.
+				_, gen, cerr := resolver.ResolveGen(ctx, in.Subject.Tenant, credUser, in.Subject.Server)
+				if cerr != nil {
+					reqLog.Warn("credential resolution failed", "err", cerr, "terminal", cred.IsTerminal(cerr))
+					msg := "backend credentials temporarily unavailable, retry later: " + cerr.Error()
+					if cred.IsTerminal(cerr) {
+						msg = "backend credentials unavailable, do not retry: " + cerr.Error()
+					}
+					return fail(wire.ErrCodeCredentialUnavailable, msg, nil)
+				}
+				if perUser {
+					key.CredSet = credUser
+				}
+				key.CredVersion = gen
+			}
 		}
 		mux, release, err := p.pool.Get(ctx, key)
 		if err != nil {

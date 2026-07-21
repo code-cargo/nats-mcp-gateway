@@ -22,12 +22,32 @@ package mcpspec
 
 // Protocol versions.
 const (
-	// ProtocolVersion is the revision the NATS wire carries exclusively.
+	// ProtocolVersion is the primary revision the NATS wire carries, and the
+	// version the shim injects and the gateway advertises by default.
 	ProtocolVersion = "2026-07-28"
 	// LegacyProtocolVersion is what today's real clients and servers speak;
 	// bridged at the edges, never on the wire.
 	LegacyProtocolVersion = "2025-11-25"
 )
+
+// SupportedProtocolVersions is the set of MCP revisions the wire accepts on a
+// request. The wire is schema-agnostic — it moves opaque JSON-RPC envelopes —
+// so revisions coexist: the gateway accepts any listed version and passes it
+// through to the backend unchanged. As the ecosystem moves, append the new
+// revision here (and keep the previous one for a window) so clients and
+// servers can upgrade INDEPENDENTLY of the gateway fleet, rather than in
+// lockstep. Order is newest-preferred-first; ProtocolVersion stays the head.
+var SupportedProtocolVersions = []string{ProtocolVersion}
+
+// IsSupportedProtocolVersion reports whether v is a revision the wire accepts.
+func IsSupportedProtocolVersion(v string) bool {
+	for _, s := range SupportedProtocolVersions {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
 
 // Standard JSON-RPC codes live in pkg/jsonrpc. One spec note that matters:
 // in 2026-07-28, resource-not-found is signaled with -32602 (invalid params);

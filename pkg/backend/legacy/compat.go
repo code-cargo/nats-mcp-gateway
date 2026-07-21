@@ -159,11 +159,11 @@ func (c *conn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	switch {
 	case msg.Kind() == jsonrpc.KindRequest && msg.Method == mcpspec.MethodDiscover:
 		// Synthesized from the cached InitializeResult; the subprocess never
-		// sees it. supportedVersions is the GATEWAY's modern version — from
-		// the client's viewpoint the gateway is the modern server.
+		// sees it. supportedVersions is the GATEWAY's supported set — from the
+		// client's viewpoint the gateway is the modern server.
 		result := map[string]any{
 			"resultType":        mcpspec.ResultTypeComplete,
-			"supportedVersions": []string{mcpspec.ProtocolVersion},
+			"supportedVersions": mcpspec.SupportedProtocolVersions,
 			"capabilities":      orEmpty(c.init.Capabilities),
 			"serverInfo":        orEmpty(c.init.ServerInfo),
 			"ttlMs":             c.ttlMs,

@@ -49,6 +49,11 @@ type ClientConfig struct {
 	Prefix string
 	// Tenant is this caller's tenant token.
 	Tenant string
+	// User is this caller's identity token for attribution. Empty means
+	// UserUnattributed ("_"). With per-user auth (e.g. NATS auth callout) it
+	// must match the token the caller's NATS credentials are scoped to, or
+	// the publish is denied.
+	User string
 	// Inactivity overrides DefaultInactivity when > 0.
 	Inactivity time.Duration
 }
@@ -60,6 +65,7 @@ type Client struct {
 	nc         *nats.Conn
 	prefix     string
 	tenant     string
+	user       string
 	inactivity time.Duration
 
 	// A denied publish surfaces as an async connection error, not on the
@@ -74,10 +80,18 @@ func NewClient(nc *nats.Conn, cfg ClientConfig) (*Client, error) {
 	if cfg.Tenant == "" || !TokenSafe(cfg.Tenant) {
 		return nil, fmt.Errorf("wire: invalid tenant %q", cfg.Tenant)
 	}
+	user := cfg.User
+	if user == "" {
+		user = UserUnattributed
+	}
+	if !TokenSafe(user) {
+		return nil, fmt.Errorf("wire: invalid user %q", cfg.User)
+	}
 	c := &Client{
 		nc:         nc,
 		prefix:     cfg.Prefix,
 		tenant:     cfg.Tenant,
+		user:       user,
 		inactivity: cfg.Inactivity,
 		viol:       make(map[string]map[*violReg]struct{}),
 	}
@@ -185,7 +199,7 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 			Message: fmt.Sprintf("request body %d bytes exceeds NATS max_payload %d", len(req.Body), max),
 		}
 	}
-	subject, err := BuildSubject(c.prefix, c.tenant, req.Server, req.Method, req.Name)
+	subject, err := BuildSubject(c.prefix, c.tenant, c.user, req.Server, req.Method, req.Name)
 	if err != nil {
 		return nil, err
 	}

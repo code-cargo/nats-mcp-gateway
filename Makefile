@@ -1,4 +1,5 @@
 VERSION ?= develop
+GOOS ?= $(shell go env GOOS)
 GOARCH ?= $(shell go env GOARCH)
 
 ifdef CI_VERSION
@@ -7,6 +8,12 @@ endif
 
 # Common directories
 bin_dir := bin
+
+# Windows executables need the .exe suffix; `go build -o <name>` does NOT add
+# it automatically. Derive it from the target GOOS (which go build reads from
+# the environment), so cross-builds and local builds stay consistent.
+EXE := $(if $(filter windows,$(GOOS)),.exe,)
+BINARY := natsmcp$(EXE)
 
 # Common build flags. Deferred (=) so $(VERSION) resolves at recipe time,
 # after any CI_VERSION override above — with := it would bake in "develop".
@@ -43,11 +50,11 @@ $(bin_dir):
 	mkdir -p $@
 
 build: | $(bin_dir)
-	@printf "${GREEN}Building natsmcp...${RESET}\n"
+	@printf "${GREEN}Building $(BINARY)...${RESET}\n"
 	@CGO_ENABLED=0 go build \
 		-ldflags="$(LDFLAGS)" \
-		-o "$(bin_dir)/natsmcp" . || \
-		(printf "${RED}Build failed for natsmcp${RESET}\n" && exit 1)
+		-o "$(bin_dir)/$(BINARY)" . || \
+		(printf "${RED}Build failed for $(BINARY)${RESET}\n" && exit 1)
 
 test:
 	@printf "${GREEN}Running tests...${RESET}\n"

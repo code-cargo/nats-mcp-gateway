@@ -214,7 +214,7 @@ func TestE2EIntegrityRejectsForgedBody(t *testing.T) {
 	reply := nc.NewRespInbox()
 	sub, err := nc.SubscribeSync(reply)
 	require.NoError(t, err)
-	subj, err := wire.BuildSubject("", "acme", "fake", "tools/list", "")
+	subj, err := wire.BuildSubject("", "acme", "_", "fake", "tools/list", "")
 	require.NoError(t, err)
 	require.NoError(t, nc.PublishMsg(&nats.Msg{
 		Subject: subj,
@@ -274,7 +274,9 @@ func TestE2EPermissions(t *testing.T) {
 			{
 				Username: "reader", Password: "r",
 				Permissions: &server.Permissions{
-					Publish:   &server.SubjectPermission{Allow: []string{"mcp.v1.req.acme.fake.tools.list._", "_INBOX.>"}},
+					// User token "_" (this client is unattributed); reader may
+					// publish only tools/list for the fake server.
+					Publish:   &server.SubjectPermission{Allow: []string{"mcp.v1.req.acme._.fake.tools.list._", "_INBOX.>"}},
 					Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX.>"}},
 				},
 			},

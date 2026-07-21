@@ -125,12 +125,12 @@ func Check(in *wire.Inbound) *CheckError {
 	if hv := in.Header.Get(wire.HeaderProtocolVersion); hv != bodyVer {
 		return mismatch("MCP-Protocol-Version header %q does not match body _meta %q", hv, bodyVer)
 	}
-	if bodyVer != mcpspec.ProtocolVersion {
+	if !mcpspec.IsSupportedProtocolVersion(bodyVer) {
 		return &CheckError{
 			Code:    mcpspec.ErrUnsupportedProtocolVersion,
 			Message: fmt.Sprintf("protocol version %q is not supported", bodyVer),
 			Data: map[string]any{
-				"supported": []string{mcpspec.ProtocolVersion},
+				"supported": mcpspec.SupportedProtocolVersions,
 				"requested": bodyVer,
 			},
 		}

@@ -78,6 +78,20 @@ func (c *PoolConfig) fill() {
 // credentials for that server+tenant).
 type Factory func(key Key) (Backend, error)
 
+// Expiring is optionally implemented by a Backend whose injected credentials
+// expire. The pool clamps that entry's lifetime to the expiry (minus a skew)
+// so a backend never outlives its credentials — enforced both in Get and by
+// the reaper. Caveat, by design: the reaper only takes idle entries, so a
+// long-lived in-flight call (subscriptions/listen) can pin a backend past
+// expiry; it fails on its next use and the caller re-issues.
+type Expiring interface {
+	CredExpiresAt() time.Time
+}
+
+// credExpirySkew is how long before credential expiry an entry is recycled,
+// so the replacement spawns while the old credentials still work.
+const credExpirySkew = 30 * time.Second
+
 // Pool lazily creates and reuses one Mux per Key.
 type Pool struct {
 	cfg     PoolConfig
@@ -95,6 +109,7 @@ type Pool struct {
 type entry struct {
 	mux      *Mux
 	born     time.Time
+	deadline time.Time // born + MaxLifetime, clamped to credential expiry
 	lastUsed time.Time
 	inflight int
 	sem      chan struct{}
@@ -128,7 +143,11 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	p.mu.Lock()
 	e := p.entries[key]
-	if e != nil && e.mux.Dead() {
+	// Past-deadline entries are replaced here, not only by the reaper: its
+	// 30s tick must never hand a request credentials that expired between
+	// ticks. In-flight calls on the closed mux fail with ErrConnDead and the
+	// client re-issues — the documented cost of credential expiry.
+	if e != nil && (e.mux.Dead() || time.Now().After(e.deadline)) {
 		go func(m *Mux) { _ = m.Close() }(e.mux)
 		delete(p.entries, key)
 		e = nil
@@ -164,10 +183,20 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 			e = cur
 			go func(c Conn) { _ = c.Close() }(conn)
 		} else {
+			born := time.Now()
+			deadline := born.Add(p.cfg.MaxLifetime)
+			if exp, ok := b.(Expiring); ok {
+				if t := exp.CredExpiresAt(); !t.IsZero() {
+					if d := t.Add(-credExpirySkew); d.Before(deadline) {
+						deadline = d
+					}
+				}
+			}
 			e = &entry{
-				mux:  NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
-				born: time.Now(),
-				sem:  make(chan struct{}, p.cfg.MaxConcurrent),
+				mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+				born:     born,
+				deadline: deadline,
+				sem:      make(chan struct{}, p.cfg.MaxConcurrent),
 			}
 			p.entries[key] = e
 		}
@@ -242,7 +271,7 @@ func (p *Pool) reap() {
 	for k, e := range p.entries {
 		dead := e.mux.Dead()
 		idle := e.inflight == 0 && now.Sub(e.lastUsed) > p.cfg.IdleTTL
-		old := e.inflight == 0 && now.Sub(e.born) > p.cfg.MaxLifetime
+		old := e.inflight == 0 && now.After(e.deadline)
 		if dead || idle || old {
 			p.log.Info("reaping backend connection",
 				"server", k.Server, "tenant", k.Tenant,
