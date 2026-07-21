@@ -56,6 +56,12 @@ type ClientConfig struct {
 	User string
 	// Inactivity overrides DefaultInactivity when > 0.
 	Inactivity time.Duration
+	// Claims, when set, advertises claim acceptance on every request and
+	// dereferences claimed responses transparently — the consumer sees a
+	// normal end frame with the full body. Requires read access to the
+	// tenant's claim bucket. Nil disables (oversize responses then fail with
+	// ErrCodePayloadTooLarge, today's behavior).
+	Claims ClaimStore
 }
 
 // Client sends requests over the wire. Tenant-inbox isolation, when wanted,
@@ -67,6 +73,7 @@ type Client struct {
 	tenant     string
 	user       string
 	inactivity time.Duration
+	claims     ClaimStore
 
 	// A denied publish surfaces as an async connection error, not on the
 	// subscription — without this registry the stream would sit out the
@@ -93,6 +100,7 @@ func NewClient(nc *nats.Conn, cfg ClientConfig) (*Client, error) {
 		tenant:     cfg.Tenant,
 		user:       user,
 		inactivity: cfg.Inactivity,
+		claims:     cfg.Claims,
 		viol:       make(map[string]map[*violReg]struct{}),
 	}
 	if c.prefix == "" {
@@ -227,6 +235,9 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	if req.Name != "" {
 		msg.Header.Set(HeaderName, req.Name)
 	}
+	if c.claims != nil {
+		msg.Header.Set(HeaderAcceptClaim, "1")
+	}
 	streamCtx, stop := context.WithCancelCause(ctx)
 
 	// Register for permission-violation failure BEFORE publishing.
@@ -327,6 +338,22 @@ func (c *Client) pump(ctx context.Context, sub *nats.Subscription, frames chan<-
 				return
 			}
 		case FrameEnd, FrameErr:
+			if id := msg.Header.Get(HeaderClaim); id != "" && kind == FrameEnd {
+				// Claimed response: the body is parked in the claim store.
+				if c.claims == nil {
+					// Defensive — a conforming gateway only claims for
+					// callers that opted in.
+					fail(ErrCodeStreamLost, "gateway sent a claimed response this client did not accept")
+					return
+				}
+				body, err := c.claims.Fetch(ctx, c.tenant, id)
+				if err != nil {
+					fail(ErrCodeStreamLost, fmt.Sprintf("claimed response fetch failed (re-issue the request): %v", err))
+					return
+				}
+				deliver(Frame{Kind: FrameEnd, Body: body})
+				return
+			}
 			deliver(Frame{Kind: kind, Body: msg.Data})
 			return
 		default:

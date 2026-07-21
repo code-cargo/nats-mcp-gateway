@@ -38,6 +38,22 @@ const (
 // HeaderFrame carries the frame kind on every reply-stream message.
 const HeaderFrame = "Mcp-Frame"
 
+// Claim-check headers (see ClaimStore). Both sides opt in: a request carrying
+// HeaderAcceptClaim "1" tells the gateway this client can dereference claims;
+// an end frame carrying HeaderClaim has an EMPTY body and the real response
+// parked in the claim store under the given id. The empty body would read as
+// "cancelled" to a client that never opted in, which is why the gateway only
+// claims for callers that advertised acceptance.
+const (
+	HeaderClaim       = "Mcp-Claim"
+	HeaderAcceptClaim = "Mcp-Accept-Claim"
+)
+
+// claimMaxBody caps what the gateway will park in the claim store (64MiB).
+// stdio backends are already line-capped at 16MiB; this bounds the otherwise
+// unbounded HTTP read path. Beyond it, ErrCodePayloadTooLarge as always.
+const claimMaxBody = 64 * 1024 * 1024
+
 // FrameKind is the value of the Mcp-Frame header.
 type FrameKind string
 

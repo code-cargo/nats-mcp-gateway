@@ -27,6 +27,7 @@ import (
 	"time"
 
 	nats "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
@@ -46,13 +47,16 @@ const minRecommendedPayload = 8 * 1024 * 1024
 // bootParams are the boot-time settings that do NOT hot-reload: the gateway's
 // own NATS connection and the wire's subject prefix / queue group / scoping.
 type bootParams struct {
-	url        string
-	credsFile  string
-	prefix     string
-	queueGroup string
-	tenant     string
-	user       string
-	pool       config.Pool
+	url           string
+	credsFile     string
+	prefix        string
+	queueGroup    string
+	tenant        string
+	user          string
+	pool          config.Pool
+	claimCheck    bool
+	claimMaxAge   time.Duration
+	claimMaxBytes int64
 }
 
 func runGateway(c *GatewayCmd, g *Globals, version string) error {
@@ -118,6 +122,23 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		queueGroup = "mcpgw." + boot.tenant + "." + boot.user
 	}
 
+	// Claim-check: park oversize responses in a JetStream Object Store for
+	// claim-accepting clients. JetStream being down is a boot warning, not a
+	// boot failure — Put failures degrade to -32012 at request time.
+	var claims wire.ClaimStore
+	if boot.claimCheck {
+		js, jsErr := jetstream.New(nc)
+		if jsErr != nil {
+			return fmt.Errorf("claim-check: %w", jsErr)
+		}
+		probeCtx, probeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if _, err := js.AccountInfo(probeCtx); err != nil {
+			log.Warn("claim-check enabled but JetStream is unreachable; oversize responses will fail with -32012 until it recovers", "err", err)
+		}
+		probeCancel()
+		claims = &wire.ObjectClaims{JS: js, MaxAge: boot.claimMaxAge, MaxBytes: boot.claimMaxBytes}
+	}
+
 	// Start the wire with an EMPTY server set; the first applied config
 	// populates it.
 	px := proxy.New(pool, log)
@@ -138,6 +159,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		Tenant:     boot.tenant,
 		User:       boot.user,
 		Version:    normalizeVersion(version),
+		Claims:     claims,
 	}, px.Handler())
 	if err != nil {
 		return err
@@ -198,7 +220,7 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 		if url == "" {
 			url = nats.DefaultURL
 		}
-		return bootParams{
+		boot := bootParams{
 			url:        url,
 			credsFile:  cfg.NATS.CredsFile,
 			prefix:     cfg.NATS.SubjectPrefix,
@@ -206,15 +228,26 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 			tenant:     cfg.NATS.Tenant,
 			user:       cfg.NATS.User,
 			pool:       cfg.Pool,
-		}, nil
+		}
+		if cc := cfg.ClaimCheck; cc != nil {
+			boot.claimCheck = true
+			if cc.MaxAge != "" {
+				boot.claimMaxAge, _ = time.ParseDuration(cc.MaxAge) // validated at load
+			}
+			boot.claimMaxBytes = cc.MaxBytes
+		}
+		return boot, nil
 	}
 	return bootParams{
-		url:        c.NatsURL,
-		credsFile:  c.NatsCreds,
-		prefix:     c.SubjectPrefix,
-		queueGroup: c.QueueGroup,
-		tenant:     c.ScopeTenant,
-		user:       c.ScopeUser,
+		url:           c.NatsURL,
+		credsFile:     c.NatsCreds,
+		prefix:        c.SubjectPrefix,
+		queueGroup:    c.QueueGroup,
+		tenant:        c.ScopeTenant,
+		user:          c.ScopeUser,
+		claimCheck:    c.ClaimCheck,
+		claimMaxAge:   c.ClaimMaxAge,
+		claimMaxBytes: c.ClaimMaxBytes,
 	}, nil
 }
 

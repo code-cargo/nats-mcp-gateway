@@ -57,6 +57,11 @@ type GatewayCmd struct {
 	ScopeTenant         string        `help:"Serve only this tenant's subjects (scoped/per-user pod mode; requires --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
 	ScopeUser           string        `help:"Serve only this user's subjects (scoped/per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 
+	// Claim-check (fetch source; the file source reads the claimCheck block).
+	ClaimCheck    bool          `help:"Park oversize responses in a JetStream Object Store for claim-accepting clients (fetch source; needs JetStream)." env:"NATSMCP_CLAIM_CHECK"`
+	ClaimMaxAge   time.Duration `help:"Claim bucket TTL — the cleanup backstop behind client deletes." default:"5m" env:"NATSMCP_CLAIM_MAX_AGE"`
+	ClaimMaxBytes int64         `help:"Per-tenant claim bucket size cap in bytes." default:"1073741824" env:"NATSMCP_CLAIM_MAX_BYTES"`
+
 	// Version is injected by main.
 	Version string `kong:"-"`
 }
@@ -75,6 +80,7 @@ type ShimCmd struct {
 	User          string `help:"User subject token for attribution ('_' if unset). Must match the token this caller's NATS creds are scoped to under per-user auth." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
+	AcceptClaims  bool   `help:"Accept claim-checked oversize responses (needs read access to this tenant's claim bucket)." env:"NATSMCP_ACCEPT_CLAIMS"`
 }
 
 func (c *ShimCmd) Run(g *Globals) error {
@@ -84,13 +90,14 @@ func (c *ShimCmd) Run(g *Globals) error {
 // CallCmd sends one request and prints raw reply frames, for debugging the
 // wire without an MCP client.
 type CallCmd struct {
-	Server  string `help:"Name of the MCP server to call." required:""`
-	Method  string `help:"MCP method (e.g. tools/list)." required:""`
-	Params  string `help:"JSON params." default:"{}"`
-	NatsURL string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds   string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
-	Tenant  string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
-	User    string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
+	Server       string `help:"Name of the MCP server to call." required:""`
+	Method       string `help:"MCP method (e.g. tools/list)." required:""`
+	Params       string `help:"JSON params." default:"{}"`
+	NatsURL      string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
+	Creds        string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Tenant       string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
+	User         string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
+	AcceptClaims bool   `help:"Accept claim-checked oversize responses." env:"NATSMCP_ACCEPT_CLAIMS"`
 }
 
 func (c *CallCmd) Run(g *Globals) error {

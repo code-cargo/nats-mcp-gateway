@@ -11,9 +11,15 @@ end users never hold them.
     │ stdio                       │                               │
     ▼                             ▼                               ▼
 ┌─────────┐  ═══ NATS ═══>  ┌─────────┐  ── stdio subprocess ──> github-mcp
-│  shim   │                 │ gateway │  ── Streamable HTTP ───> weather
-└─────────┘                 └─────────┘
- compat wing                 compat wing
+│  shim   │        ║        │ gateway │  ── Streamable HTTP ───> weather
+└─────────┘        ║        └─────────┘
+ compat wing       ║         compat wing
+                   ║
+                   ║  {tenant}.{user}-scoped subjects
+                   ╚═══════> ┌───────────────────────────────────┐
+                             │ per-user pod                      │
+                             │ gateway (scoped) ── stdio ──> aws │
+                             └───────────────────────────────────┘
 ```
 
 One binary, `natsmcp`, three subcommands:
@@ -50,6 +56,49 @@ Frames: `msg` carries one JSON-RPC notification; `end` carries the response
 gateway-synthesized error; `ka` is a 15s keepalive so idle streams are
 distinguishable from dead ones. A broken stream is reported as error `-32010`
 and the client re-issues — exactly what the 2026-07-28 spec mandates.
+
+## Large results (claim-check)
+
+Every message is bounded by the NATS server's `max_payload`, which the
+gateway learns from the connection handshake (`nc.MaxPayload()`) — there is
+no size config to keep in sync. A response that doesn't fit normally fails
+with a legible `-32012`. With **claim-check** enabled, the gateway instead
+parks the oversize body in a JetStream Object Store and sends only a
+reference (`Mcp-Claim` header on an empty `end` frame); the client fetches,
+digest-verifies, and deletes it before the MCP client sees anything:
+
+```
+gateway: body > max_payload → put MCP_CLAIMS_{tenant}/{random-id} → end + Mcp-Claim: id
+client:  end + Mcp-Claim     → fetch (SHA-256 verified) → delete → deliver inline
+```
+
+Both ends opt in — the feature is **off by default** and requires JetStream:
+
+```
+natsmcp gateway --config gw.json          # file mode: add "claimCheck": {"maxAge": "5m"}
+natsmcp gateway --config-subject … --claim-check   # fetch mode
+natsmcp shim --server aws --accept-claims          # client side (also: natsmcp call)
+```
+
+The gateway only claims for requests carrying `Mcp-Accept-Claim: 1` (a
+claimed frame's empty body would read as "cancelled" to an unaware client),
+so mixed fleets are safe. One bucket per tenant (`MCP_CLAIMS_{tenant}`)
+keeps the fencing in NATS permissions, same as request subjects — the
+callout grants clients read on their own bucket:
+
+```
+allow: ["$O.MCP_CLAIMS_acme.>"]   # object-store subjects for tenant acme
+```
+
+Objects live until fetched (client deletes eagerly) or until the bucket TTL
+(`maxAge`, default 5m) reaps them — a client that dies mid-fetch can
+re-issue and still succeed. `maxBytes` (default 1GiB) caps each tenant's
+bucket; single objects cap at 64MiB. Every failure degrades to the status
+quo: store unreachable at put time → `-32012`; fetch failure → `-32010`,
+re-issue. Within a tenant, claim secrecy rests on unguessable random ids and
+the privacy of reply inboxes. Cost: a claimed result takes roughly one extra
+disk round-trip on the JetStream node (~300ms for 8MB) — keep `max_payload`
+at 8MB so claims stay the rare tail, not the steady path.
 
 ## The authorization plane is NATS
 
@@ -171,20 +220,31 @@ credential, and per-user modes keep secrets out of the config entirely.
 | mode | grain | resolves via |
 |---|---|---|
 | `static` (default) | shared | config `env`/`headers` — today's behavior |
-| `file` | shared | mounted/rotated JSON file (`path`, optional `ttl`) |
-| `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`) |
-| `exec` | per-user | a credential-helper command (the universal adapter, below) |
-| `oauth-token-exchange` | per-user | RFC 8693: the user's identity assertion → a scoped access token |
-| `oauth-refresh` | per-user | refresh_token grant over per-user token files |
-| `nats` | per-user | request/reply to a controller (below) |
+| `file` | shared | a mounted/rotated file (`path`; optional `ttl`, default 1m, applied when the file carries no `expiresAt`) |
+| `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`; optional `scope`, `audience`) |
+| `exec` | per-user | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
+| `oauth-token-exchange` | per-user | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |
+| `oauth-refresh` | per-user | refresh_token grant (`tokenUrl`, `clientId`, `refreshTokenFile`; a rotated refresh token is written back) |
+| `nats` | per-user | request/reply to a controller (below; optional `subject` overrides the `mcp.v1.cred` prefix) |
+
+The file-path fields (`path`, `subjectTokenFile`, `refreshTokenFile`) accept
+`{tenant}`, `{user}`, `{server}` placeholders, and `file` reads the same
+`{"headers"|"env": {...}, "expiresAt": "RFC3339"}` JSON the `exec` helper
+prints.
 
 Per-user servers are pooled per `(server, tenant, user, credential
 generation)`: two users of one server get separate processes with their own
 credentials, a refreshed credential drains the old backend, and the pool
 recycles a backend before its credentials expire (an in-flight call at expiry
-fails with `-32010` and the client re-issues). Credential-resolution failures
-surface as **`-32014`**; the message says whether to retry (resolver
-unreachable) or not (the source refused). Mind `pool.maxProcsPerTenant`
+fails with `-32010` and the client re-issues). HTTP servers get the current
+bearer on every request, so a mid-life refresh needs no reconnect; on a `401`
+the gateway drops the cached credential, re-resolves, and retries exactly
+once — safe for any method, since a `401` rejects the request before the
+server executes it. Credential-resolution failures surface as **`-32014`**;
+the message says whether to retry (resolver unreachable) or not (the source
+refused), and failures are memoized with a short backoff (1s doubling to
+30s), so a resolver outage degrades into fast, legible errors instead of
+hammering the source at request rate. Mind `pool.maxProcsPerTenant`
 (default 16): per-user stdio servers count each `(user, server)` process
 against it, so size it to roughly users × stdio servers per tenant.
 
@@ -345,10 +405,16 @@ code running**. See `demo/README-steps` inside `demo/run.sh`.
 - `notifications/message` (logging) has no per-request correlator in a
   multiplexed process; it lands in the gateway's own logs, tagged with
   tenant and server, and is never forwarded.
-- Payloads are bounded by NATS `max_payload`; no chunking (planned:
-  claim-check via JetStream Object Store).
+- Payloads are bounded by NATS `max_payload` unless claim-check is enabled
+  (see "Large results"), and even then single results cap at 64MiB.
+  Request-direction bodies (large uploads) are always bounded by
+  `max_payload` — claim-check covers responses only.
 - `resourceSubscriptions` inside `subscriptions/listen` is not yet bridged
   for legacy backends (`*/list_changed` events are).
+- Credential-expired backends are recycled on their next use and by the
+  reaper, but only when idle: a long-lived in-flight call (a
+  `subscriptions/listen` stream) can pin its process past the credentials'
+  expiry until it completes.
 
 ## Development
 

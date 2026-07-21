@@ -32,9 +32,21 @@ import (
 
 // Config is the gateway configuration.
 type Config struct {
-	NATS    NATS              `json:"nats"`
-	Servers map[string]Server `json:"servers"`
-	Pool    Pool              `json:"pool"`
+	NATS       NATS              `json:"nats"`
+	Servers    map[string]Server `json:"servers"`
+	Pool       Pool              `json:"pool"`
+	ClaimCheck *ClaimCheck       `json:"claimCheck"`
+}
+
+// ClaimCheck enables parking oversize responses in a JetStream Object Store
+// (presence = enabled; requires JetStream on the NATS server). Boot-fixed,
+// like the pool.
+type ClaimCheck struct {
+	// MaxAge is the per-tenant bucket TTL (Go duration, default "5m") — the
+	// cleanup backstop behind the client's eager delete.
+	MaxAge string `json:"maxAge"`
+	// MaxBytes caps each tenant's bucket (default 1GiB).
+	MaxBytes int64 `json:"maxBytes"`
 }
 
 // NATS is the gateway's connection settings.
@@ -242,6 +254,16 @@ func parse(raw []byte, strict bool) (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	if cc := c.ClaimCheck; cc != nil {
+		if cc.MaxAge != "" {
+			if _, err := time.ParseDuration(cc.MaxAge); err != nil {
+				return fmt.Errorf("claimCheck.maxAge: %w", err)
+			}
+		}
+		if cc.MaxBytes < 0 {
+			return fmt.Errorf("claimCheck.maxBytes must be >= 0")
+		}
+	}
 	if (c.NATS.Tenant == "") != (c.NATS.User == "") {
 		return fmt.Errorf("nats: scoping requires both tenant and user (got tenant=%q, user=%q)", c.NATS.Tenant, c.NATS.User)
 	}

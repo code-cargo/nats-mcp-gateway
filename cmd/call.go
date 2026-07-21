@@ -20,6 +20,7 @@ import (
 	"fmt"
 
 	nats "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
@@ -68,7 +69,15 @@ func runCall(c *CallCmd, g *Globals) error {
 		name = s
 	}
 
-	wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: c.Tenant, User: c.User})
+	cfg := wire.ClientConfig{Tenant: c.Tenant, User: c.User}
+	if c.AcceptClaims {
+		js, err := jetstream.New(nc)
+		if err != nil {
+			return fmt.Errorf("accept-claims: %w", err)
+		}
+		cfg.Claims = &wire.ObjectClaims{JS: js}
+	}
+	wc, err := wire.NewClient(nc, cfg)
 	if err != nil {
 		return err
 	}

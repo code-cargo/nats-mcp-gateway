@@ -20,6 +20,7 @@ import (
 	"os"
 
 	nats "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/shim"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
@@ -44,11 +45,19 @@ func runShim(c *ShimCmd, g *Globals) error {
 	}
 	defer nc.Close()
 
-	wc, err := wire.NewClient(nc, wire.ClientConfig{
+	cfg := wire.ClientConfig{
 		Prefix: c.SubjectPrefix,
 		Tenant: c.Tenant,
 		User:   c.User,
-	})
+	}
+	if c.AcceptClaims {
+		js, err := jetstream.New(nc)
+		if err != nil {
+			return fmt.Errorf("accept-claims: %w", err)
+		}
+		cfg.Claims = &wire.ObjectClaims{JS: js}
+	}
+	wc, err := wire.NewClient(nc, cfg)
 	if err != nil {
 		return err
 	}

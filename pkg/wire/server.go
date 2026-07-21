@@ -91,6 +91,10 @@ type ServerConfig struct {
 	Version string
 	// KeepAlive overrides DefaultKeepAlive when > 0.
 	KeepAlive time.Duration
+	// Claims, when set, parks oversize responses in a claim store instead of
+	// failing them with ErrCodePayloadTooLarge — but only for callers that
+	// sent HeaderAcceptClaim. Nil disables claim-check (today's behavior).
+	Claims ClaimStore
 }
 
 // Server is a running wire endpoint fleet member. It runs one micro service
@@ -107,6 +111,7 @@ type Server struct {
 	name       string
 	version    string
 	keepAlive  time.Duration
+	claims     ClaimStore
 
 	svcMu sync.Mutex
 	svcs  map[string]micro.Service // server name -> its micro service
@@ -152,6 +157,7 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		name:       cfg.Name,
 		version:    cfg.Version,
 		keepAlive:  cfg.KeepAlive,
+		claims:     cfg.Claims,
 		svcs:       make(map[string]micro.Service),
 		base:       base,
 		cancel:     cancel,
@@ -261,6 +267,9 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 			_ = w.errWithID(nil, jsonrpc.CodeInvalidRequest, err.Error(), nil)
 			return
 		}
+		w.claims = s.claims
+		w.tenant = parsed.Tenant
+		w.acceptClaim = req.Headers().Get(HeaderAcceptClaim) == "1"
 		if v := req.Headers().Get(HeaderWire); v != WireVersion {
 			_ = w.errWithID(nil, jsonrpc.CodeInvalidRequest,
 				fmt.Sprintf("unsupported wire version %q (want %s)", v, WireVersion), nil)
@@ -342,6 +351,12 @@ type streamWriter struct {
 	req micro.Request
 	id  []byte // raw JSON-RPC id of the request, for synthesized errors
 
+	// Claim-check state, set once the subject has parsed: the store, the
+	// tenant fencing the bucket, and whether THIS caller opted in.
+	claims      ClaimStore
+	tenant      string
+	acceptClaim bool
+
 	mu   sync.Mutex
 	done bool
 }
@@ -382,6 +397,24 @@ func (w *streamWriter) Msg(body []byte) error {
 
 func (w *streamWriter) End(body []byte) error {
 	if max := w.nc.MaxPayload(); int64(len(body)) > max {
+		// Claim-check: park the body and send only the reference — but only
+		// for callers that opted in (HeaderAcceptClaim), because a claimed
+		// end frame's empty body would read as "cancelled" to anyone else.
+		if w.claims != nil && w.acceptClaim && len(body) <= claimMaxBody {
+			ctx, cancel := context.WithTimeout(context.Background(), claimOpTimeout)
+			id, err := w.claims.Put(ctx, w.tenant, body)
+			cancel()
+			if err == nil {
+				if !w.claim() {
+					return nil
+				}
+				return w.req.Respond(nil, micro.WithHeaders(micro.Headers{
+					HeaderFrame: []string{string(FrameEnd)},
+					HeaderClaim: []string{id},
+				}))
+			}
+			// Fall through: degrade to the legible oversize error, never a hang.
+		}
 		return w.Err(ErrCodePayloadTooLarge,
 			fmt.Sprintf("response %d bytes exceeds NATS max_payload %d", len(body), max),
 			map[string]int64{"size": int64(len(body)), "limit": max})

@@ -186,3 +186,26 @@ func TestNATSScopingValidation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not subject-token safe")
 }
+
+func TestClaimCheckValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"claimCheck":{"maxAge":"10m","maxBytes":1000000},"servers":{}}`))
+	require.NoError(t, err)
+	require.NotNil(t, cfg.ClaimCheck)
+	assert.Equal(t, "10m", cfg.ClaimCheck.MaxAge)
+
+	cfg, err = Parse([]byte(`{"claimCheck":{},"servers":{}}`))
+	require.NoError(t, err, "empty block = enabled with defaults")
+	require.NotNil(t, cfg.ClaimCheck)
+
+	cfg, err = Parse([]byte(`{"servers":{}}`))
+	require.NoError(t, err)
+	assert.Nil(t, cfg.ClaimCheck, "absent block = disabled")
+
+	_, err = Parse([]byte(`{"claimCheck":{"maxAge":"soon"},"servers":{}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "claimCheck.maxAge")
+
+	_, err = Parse([]byte(`{"claimCheck":{"maxBytes":-1},"servers":{}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "maxBytes")
+}
