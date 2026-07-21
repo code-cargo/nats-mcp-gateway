@@ -53,6 +53,9 @@ func stack(t *testing.T, natsOpts *server.Options) (*nats.Conn, *wire.Client) {
 	natsOpts.Port = -1
 	natsOpts.NoLog = true
 	natsOpts.NoSigs = true
+	if natsOpts.MaxPayload == 0 {
+		natsOpts.MaxPayload = 8 * 1024 * 1024 // production-recommended size (see README)
+	}
 	srv, err := server.NewServer(natsOpts)
 	require.NoError(t, err)
 	go srv.Start()

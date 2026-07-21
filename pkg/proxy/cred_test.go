@@ -47,7 +47,7 @@ func decodeMsg(t *testing.T, body []byte) *jsonrpc.Message {
 // injects the resolved env over the fakemcp base env.
 func credStack(t *testing.T, resolver *cred.CachedResolver) *nats.Conn {
 	t.Helper()
-	natsOpts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true}
+	natsOpts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
 	srv, err := server.NewServer(natsOpts)
 	require.NoError(t, err)
 	go srv.Start()

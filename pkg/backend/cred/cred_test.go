@@ -182,7 +182,7 @@ func TestOAuthRefreshRotation(t *testing.T) {
 }
 
 func TestNATSResolver(t *testing.T) {
-	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true}
+	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
 	srv, err := server.NewServer(opts)
 	require.NoError(t, err)
 	go srv.Start()

@@ -40,6 +40,9 @@ func runNATS(t *testing.T, opts *server.Options) *nats.Conn {
 	// Silence logging; keep JetStream off.
 	opts.NoLog = true
 	opts.NoSigs = true
+	if opts.MaxPayload == 0 {
+		opts.MaxPayload = 8 * 1024 * 1024 // production-recommended size (see README)
+	}
 	srv, err := server.NewServer(opts)
 	require.NoError(t, err)
 	go srv.Start()
@@ -362,4 +365,61 @@ func TestServeRejectsHalfScoping(t *testing.T) {
 	_, err := Serve(nc, ServerConfig{Tenant: "acme", Servers: []string{"test"}}, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "both Tenant and User")
+}
+
+// A NATS publish denial must fail the stream immediately with -32013 — not
+// sit out the inactivity window. The violation arrives as an async connection
+// error; the client's registry maps it back to the exact denied subject.
+func TestPermissionViolationFailsFast(t *testing.T) {
+	opts := &server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{{
+			Username: "restricted", Password: "pw",
+			Permissions: &server.Permissions{
+				Publish:   &server.SubjectPermission{Allow: []string{"mcp.v1.req.acme._.allowed.>", "_INBOX.>"}},
+				Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX.>"}},
+			},
+		}},
+	}
+	srv, err := server.NewServer(opts)
+	require.NoError(t, err)
+	go srv.Start()
+	require.True(t, srv.ReadyForConnections(5*time.Second))
+	t.Cleanup(srv.Shutdown)
+
+	nc, err := nats.Connect(srv.ClientURL(), nats.UserInfo("restricted", "pw"))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	// Inactivity far beyond collect's own 10s timeout: if the fast-fail path
+	// is broken, the frame would only arrive at the inactivity deadline and
+	// collect would fatal first.
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", Inactivity: 30 * time.Second})
+	require.NoError(t, err)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": map[string]any{},
+	})
+	s, err := c.Do(context.Background(), &Request{
+		Server: "denied", Method: "tools/call", ProtocolVersion: "2026-07-28", Body: body,
+	})
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.NotNil(t, frames[0].Err)
+	assert.Equal(t, ErrCodePermissionDenied, frames[0].Err.Code)
+	assert.Contains(t, frames[0].Err.Message, "permissions do not cover")
+
+	// An allowed subject on the same connection still works normally
+	// (no-responders here, since nothing serves it — the point is the
+	// publish itself is permitted and fails differently).
+	s, err = c.Do(context.Background(), &Request{
+		Server: "allowed", Method: "tools/call", ProtocolVersion: "2026-07-28", Body: body,
+	})
+	require.NoError(t, err)
+	frames = collect(t, s)
+	require.Len(t, frames, 1)
+	require.NotNil(t, frames[0].Err)
+	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 }

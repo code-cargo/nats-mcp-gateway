@@ -20,7 +20,8 @@
 // assertions), slow (N progress notifications then a result), crash (exits
 // mid-request), huge (returns > 1 MiB), wedge (never responds), sample
 // (initiates a server->client request, which the gateway must reject without
-// wedging this process).
+// wedging this process), listen_event (emits a subscription-correlated
+// notification, for mux routing tests).
 //
 // Env knobs: FAKEMCP_PROTOCOL=2025-11-25 makes it a legacy server that
 // requires the initialize handshake before serving. FAKEMCP_BANNER=1 prints
@@ -244,6 +245,19 @@ func (s *server) handleToolCall(msg *jsonrpc.Message) {
 		})
 	case "wedge":
 		select {} // never responds; tests the cancellation/timeout path
+	case "listen_event":
+		// Emits a notification correlated to THIS request via _meta
+		// subscriptionId (the 2026-07-28 subscriptions/listen shape), then
+		// the result: exercises the mux's subscription routing.
+		params, _ := json.Marshal(map[string]any{
+			"uri":   "file:///watched",
+			"_meta": map[string]any{mcpspec.MetaSubscriptionID: json.RawMessage(msg.ID)},
+		})
+		s.send(jsonrpc.NewNotification("notifications/resources/updated", params))
+		s.result(msg.ID, map[string]any{
+			"resultType": mcpspec.ResultTypeComplete,
+			"content":    []map[string]any{{"type": "text", "text": "listening"}},
+		})
 	case "notify_changed":
 		// Emits a legacy tools/list_changed notification, then succeeds:
 		// exercises the subscriptions/listen synthesis in the legacy bridge.

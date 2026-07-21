@@ -244,7 +244,7 @@ func TestFileSourceReloadOnChange(t *testing.T) {
 
 func runNATS(t *testing.T) *nats.Conn {
 	t.Helper()
-	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true}
+	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
 	s, err := server.NewServer(opts)
 	require.NoError(t, err)
 	go s.Start()
