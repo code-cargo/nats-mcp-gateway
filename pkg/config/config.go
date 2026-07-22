@@ -149,6 +149,12 @@ func (a *Auth) PerUser() bool {
 	switch a.Mode {
 	case AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh:
 		return true
+	case AuthFile:
+		// A {user}-templated path is per-user by construction; without it
+		// the file is one shared credential. Deciding from the path keeps
+		// the grain truthful — a fixed shared grain here would silently
+		// resolve every caller's file as user "_".
+		return strings.Contains(a.Path, "{user}")
 	}
 	return false
 }

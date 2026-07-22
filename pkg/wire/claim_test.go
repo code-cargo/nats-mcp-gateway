@@ -207,3 +207,30 @@ func TestClaimToNonAcceptingClientIsRejected(t *testing.T) {
 	require.NotNil(t, frames[0].Err)
 	assert.Contains(t, frames[0].Err.Message, "did not accept")
 }
+
+// The Put retry fires ONLY for a vanished bucket — other failures (quota,
+// oversize) fail fast instead of re-uploading the body and stomping the
+// bucket's settings.
+func TestClaimPutRecoversFromDeletedBucketOnly(t *testing.T) {
+	nc := jsNATS(t, 0)
+	js, err := jetstream.New(nc)
+	require.NoError(t, err)
+	oc := &ObjectClaims{JS: js, MaxAge: time.Minute}
+	ctx := context.Background()
+
+	// Prime the cached bucket handle, then delete the bucket out from
+	// under it: the next Put must transparently recreate and succeed.
+	_, err = oc.Put(ctx, "acme", []byte("first"))
+	require.NoError(t, err)
+	require.NoError(t, js.DeleteObjectStore(ctx, "MCP_CLAIMS_acme"))
+	id, err := oc.Put(ctx, "acme", []byte("second"))
+	require.NoError(t, err, "a deleted bucket must be rebuilt on the next Put")
+	got, err := oc.Fetch(ctx, "acme", id)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("second"), got)
+
+	// A quota failure is NOT bucket-missing: it must fail without retry.
+	tiny := &ObjectClaims{JS: js, MaxAge: time.Minute, MaxBytes: 1024}
+	_, err = tiny.Put(ctx, "cramped", bytes.Repeat([]byte("x"), 64*1024))
+	require.Error(t, err, "a quota failure must surface, not retry")
+}

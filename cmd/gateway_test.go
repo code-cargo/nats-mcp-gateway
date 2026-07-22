@@ -26,12 +26,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
@@ -117,26 +117,7 @@ func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 
 func (a *assembled) call(t *testing.T, serverName, tool string) wire.Frame {
 	t.Helper()
-	c, err := wire.NewClient(a.clientNC, wire.ClientConfig{Tenant: "demo", Inactivity: 3 * time.Second})
-	require.NoError(t, err)
-	params, _ := json.Marshal(map[string]any{
-		"name": tool, "arguments": map[string]any{},
-		"_meta": map[string]any{mcpspec.MetaProtocolVersion: mcpspec.ProtocolVersion},
-	})
-	body, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0", "id": "1", "method": "tools/call",
-		"params": json.RawMessage(params),
-	})
-	s, err := c.Do(context.Background(), &wire.Request{
-		Server: serverName, Method: "tools/call", Name: tool,
-		ProtocolVersion: mcpspec.ProtocolVersion, Body: body,
-	})
-	require.NoError(t, err)
-	var last wire.Frame
-	for f := range s.C {
-		last = f
-	}
-	return last
+	return a.callAs(t, "", serverName, tool, nil)
 }
 
 func mustPID(t *testing.T, f wire.Frame) float64 {
@@ -153,16 +134,7 @@ func mustPID(t *testing.T, f wire.Frame) float64 {
 
 func fetchNATS(t *testing.T) (*nats.Conn, string) {
 	t.Helper()
-	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
-	s, err := server.NewServer(opts)
-	require.NoError(t, err)
-	go s.Start()
-	require.True(t, s.ReadyForConnections(5*time.Second))
-	t.Cleanup(s.Shutdown)
-	nc, err := nats.Connect(s.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
-	return nc, s.ClientURL()
+	return natstest.Run(t, nil)
 }
 
 // mutableConfig serves a config over request/reply and publishes change events.
@@ -394,4 +366,55 @@ echo "{\"env\":{\"TOKEN\":\"tok-$NATSMCP_CRED_USER\"},\"expiresAt\":\"2100-01-01
 	assert.Equal(t, "tok-bob", tokBob)
 	assert.NotEqual(t, pidAlice, pidBob, "per-user servers must not share a process across users")
 	assert.Equal(t, "eu-1", region, "config env non-secrets must survive the credential merge")
+}
+
+// buildBackend refuses to build when the credentials rotated between the
+// proxy's resolve (which stamped the pool key) and its own — a mislabeled
+// entry would alias the pool. The caller retries and keys the new generation.
+func TestBuildBackendRejectsGenerationMismatch(t *testing.T) {
+	calls := 0
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(context.Context, string, string, string) (*cred.Credentials, error) {
+			calls++
+			return &cred.Credentials{Env: map[string]string{"TOKEN": fmt.Sprintf("t%d", calls)}}, nil
+		},
+	), 0)
+
+	_, gen, err := resolver.ResolveGen(context.Background(), "acme", "u1", "s")
+	require.NoError(t, err)
+
+	// Simulate a rotation between the proxy's resolve and the factory's.
+	resolver.Invalidate("acme", "u1", "s")
+
+	key := backend.Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: gen}
+	_, err = buildBackend(key, config.Server{Command: "true"}, resolver, testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "rotated during spawn")
+
+	// With a consistent key the build succeeds.
+	_, gen2, err := resolver.ResolveGen(context.Background(), "acme", "u1", "s")
+	require.NoError(t, err)
+	key.CredVersion = gen2
+	_, err = buildBackend(key, config.Server{Command: "true"}, resolver, testLogger())
+	require.NoError(t, err)
+}
+
+// A server removed from config must not leave its resolver (and cached
+// credential material) behind in the registry.
+func TestCredRegistryPrunesRemovedServers(t *testing.T) {
+	r := &credRegistry{log: testLogger()}
+	srv := config.Server{Command: "x", Auth: &config.Auth{Mode: config.AuthExec, Command: "helper"}}
+
+	resolver, perUser := r.lookup("gone", srv)
+	require.NotNil(t, resolver)
+	require.True(t, perUser)
+	require.Len(t, r.entries, 1)
+
+	r.prune(map[string]config.Server{"kept": srv})
+	assert.Empty(t, r.entries, "a removed server's resolver must be pruned")
+
+	// Present servers survive a prune.
+	r.lookup("kept", srv)
+	r.prune(map[string]config.Server{"kept": srv})
+	assert.Len(t, r.entries, 1)
 }

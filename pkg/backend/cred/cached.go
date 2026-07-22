@@ -16,6 +16,7 @@ package cred
 
 import (
 	"context"
+	"maps"
 	rand "math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -43,17 +44,28 @@ const (
 	idleEvict  = 30 * time.Minute
 )
 
+// globalGen issues credential generations for EVERY CachedResolver in the
+// process. Package-global on purpose: the gateway rebuilds a server's
+// resolver when its auth config changes, and a per-resolver counter would
+// restart at 1 — colliding with pool keys minted by the previous resolver
+// and aliasing stale backends. A process-wide monotonic counter can never
+// repeat.
+var globalGen atomic.Int64
+
+// refreshTimeout bounds one background refresh-ahead resolve (the inner
+// resolvers carry their own tighter timeouts).
+const refreshTimeout = 45 * time.Second
+
 // CachedResolver wraps a Resolver with the caching every mode needs, so no
 // resolver author reimplements it: TTL cache keyed (tenant, user, server),
-// single-flight per key, failure backoff, and a monotonic generation counter.
-// The generation becomes the pool key's CredVersion — it is resolver-global,
-// not per-key, so a swept-and-recreated entry can never repeat a generation
-// and alias a stale pooled backend.
+// single-flight per key, failure backoff, refresh-ahead, and a monotonic
+// generation counter (the pool key's CredVersion). The generation advances
+// only when the credential MATERIAL changes — a refresh that returns
+// identical headers/env keeps its generation, so steadily-renewed identical
+// credentials don't churn pooled backends.
 type CachedResolver struct {
 	inner Resolver
 	skew  time.Duration
-
-	gen atomic.Int64
 
 	mu        sync.Mutex
 	entries   map[cacheKey]*cacheEntry
@@ -63,17 +75,21 @@ type CachedResolver struct {
 type cacheKey struct{ tenant, user, server string }
 
 type cacheEntry struct {
-	// mu is held across an inner Resolve: concurrent misses on one key
-	// single-flight behind it (and pick up the winner's result), while other
-	// keys proceed independently.
-	mu       sync.Mutex
-	creds    *Credentials
-	gen      int
-	jitter   time.Duration
-	fails    int
-	lastErr  error
-	retryAt  time.Time
-	lastUsed time.Time // guarded by CachedResolver.mu, not entry.mu
+	// mu is held across an inner Resolve only when the credentials are
+	// absent or actually expired: those callers single-flight behind it.
+	// Inside the refresh-ahead window, callers are served the still-valid
+	// credentials immediately and one background goroutine refreshes
+	// without holding mu across its I/O.
+	mu         sync.Mutex
+	creds      *Credentials
+	gen        int
+	refreshAt  time.Time // when refresh-ahead should begin
+	refreshing bool
+	jitter     time.Duration
+	fails      int
+	lastErr    error
+	retryAt    time.Time
+	lastUsed   time.Time // guarded by CachedResolver.mu, not entry.mu
 }
 
 // Cached wraps inner. skew <= 0 uses DefaultSkew.
@@ -95,35 +111,95 @@ func (c *CachedResolver) Resolve(ctx context.Context, tenant, user, server strin
 }
 
 // ResolveGen resolves and also returns the credentials' generation — the
-// value the proxy threads into the pool key so a refreshed credential yields
-// a new pool entry and the old backend drains.
+// value the proxy threads into the pool key so a CHANGED credential yields a
+// new pool entry and the old backend drains. Still-valid credentials are
+// served immediately; inside the refresh-ahead window a single background
+// refresh runs so callers never block on renewal they don't need.
 func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server string) (*Credentials, int, error) {
 	e := c.entry(tenant, user, server)
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	now := time.Now()
-	if e.creds != nil && (e.creds.ExpiresAt.IsZero() || now.Before(e.creds.ExpiresAt.Add(-c.skew-e.jitter))) {
-		return e.creds, e.gen, nil
-	}
-	if now.Before(e.retryAt) {
-		return nil, 0, e.lastErr
+	if e.creds != nil && (e.creds.ExpiresAt.IsZero() || now.Before(e.creds.ExpiresAt)) {
+		// Valid. Kick one background refresh once inside the lead window
+		// (unless a recent failure's backoff says wait).
+		if !e.creds.ExpiresAt.IsZero() && now.After(e.refreshAt) && !e.refreshing && now.After(e.retryAt) {
+			e.refreshing = true
+			go c.refreshAhead(e, tenant, user, server)
+		}
+		creds, gen := e.creds, e.gen
+		e.mu.Unlock()
+		return creds, gen, nil
 	}
 
-	creds, err := c.inner.Resolve(ctx, tenant, user, server)
-	if err != nil {
-		e.fails++
-		e.lastErr = err
-		e.retryAt = now.Add(failBackoff(e.fails))
+	// Absent or expired: resolve under e.mu so concurrent misses
+	// single-flight behind the first caller.
+	if now.Before(e.retryAt) {
+		err := e.lastErr
+		e.mu.Unlock()
 		return nil, 0, err
 	}
+	creds, err := c.inner.Resolve(ctx, tenant, user, server)
+	if err != nil {
+		// A failure caused by the CALLER (its context cancelled or timed
+		// out mid-resolve) says nothing about the credential source — do
+		// not memoize it, or one impatient client poisons the key for
+		// everyone else within the backoff window.
+		if ctx.Err() == nil {
+			e.fails++
+			e.lastErr = err
+			e.retryAt = now.Add(failBackoff(e.fails))
+		}
+		e.mu.Unlock()
+		return nil, 0, err
+	}
+	c.store(e, creds, now)
+	creds, gen := e.creds, e.gen
+	e.mu.Unlock()
+	return creds, gen, nil
+}
+
+// refreshAhead renews one entry's credentials in the background, resolving
+// WITHOUT holding e.mu so valid-credential callers never block behind it.
+func (c *CachedResolver) refreshAhead(e *cacheEntry, tenant, user, server string) {
+	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+	defer cancel()
+	creds, err := c.inner.Resolve(ctx, tenant, user, server)
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.refreshing = false
+	if err != nil {
+		// The old credentials keep serving until their real expiry; the
+		// backoff throttles further refresh attempts.
+		e.fails++
+		e.lastErr = err
+		e.retryAt = time.Now().Add(failBackoff(e.fails))
+		return
+	}
+	c.store(e, creds, time.Now())
+}
+
+// store records freshly-resolved credentials (e.mu held). The generation
+// advances only when the injectable material changed; the refresh-ahead
+// deadline is clamped so short-TTL credentials still cache for at least half
+// their life instead of resolving on every request.
+func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time) {
 	if creds == nil {
 		creds = &Credentials{}
 	}
+	if e.creds == nil || !maps.Equal(e.creds.Headers, creds.Headers) || !maps.Equal(e.creds.Env, creds.Env) {
+		e.gen = int(globalGen.Add(1))
+	}
 	e.creds = creds
-	e.gen = int(c.gen.Add(1))
 	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
-	return e.creds, e.gen, nil
+	if !creds.ExpiresAt.IsZero() {
+		lead := c.skew + e.jitter
+		if ttl := creds.ExpiresAt.Sub(now); lead > ttl/2 {
+			lead = ttl / 2
+		}
+		e.refreshAt = creds.ExpiresAt.Add(-lead)
+	}
 }
 
 // Invalidate drops the cached credentials for one key so the next Resolve

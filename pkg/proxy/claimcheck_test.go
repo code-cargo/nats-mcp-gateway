@@ -21,12 +21,12 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server"
-	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
@@ -35,20 +35,10 @@ import (
 // >2MiB result through a 1MB max_payload NATS — impossible inline, delivered
 // transparently via the claim store.
 func TestE2EClaimCheckHugeResult(t *testing.T) {
-	natsOpts := &server.Options{
-		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+	nc, _ := natstest.Run(t, &server.Options{
 		JetStream: true, StoreDir: t.TempDir(),
 		MaxPayload: 1024 * 1024,
-	}
-	srv, err := server.NewServer(natsOpts)
-	require.NoError(t, err)
-	go srv.Start()
-	require.True(t, srv.ReadyForConnections(5*time.Second))
-	t.Cleanup(srv.Shutdown)
-
-	nc, err := nats.Connect(srv.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	})
 	js, err := jetstream.New(nc)
 	require.NoError(t, err)
 	claims := &wire.ObjectClaims{JS: js}

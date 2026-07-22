@@ -53,7 +53,7 @@ type GatewayCmd struct {
 	NatsURL             string        `help:"NATS URL (fetch source)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
 	NatsCreds           string        `help:"NATS credentials file (fetch source)." env:"NATSMCP_NATS_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch source)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
-	QueueGroup          string        `help:"Wire queue group (fetch source)." default:"mcpgw" env:"NATSMCP_QUEUE_GROUP"`
+	QueueGroup          string        `help:"Wire queue group (fetch source; default mcpgw, or mcpgw.{tenant}.{user} for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
 	ScopeTenant         string        `help:"Serve only this tenant's subjects (scoped/per-user pod mode; requires --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
 	ScopeUser           string        `help:"Serve only this user's subjects (scoped/per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 

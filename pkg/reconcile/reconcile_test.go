@@ -21,12 +21,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
@@ -98,16 +98,7 @@ type stack struct {
 
 func newStack(t *testing.T) *stack {
 	t.Helper()
-	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
-	s, err := server.NewServer(opts)
-	require.NoError(t, err)
-	go s.Start()
-	require.True(t, s.ReadyForConnections(5*time.Second))
-	t.Cleanup(s.Shutdown)
-
-	nc, err := nats.Connect(s.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	nc, _ := natstest.Run(t, nil)
 
 	st := &stack{nc: nc}
 	st.pool = backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {

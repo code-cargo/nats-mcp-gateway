@@ -114,14 +114,6 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}, factory, log)
 	defer pool.Shutdown()
 
-	// A scoped instance defaults to its own queue group: sharing "mcpgw"
-	// with a central gateway fleet serving the same server names would make
-	// the two compete for the scoped traffic.
-	queueGroup := boot.queueGroup
-	if boot.tenant != "" && queueGroup == "" {
-		queueGroup = "mcpgw." + boot.tenant + "." + boot.user
-	}
-
 	// Claim-check: park oversize responses in a JetStream Object Store for
 	// claim-accepting clients. JetStream being down is a boot warning, not a
 	// boot failure — Put failures degrade to -32012 at request time.
@@ -153,9 +145,11 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		}
 		return registry.lookup(server, s)
 	}
+	// The queue-group default (scoped-aware) lives in wire.Serve, so an
+	// empty group here is correct for every config source.
 	ws, err := wire.Serve(nc, wire.ServerConfig{
 		Prefix:     boot.prefix,
-		QueueGroup: queueGroup,
+		QueueGroup: boot.queueGroup,
 		Tenant:     boot.tenant,
 		User:       boot.user,
 		Version:    normalizeVersion(version),
@@ -196,6 +190,9 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	// fatal initial-config error.
 	runErr := configsource.Run(ctx, log, source, func(cfg *config.Config) error {
 		_, err := rec.Apply(cfg)
+		if err == nil {
+			registry.prune(cfg.Servers)
+		}
 		return err
 	})
 
@@ -288,9 +285,18 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 	if resolver != nil {
 		// Steady-state this is a cache hit: the proxy resolved the same key
 		// to build the pool key just before spawning us.
-		c, _, err := resolver.ResolveGen(context.Background(), key.Tenant, credUser, key.Server)
+		c, gen, err := resolver.ResolveGen(context.Background(), key.Tenant, credUser, key.Server)
 		if err != nil {
 			return nil, fmt.Errorf("resolving credentials for %s/%s: %w", key.Tenant, key.Server, err)
+		}
+		if gen != key.CredVersion {
+			// The credentials rotated between the proxy's resolve and ours:
+			// building now would file generation-N+1 material under an
+			// N-stamped key, aliasing the pool. Fail the spawn — the caller
+			// gets a retryable error and the re-issue keys the new
+			// generation.
+			return nil, fmt.Errorf("credentials for %s/%s rotated during spawn (generation %d != %d), re-issue",
+				key.Tenant, key.Server, gen, key.CredVersion)
 		}
 		creds = c
 	}
@@ -367,9 +373,28 @@ type credRegistry struct {
 }
 
 type credRegEntry struct {
+	// authPtr is the *config.Auth this entry was built from. Config reloads
+	// swap whole *Config values and never mutate Auth in place, so pointer
+	// equality answers the per-request "did the auth change?" check without
+	// marshaling; authJSON is the reload-time fallback that keeps the
+	// resolver (and its credential cache) across a benign reload.
+	authPtr  *config.Auth
 	authJSON string
 	resolver *cred.CachedResolver
 	perUser  bool
+}
+
+// prune drops registry entries for servers no longer in the config, so a
+// deleted server's resolver — and the credential material in its cache —
+// doesn't outlive the server. Called after every successful config apply.
+func (r *credRegistry) prune(servers map[string]config.Server) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for name := range r.entries {
+		if _, ok := servers[name]; !ok {
+			delete(r.entries, name)
+		}
+	}
 }
 
 // lookup returns the server's resolver (nil for static credentials) and
@@ -378,20 +403,28 @@ func (r *credRegistry) lookup(name string, s config.Server) (*cred.CachedResolve
 	if !s.Auth.Dynamic() {
 		return nil, false
 	}
-	authJSON, err := json.Marshal(s.Auth)
-	if err != nil {
-		r.log.Error("marshaling auth config", "server", name, "err", err)
-		return nil, false
-	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.entries == nil {
 		r.entries = make(map[string]*credRegEntry)
 	}
-	if e := r.entries[name]; e != nil && e.authJSON == string(authJSON) {
+	e := r.entries[name]
+	if e != nil && e.authPtr == s.Auth {
+		return e.resolver, e.perUser // steady state: no marshal on the request path
+	}
+	authJSON, err := json.Marshal(s.Auth)
+	if err != nil {
+		r.log.Error("marshaling auth config", "server", name, "err", err)
+		return nil, false
+	}
+	if e != nil && e.authJSON == string(authJSON) {
+		// A reload swapped the pointer but not the config: keep the
+		// resolver and its cache, re-anchor the fast path.
+		e.authPtr = s.Auth
 		return e.resolver, e.perUser
 	}
-	e := &credRegEntry{
+	e = &credRegEntry{
+		authPtr:  s.Auth,
 		authJSON: string(authJSON),
 		resolver: cred.Cached(buildResolver(s.Auth, r.nc), 0),
 		perUser:  s.Auth.PerUser(),

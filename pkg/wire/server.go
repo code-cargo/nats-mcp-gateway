@@ -126,7 +126,17 @@ type Server struct {
 // the backend pool, not the wire.
 func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	if cfg.QueueGroup == "" {
-		cfg.QueueGroup = "mcpgw"
+		// A scoped instance defaults to its OWN queue group: NATS dedupes
+		// queue subscribers by group name across different subject patterns,
+		// so sharing "mcpgw" with an unscoped fleet serving the same server
+		// names would make the two compete for the scoped user's traffic.
+		// This default lives here — not in the CLI — so every config source
+		// gets it.
+		if cfg.Tenant != "" {
+			cfg.QueueGroup = "mcpgw." + cfg.Tenant + "." + cfg.User
+		} else {
+			cfg.QueueGroup = "mcpgw"
+		}
 	}
 	if cfg.Name == "" {
 		cfg.Name = "natsmcp-gateway"

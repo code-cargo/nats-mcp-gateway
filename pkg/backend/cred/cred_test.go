@@ -28,10 +28,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 )
 
 func ctxT(t *testing.T) context.Context {
@@ -182,15 +183,7 @@ func TestOAuthRefreshRotation(t *testing.T) {
 }
 
 func TestNATSResolver(t *testing.T) {
-	opts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
-	srv, err := server.NewServer(opts)
-	require.NoError(t, err)
-	go srv.Start()
-	require.True(t, srv.ReadyForConnections(5*time.Second))
-	t.Cleanup(srv.Shutdown)
-	nc, err := nats.Connect(srv.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	nc, _ := natstest.Run(t, nil)
 
 	sub, err := nc.Subscribe("mcp.v1.cred.acme.u1.grafana", func(m *nats.Msg) {
 		_ = m.Respond([]byte(`{"headers":{"Authorization":"Bearer nats-u1"},"expiresAt":"2100-01-01T00:00:00Z"}`))
@@ -231,11 +224,12 @@ type countingResolver struct {
 func (c *countingResolver) Resolve(_ context.Context, _, user, _ string) (*Credentials, error) {
 	c.mu.Lock()
 	c.calls++
+	next, delay := c.next, c.delay
 	c.mu.Unlock()
-	if c.delay > 0 {
-		time.Sleep(c.delay)
+	if delay > 0 {
+		time.Sleep(delay)
 	}
-	return c.next(user)
+	return next(user)
 }
 
 func (c *countingResolver) count() int {
@@ -245,12 +239,15 @@ func (c *countingResolver) count() int {
 }
 
 func TestCachedCachesUntilExpiryThenRefreshes(t *testing.T) {
-	inner := &countingResolver{next: func(user string) (*Credentials, error) {
+	// Each resolve returns DIFFERENT material, so a real refresh must
+	// advance the generation.
+	inner := &countingResolver{}
+	inner.next = func(user string) (*Credentials, error) {
 		return &Credentials{
-			Headers:   map[string]string{"Authorization": "Bearer " + user},
+			Headers:   map[string]string{"Authorization": fmt.Sprintf("Bearer %s-%d", user, inner.count())},
 			ExpiresAt: time.Now().Add(80 * time.Millisecond),
 		}, nil
-	}}
+	}
 	c := Cached(inner, time.Millisecond)
 
 	_, gen1, err := c.ResolveGen(ctxT(t), "t", "u1", "s")
@@ -263,8 +260,112 @@ func TestCachedCachesUntilExpiryThenRefreshes(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	_, gen3, err := c.ResolveGen(ctxT(t), "t", "u1", "s")
 	require.NoError(t, err)
-	assert.Greater(t, gen3, gen2, "a refresh must advance the generation")
+	assert.Greater(t, gen3, gen2, "changed credentials must advance the generation")
 	assert.Equal(t, 2, inner.count())
+}
+
+func TestCachedIdenticalRefreshKeepsGeneration(t *testing.T) {
+	// Identical material on refresh keeps the generation, so steadily
+	// renewed same-value credentials never churn pooled backends.
+	inner := &countingResolver{next: func(user string) (*Credentials, error) {
+		return &Credentials{
+			Env:       map[string]string{"TOKEN": "constant"},
+			ExpiresAt: time.Now().Add(60 * time.Millisecond),
+		}, nil
+	}}
+	c := Cached(inner, time.Millisecond)
+
+	_, gen1, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	time.Sleep(80 * time.Millisecond) // past expiry -> blocking re-resolve
+	_, gen2, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, inner.count(), 2, "expired credentials must be re-resolved")
+	assert.Equal(t, gen1, gen2, "identical material must keep its generation")
+}
+
+func TestCachedShortTTLStillCaches(t *testing.T) {
+	// TTL far below the skew: the refresh-ahead lead is clamped to TTL/2 so
+	// the credentials still cache instead of resolving on every request.
+	inner := &countingResolver{next: func(user string) (*Credentials, error) {
+		return &Credentials{ExpiresAt: time.Now().Add(1 * time.Second)}, nil
+	}}
+	c := Cached(inner, 0) // DefaultSkew 30s >> TTL
+
+	_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	assert.Equal(t, 1, inner.count(), "short-TTL credentials must still be served from cache within TTL/2")
+}
+
+func TestCachedCallerCancellationNotMemoized(t *testing.T) {
+	inner := &countingResolver{delay: 100 * time.Millisecond, next: func(string) (*Credentials, error) {
+		return nil, context.Canceled // what an inner resolver returns when its ctx dies
+	}}
+	c := Cached(inner, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, err := c.ResolveGen(ctx, "t", "u", "s")
+	require.Error(t, err)
+
+	// A fresh caller must NOT be served the cancelled caller's failure.
+	inner.mu.Lock()
+	inner.next = func(string) (*Credentials, error) { return &Credentials{}, nil }
+	inner.delay = 0
+	inner.mu.Unlock()
+	_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err, "a caller-side cancellation must not poison the negative cache")
+}
+
+func TestGenerationsMonotonicAcrossResolvers(t *testing.T) {
+	// The gateway rebuilds a resolver when a server's auth config changes;
+	// generations must never repeat across rebuilds or new-resolver keys
+	// would alias pool entries minted by the old one.
+	mk := func(token string) *CachedResolver {
+		return Cached(ResolveFunc(func(context.Context, string, string, string) (*Credentials, error) {
+			return &Credentials{Env: map[string]string{"T": token}}, nil
+		}), 0)
+	}
+	_, gen1, err := mk("a").ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	_, gen2, err := mk("b").ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	assert.Greater(t, gen2, gen1, "a rebuilt resolver must not reuse generations")
+}
+
+func TestCachedRefreshAheadDoesNotBlockCallers(t *testing.T) {
+	var n atomic.Int64
+	inner := &countingResolver{}
+	inner.next = func(user string) (*Credentials, error) {
+		if n.Add(1) > 1 {
+			time.Sleep(300 * time.Millisecond) // slow renewal
+		}
+		return &Credentials{
+			Env:       map[string]string{"T": fmt.Sprint(n.Load())},
+			ExpiresAt: time.Now().Add(400 * time.Millisecond),
+		}, nil
+	}
+	c := Cached(inner, 100*time.Millisecond) // lead = min(100ms+jitter, 200ms)
+
+	first, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	time.Sleep(320 * time.Millisecond) // inside the lead window, before expiry
+	start := time.Now()
+	got, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), 100*time.Millisecond,
+		"a caller inside the refresh window must be served immediately, not block on the renewal")
+	assert.Equal(t, first.Env["T"], got.Env["T"], "the still-valid credentials are served during refresh")
+
+	// The background refresh eventually lands the new credentials.
+	require.Eventually(t, func() bool {
+		cur, _, err := c.ResolveGen(context.Background(), "t", "u", "s")
+		return err == nil && cur.Env["T"] != first.Env["T"]
+	}, 3*time.Second, 20*time.Millisecond)
 }
 
 func TestCachedKeysPerUser(t *testing.T) {

@@ -23,12 +23,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
@@ -47,16 +47,7 @@ func decodeMsg(t *testing.T, body []byte) *jsonrpc.Message {
 // injects the resolved env over the fakemcp base env.
 func credStack(t *testing.T, resolver *cred.CachedResolver) *nats.Conn {
 	t.Helper()
-	natsOpts := &server.Options{Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true, MaxPayload: 8 * 1024 * 1024}
-	srv, err := server.NewServer(natsOpts)
-	require.NoError(t, err)
-	go srv.Start()
-	require.True(t, srv.ReadyForConnections(5*time.Second))
-	t.Cleanup(srv.Shutdown)
-
-	nc, err := nats.Connect(srv.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	nc, _ := natstest.Run(t, nil)
 
 	pool := backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {
 		env := map[string]string{fakemcp.EnvFlag: "1"}

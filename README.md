@@ -220,7 +220,7 @@ credential, and per-user modes keep secrets out of the config entirely.
 | mode | grain | resolves via |
 |---|---|---|
 | `static` (default) | shared | config `env`/`headers` — today's behavior |
-| `file` | shared | a mounted/rotated file (`path`; optional `ttl`, default 1m, applied when the file carries no `expiresAt`) |
+| `file` | shared, or per-user when `path` contains `{user}` | a mounted/rotated file (`path`; optional `ttl`, default 1m, applied when the file carries no `expiresAt`) |
 | `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`; optional `scope`, `audience`) |
 | `exec` | per-user | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
 | `oauth-token-exchange` | per-user | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |

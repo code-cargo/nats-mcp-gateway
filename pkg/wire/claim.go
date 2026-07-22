@@ -19,10 +19,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
+	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 )
 
@@ -96,8 +98,15 @@ func (o *ObjectClaims) Put(ctx context.Context, tenant string, body []byte) (str
 		return "", err
 	}
 	if _, err := obs.Put(ctx, meta, bytes.NewReader(body)); err != nil {
-		// The cached handle may point at a bucket deleted underneath us
-		// (ops cleanup, JS restart): rebuild once and retry.
+		// Rebuild-and-retry ONLY when the bucket vanished underneath the
+		// cached handle (ops cleanup, JS restart). Anything else — quota,
+		// timeout, payload — would fail identically on retry, so re-uploading
+		// a multi-MB body (and stomping the bucket's settings via
+		// CreateOrUpdate) would double the load exactly when JS is under
+		// pressure.
+		if !bucketMissing(err) {
+			return "", fmt.Errorf("wire: claim put: %w", err)
+		}
 		obs, rerr := o.recreateBucket(ctx, tenant)
 		if rerr != nil {
 			return "", fmt.Errorf("wire: claim put: %w", err)
@@ -107,6 +116,16 @@ func (o *ObjectClaims) Put(ctx context.Context, tenant string, body []byte) (str
 		}
 	}
 	return id, nil
+}
+
+// bucketMissing reports whether a Put failure means the bucket is gone. A
+// deleted bucket surfaces either as the explicit not-found sentinels (lookup
+// paths) or as no-stream/no-responder errors from the chunk publishes.
+func bucketMissing(err error) bool {
+	return errors.Is(err, jetstream.ErrBucketNotFound) ||
+		errors.Is(err, jetstream.ErrStreamNotFound) ||
+		errors.Is(err, nats.ErrNoStreamResponse) ||
+		errors.Is(err, nats.ErrNoResponders)
 }
 
 // Fetch implements ClaimStore. It never creates buckets — the fetch side

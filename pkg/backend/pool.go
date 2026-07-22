@@ -101,6 +101,11 @@ type Pool struct {
 	mu      sync.Mutex
 	entries map[Key]*entry
 	broken  map[Key]*breaker
+	// orphans are past-deadline entries replaced by Get while they still had
+	// in-flight calls: the calls run to completion and the reaper closes the
+	// mux once they drain. Closing immediately would kill live work for an
+	// age-out — worse than letting it finish.
+	orphans []*entry
 
 	stop chan struct{}
 	once sync.Once
@@ -145,10 +150,15 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	e := p.entries[key]
 	// Past-deadline entries are replaced here, not only by the reaper: its
 	// 30s tick must never hand a request credentials that expired between
-	// ticks. In-flight calls on the closed mux fail with ErrConnDead and the
-	// client re-issues — the documented cost of credential expiry.
+	// ticks. An idle (or dead) entry is closed immediately; a busy one is
+	// orphaned so its in-flight calls finish and the reaper collects it once
+	// drained — an age-out must never kill live work.
 	if e != nil && (e.mux.Dead() || time.Now().After(e.deadline)) {
-		go func(m *Mux) { _ = m.Close() }(e.mux)
+		if e.mux.Dead() || e.inflight == 0 {
+			go func(m *Mux) { _ = m.Close() }(e.mux)
+		} else {
+			p.orphans = append(p.orphans, e)
+		}
 		delete(p.entries, key)
 		e = nil
 	}
@@ -280,6 +290,16 @@ func (p *Pool) reap() {
 			delete(p.entries, k)
 		}
 	}
+	// Orphans (replaced while busy) are closed once their calls drain.
+	kept := p.orphans[:0]
+	for _, e := range p.orphans {
+		if e.mux.Dead() || e.inflight == 0 {
+			victims = append(victims, e.mux)
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	p.orphans = kept
 	p.mu.Unlock()
 	for _, m := range victims {
 		_ = m.Close()
@@ -316,11 +336,15 @@ func (p *Pool) EvictServer(server string) {
 func (p *Pool) Shutdown() {
 	p.once.Do(func() { close(p.stop) })
 	p.mu.Lock()
-	victims := make([]*Mux, 0, len(p.entries))
+	victims := make([]*Mux, 0, len(p.entries)+len(p.orphans))
 	for k, e := range p.entries {
 		victims = append(victims, e.mux)
 		delete(p.entries, k)
 	}
+	for _, e := range p.orphans {
+		victims = append(victims, e.mux)
+	}
+	p.orphans = nil
 	p.mu.Unlock()
 	for _, m := range victims {
 		_ = m.Close()

@@ -165,6 +165,10 @@ func TestAuthGrain(t *testing.T) {
 		assert.False(t, a.PerUser(), mode)
 		assert.True(t, a.Dynamic(), mode)
 	}
+	// File grain follows the path: a {user}-templated path is per-user, so
+	// it never silently resolves every caller as "_".
+	assert.True(t, (&Auth{Mode: AuthFile, Path: "/creds/{user}.json"}).PerUser())
+	assert.False(t, (&Auth{Mode: AuthFile, Path: "/creds/shared.json"}).PerUser())
 	assert.False(t, (&Auth{Mode: AuthStatic}).Dynamic())
 	assert.False(t, (&Auth{}).Dynamic())
 	var nilAuth *Auth

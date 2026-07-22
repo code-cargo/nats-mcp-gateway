@@ -28,6 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/fakemcp"
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
@@ -46,25 +47,7 @@ func TestMain(m *testing.M) {
 // minus the CLI.
 func stack(t *testing.T, natsOpts *server.Options) (*nats.Conn, *wire.Client) {
 	t.Helper()
-	if natsOpts == nil {
-		natsOpts = &server.Options{}
-	}
-	natsOpts.Host = "127.0.0.1"
-	natsOpts.Port = -1
-	natsOpts.NoLog = true
-	natsOpts.NoSigs = true
-	if natsOpts.MaxPayload == 0 {
-		natsOpts.MaxPayload = 8 * 1024 * 1024 // production-recommended size (see README)
-	}
-	srv, err := server.NewServer(natsOpts)
-	require.NoError(t, err)
-	go srv.Start()
-	require.True(t, srv.ReadyForConnections(5*time.Second))
-	t.Cleanup(srv.Shutdown)
-
-	nc, err := nats.Connect(srv.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	nc, _ := natstest.Run(t, natsOpts)
 
 	pool := backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {
 		return &backend.StdioBackend{

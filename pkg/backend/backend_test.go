@@ -462,3 +462,39 @@ func pidOfResp(t *testing.T, resp *jsonrpc.Message) float64 {
 	require.NoError(t, json.Unmarshal(resp.Result, &r))
 	return r.PID
 }
+
+// A Get past the credential deadline replaces the entry but must NOT kill
+// its in-flight calls: the old mux is orphaned until it drains, then the
+// reaper closes it.
+func TestDeadlineReplacementSparesInFlightCalls(t *testing.T) {
+	expiry := time.Now().Add(credExpirySkew + 150*time.Millisecond)
+	p := NewPool(PoolConfig{}, func(key Key) (Backend, error) {
+		return &expiringFake{Backend: fakeBackend(nil), expiresAt: expiry}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+
+	oldMux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	// Keep the call slot held across the deadline: the entry is busy.
+	time.Sleep(250 * time.Millisecond)
+
+	newMux, release2, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	defer release2()
+	require.NotSame(t, oldMux, newMux, "a past-deadline entry must be replaced")
+
+	// The busy old mux survives: its in-flight work still completes.
+	resp, err := oldMux.Call(context.Background(), callTool("live", "echo", `{}`, ""), nil)
+	require.NoError(t, err, "in-flight work on the orphaned mux must not be killed")
+	require.Nil(t, resp.Error)
+
+	// Once drained, the reaper collects the orphan.
+	release()
+	p.reap()
+	require.True(t, oldMux.Dead(), "a drained orphan must be closed by the reaper")
+	p.mu.Lock()
+	orphans := len(p.orphans)
+	p.mu.Unlock()
+	assert.Zero(t, orphans)
+}

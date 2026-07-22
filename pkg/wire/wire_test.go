@@ -26,32 +26,14 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
 )
 
 // runNATS starts an embedded nats-server on a random port.
 func runNATS(t *testing.T, opts *server.Options) *nats.Conn {
 	t.Helper()
-	if opts == nil {
-		opts = &server.Options{}
-	}
-	opts.Host = "127.0.0.1"
-	opts.Port = -1
-	// Silence logging; keep JetStream off.
-	opts.NoLog = true
-	opts.NoSigs = true
-	if opts.MaxPayload == 0 {
-		opts.MaxPayload = 8 * 1024 * 1024 // production-recommended size (see README)
-	}
-	srv, err := server.NewServer(opts)
-	require.NoError(t, err)
-	go srv.Start()
-	require.True(t, srv.ReadyForConnections(5*time.Second), "embedded nats-server did not start")
-	t.Cleanup(srv.Shutdown)
-
-	nc, err := nats.Connect(srv.ClientURL())
-	require.NoError(t, err)
-	t.Cleanup(nc.Close)
+	nc, _ := natstest.Run(t, opts)
 	return nc
 }
 
@@ -422,4 +404,19 @@ func TestPermissionViolationFailsFast(t *testing.T) {
 	require.Len(t, frames, 1)
 	require.NotNil(t, frames[0].Err)
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
+}
+
+// The scoped queue-group default lives in Serve so EVERY config source gets
+// it — a scoped instance must never silently share the fleet's "mcpgw" group
+// (the two would compete for the scoped user's traffic).
+func TestQueueGroupDefaults(t *testing.T) {
+	nc := runNATS(t, nil)
+	s := serve(t, nc, ServerConfig{}, nil)
+	assert.Equal(t, "mcpgw", s.queueGroup)
+
+	s = serve(t, nc, ServerConfig{Tenant: "acme", User: "u1"}, nil)
+	assert.Equal(t, "mcpgw.acme.u1", s.queueGroup, "scoped instances must default to their own group")
+
+	s = serve(t, nc, ServerConfig{Tenant: "acme", User: "u1", QueueGroup: "custom"}, nil)
+	assert.Equal(t, "custom", s.queueGroup, "an explicit group is always respected")
 }
