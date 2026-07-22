@@ -109,7 +109,7 @@ func (o *ObjectClaims) Put(ctx context.Context, tenant string, body []byte) (str
 		}
 		obs, rerr := o.recreateBucket(ctx, tenant)
 		if rerr != nil {
-			return "", fmt.Errorf("wire: claim put: %w", err)
+			return "", fmt.Errorf("wire: claim put: %w (bucket rebuild also failed: %w)", err, rerr)
 		}
 		if _, err := obs.Put(ctx, meta, bytes.NewReader(body)); err != nil {
 			return "", fmt.Errorf("wire: claim put: %w", err)

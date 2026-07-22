@@ -177,6 +177,10 @@ func tokenRequestFull(ctx context.Context, client *http.Client, tokenURL, client
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	if clientID != "" {
+		// The escaping is deliberate, not a bug: RFC 6749 §2.3.1 requires
+		// the client id/secret to be form-urlencoded BEFORE they go into
+		// the Basic header (SetBasicAuth does no encoding of its own).
+		// golang.org/x/oauth2 does exactly this, so IdPs interop with it.
 		req.SetBasicAuth(url.QueryEscape(clientID), url.QueryEscape(clientSecret))
 	}
 	resp, err := client.Do(req)
