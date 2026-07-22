@@ -33,7 +33,7 @@ jobs:
           - { os: darwin, arch: amd64 }
           - { os: darwin, arch: arm64 }
     steps:
-      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
         with:
           allowed-hosts: |
             proxy.golang.org
@@ -96,7 +96,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
 
       - name: Download artifacts
         uses: actions/download-artifact@v8

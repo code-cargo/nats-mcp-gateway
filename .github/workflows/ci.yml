@@ -17,8 +17,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+      id-token: write
+      actions: read
     steps:
-      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
         with:
           allowed-hosts: |
             proxy.golang.org
@@ -54,8 +56,10 @@ jobs:
     permissions:
       contents: read
       checks: write
+      id-token: write
+      actions: read
     steps:
-      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+      - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
         with:
           allowed-hosts: |
             proxy.golang.org
