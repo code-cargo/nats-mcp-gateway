@@ -76,6 +76,16 @@ func Main() {
 		if err != nil {
 			continue
 		}
+		// Notifications and responses are handled INLINE so stdin ordering
+		// is preserved: notifications/initialized must take effect before
+		// any later request line is dispatched, or a racing tools/call sees
+		// "server not initialized" (a real CI flake). Both are cheap and
+		// non-blocking (pending channels are buffered). Only requests go to
+		// goroutines — wedge/slow need a live read loop while they block.
+		if msg.Kind() != jsonrpc.KindRequest {
+			s.handle(msg)
+			continue
+		}
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
