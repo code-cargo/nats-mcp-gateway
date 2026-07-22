@@ -112,13 +112,23 @@ type Pool struct {
 }
 
 type entry struct {
+	// key is retained on the entry (not only as the map key) so orphaned
+	// entries stay attributable: EvictServer must find a server's orphans
+	// and tenantCountLocked must count them.
+	key      Key
 	mux      *Mux
 	born     time.Time
 	deadline time.Time // born + MaxLifetime, clamped to credential expiry
 	lastUsed time.Time
 	inflight int
-	sem      chan struct{}
+	// waiters counts Gets blocked on the sem that have not yet incremented
+	// inflight — live-work-in-waiting the close paths must not kill.
+	waiters int
+	sem     chan struct{}
 }
+
+// busyLocked reports whether the entry has live or imminent work (p.mu held).
+func (e *entry) busyLocked() bool { return e.inflight > 0 || e.waiters > 0 }
 
 type breaker struct {
 	fails     int
@@ -154,7 +164,7 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	// orphaned so its in-flight calls finish and the reaper collects it once
 	// drained — an age-out must never kill live work.
 	if e != nil && (e.mux.Dead() || time.Now().After(e.deadline)) {
-		if e.mux.Dead() || e.inflight == 0 {
+		if e.mux.Dead() || !e.busyLocked() {
 			go func(m *Mux) { _ = m.Close() }(e.mux)
 		} else {
 			p.orphans = append(p.orphans, e)
@@ -197,12 +207,22 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 			deadline := born.Add(p.cfg.MaxLifetime)
 			if exp, ok := b.(Expiring); ok {
 				if t := exp.CredExpiresAt(); !t.IsZero() {
-					if d := t.Add(-credExpirySkew); d.Before(deadline) {
+					d := t.Add(-credExpirySkew)
+					if d.Before(born) {
+						// Credentials already inside the skew window at
+						// spawn: a skewed deadline would be born-dead and
+						// every Get would tear down and respawn. Live to
+						// the literal expiry instead; the cost is the
+						// documented in-flight -32010 at expiry.
+						d = t
+					}
+					if d.Before(deadline) {
 						deadline = d
 					}
 				}
 			}
 			e = &entry{
+				key:      key,
 				mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
 				born:     born,
 				deadline: deadline,
@@ -212,6 +232,7 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 		}
 	}
 	e.lastUsed = time.Now()
+	e.waiters++ // visible to the close paths while we block on the sem
 	sem := e.sem
 	mux := e.mux
 	p.mu.Unlock()
@@ -219,9 +240,13 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	select {
 	case sem <- struct{}{}:
 	case <-ctx.Done():
+		p.mu.Lock()
+		e.waiters--
+		p.mu.Unlock()
 		return nil, nil, ctx.Err()
 	}
 	p.mu.Lock()
+	e.waiters--
 	e.inflight++
 	p.mu.Unlock()
 
@@ -258,6 +283,13 @@ func (p *Pool) tenantCountLocked(tenant string) int {
 			n++
 		}
 	}
+	// Orphans are still live subprocesses; not counting them would let a
+	// tenant exceed the OOM guard by exactly the backends it churned.
+	for _, e := range p.orphans {
+		if e.key.Tenant == tenant && !e.mux.Dead() {
+			n++
+		}
+	}
 	return n
 }
 
@@ -280,8 +312,8 @@ func (p *Pool) reap() {
 	p.mu.Lock()
 	for k, e := range p.entries {
 		dead := e.mux.Dead()
-		idle := e.inflight == 0 && now.Sub(e.lastUsed) > p.cfg.IdleTTL
-		old := e.inflight == 0 && now.After(e.deadline)
+		idle := !e.busyLocked() && now.Sub(e.lastUsed) > p.cfg.IdleTTL
+		old := !e.busyLocked() && now.After(e.deadline)
 		if dead || idle || old {
 			p.log.Info("reaping backend connection",
 				"server", k.Server, "tenant", k.Tenant,
@@ -293,7 +325,7 @@ func (p *Pool) reap() {
 	// Orphans (replaced while busy) are closed once their calls drain.
 	kept := p.orphans[:0]
 	for _, e := range p.orphans {
-		if e.mux.Dead() || e.inflight == 0 {
+		if e.mux.Dead() || !e.busyLocked() {
 			victims = append(victims, e.mux)
 		} else {
 			kept = append(kept, e)
@@ -321,6 +353,19 @@ func (p *Pool) EvictServer(server string) {
 			delete(p.entries, k)
 		}
 	}
+	// Eviction deliberately kills busy work (the definition or credentials
+	// changed underneath it) — that must include orphans, or a backend
+	// replaced moments before the reload would keep serving the removed
+	// server with its old credentials.
+	kept := p.orphans[:0]
+	for _, e := range p.orphans {
+		if e.key.Server == server {
+			victims = append(victims, e.mux)
+		} else {
+			kept = append(kept, e)
+		}
+	}
+	p.orphans = kept
 	for k := range p.broken {
 		if k.Server == server {
 			delete(p.broken, k)

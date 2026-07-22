@@ -96,6 +96,14 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	// resolvers' caches survive requests but not an auth-config change.
 	var rec *reconcile.Reconciler
 	registry := &credRegistry{nc: nc, log: log}
+	registry.live = func(name string) (config.Server, bool) {
+		cur := rec.Current()
+		if cur == nil {
+			return config.Server{}, false
+		}
+		s, ok := cur.Servers[name]
+		return s, ok
+	}
 	factory := func(key backend.Key) (backend.Backend, error) {
 		cur := rec.Current()
 		if cur == nil {
@@ -367,6 +375,13 @@ func (t *credTokenSource) Invalidate() { t.resolver.Invalidate(t.tenant, t.user,
 type credRegistry struct {
 	nc  *nats.Conn
 	log *slog.Logger
+	// live returns the server's CURRENT definition, or false if it is no
+	// longer configured. Consulted before inserting a new entry: a request
+	// holding a pre-reload config snapshot must not resurrect a
+	// just-pruned server's resolver (whose cache would then retain
+	// credential material until the next reload — possibly forever). Nil
+	// disables the check (tests).
+	live func(name string) (config.Server, bool)
 
 	mu      sync.Mutex
 	entries map[string]*credRegEntry
@@ -422,6 +437,20 @@ func (r *credRegistry) lookup(name string, s config.Server) (*cred.CachedResolve
 		// resolver and its cache, re-anchor the fast path.
 		e.authPtr = s.Auth
 		return e.resolver, e.perUser
+	}
+	if r.live != nil {
+		// Insert path only: build from the LIVE definition, so a caller
+		// holding a stale config snapshot can neither resurrect a removed
+		// server nor install a resolver for a superseded auth config.
+		ls, ok := r.live(name)
+		if !ok || !ls.Auth.Dynamic() {
+			return nil, false
+		}
+		s = ls
+		if authJSON, err = json.Marshal(s.Auth); err != nil {
+			r.log.Error("marshaling auth config", "server", name, "err", err)
+			return nil, false
+		}
 	}
 	e = &credRegEntry{
 		authPtr:  s.Auth,

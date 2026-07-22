@@ -118,13 +118,26 @@ func (o *ObjectClaims) Put(ctx context.Context, tenant string, body []byte) (str
 	return id, nil
 }
 
-// bucketMissing reports whether a Put failure means the bucket is gone. A
-// deleted bucket surfaces either as the explicit not-found sentinels (lookup
-// paths) or as no-stream/no-responder errors from the chunk publishes.
+// bucketMissing reports whether a Put failure plausibly means the bucket is
+// GONE — the condition where rebuild-and-retry helps. The sentinel set is
+// grounded in what nats.go v1.52.0 actually surfaces:
+//   - ErrBucketNotFound / ErrStreamNotFound: the lookup legs' explicit
+//     not-found remaps.
+//   - nats.ErrNoResponders: a deleted bucket reached through a CACHED handle
+//     — the object store reads via direct-get subjects served by the stream
+//     itself, so a deleted stream answers with no-responders (verified by
+//     TestClaimPutRecoversFromDeletedBucketOnly). Also fires when JetStream
+//     is down entirely, where the rebuild simply fails fast and the original
+//     error is returned — one cheap API call, no re-upload.
+//   - jetstream.ErrNoStreamResponse: chunk publishes to a bucket deleted
+//     mid-upload (the legacy nats.ErrNoStreamResponse never escapes the
+//     jetstream package). Also fires on transient leadership blips; the
+//     cost is bounded because the retry is single-shot and the re-upload
+//     only happens if the rebuild succeeded, i.e. JS answered again.
 func bucketMissing(err error) bool {
 	return errors.Is(err, jetstream.ErrBucketNotFound) ||
 		errors.Is(err, jetstream.ErrStreamNotFound) ||
-		errors.Is(err, nats.ErrNoStreamResponse) ||
+		errors.Is(err, jetstream.ErrNoStreamResponse) ||
 		errors.Is(err, nats.ErrNoResponders)
 }
 

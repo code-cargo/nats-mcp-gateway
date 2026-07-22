@@ -16,6 +16,7 @@ package cred
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	rand "math/rand/v2"
 	"sync"
@@ -85,11 +86,17 @@ type cacheEntry struct {
 	gen        int
 	refreshAt  time.Time // when refresh-ahead should begin
 	refreshing bool
-	jitter     time.Duration
-	fails      int
-	lastErr    error
-	retryAt    time.Time
-	lastUsed   time.Time // guarded by CachedResolver.mu, not entry.mu
+	// epoch counts every mutation of creds (store or Invalidate). A
+	// background refresh captures it at launch and discards its result if
+	// the entry moved on — otherwise a slow refresh completing after a
+	// foreground re-resolve (or a 401 Invalidate) would overwrite fresher
+	// credentials with staler ones, last-writer-wins.
+	epoch    uint64
+	jitter   time.Duration
+	fails    int
+	lastErr  error
+	retryAt  time.Time
+	lastUsed time.Time // guarded by CachedResolver.mu, not entry.mu
 }
 
 // Cached wraps inner. skew <= 0 uses DefaultSkew.
@@ -125,7 +132,7 @@ func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server st
 		// (unless a recent failure's backoff says wait).
 		if !e.creds.ExpiresAt.IsZero() && now.After(e.refreshAt) && !e.refreshing && now.After(e.retryAt) {
 			e.refreshing = true
-			go c.refreshAhead(e, tenant, user, server)
+			go c.refreshAhead(e, e.epoch, tenant, user, server)
 		}
 		creds, gen := e.creds, e.gen
 		e.mu.Unlock()
@@ -140,6 +147,9 @@ func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server st
 		return nil, 0, err
 	}
 	creds, err := c.inner.Resolve(ctx, tenant, user, server)
+	if err == nil {
+		err = c.store(e, creds, now)
+	}
 	if err != nil {
 		// A failure caused by the CALLER (its context cancelled or timed
 		// out mid-resolve) says nothing about the credential source — do
@@ -153,7 +163,6 @@ func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server st
 		e.mu.Unlock()
 		return nil, 0, err
 	}
-	c.store(e, creds, now)
 	creds, gen := e.creds, e.gen
 	e.mu.Unlock()
 	return creds, gen, nil
@@ -161,7 +170,10 @@ func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server st
 
 // refreshAhead renews one entry's credentials in the background, resolving
 // WITHOUT holding e.mu so valid-credential callers never block behind it.
-func (c *CachedResolver) refreshAhead(e *cacheEntry, tenant, user, server string) {
+// startEpoch pins the entry state this refresh was launched against: if the
+// entry mutated meanwhile (foreground re-resolve, Invalidate), this result
+// is stale and is discarded.
+func (c *CachedResolver) refreshAhead(e *cacheEntry, startEpoch uint64, tenant, user, server string) {
 	ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 	defer cancel()
 	creds, err := c.inner.Resolve(ctx, tenant, user, server)
@@ -169,29 +181,40 @@ func (c *CachedResolver) refreshAhead(e *cacheEntry, tenant, user, server string
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.refreshing = false
+	if e.epoch != startEpoch {
+		return // superseded while we were resolving; newer state wins
+	}
+	if err == nil {
+		err = c.store(e, creds, time.Now())
+	}
 	if err != nil {
 		// The old credentials keep serving until their real expiry; the
 		// backoff throttles further refresh attempts.
 		e.fails++
 		e.lastErr = err
 		e.retryAt = time.Now().Add(failBackoff(e.fails))
-		return
 	}
-	c.store(e, creds, time.Now())
 }
 
-// store records freshly-resolved credentials (e.mu held). The generation
-// advances only when the injectable material changed; the refresh-ahead
-// deadline is clamped so short-TTL credentials still cache for at least half
-// their life instead of resolving on every request.
-func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time) {
+// store records freshly-resolved credentials (e.mu held), rejecting material
+// that is already expired — a stale source (late file rotator, skewed
+// controller) must hit the failure backoff, not reset it and be re-resolved
+// at request rate. The generation advances only when the injectable material
+// changed; the refresh-ahead deadline is clamped so short-TTL credentials
+// still cache for at least half their life.
+func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time) error {
 	if creds == nil {
 		creds = &Credentials{}
 	}
-	if e.creds == nil || !maps.Equal(e.creds.Headers, creds.Headers) || !maps.Equal(e.creds.Env, creds.Env) {
+	if !creds.ExpiresAt.IsZero() && !creds.ExpiresAt.After(now) {
+		return fmt.Errorf("cred: source returned credentials already expired at %s", creds.ExpiresAt.Format(time.RFC3339))
+	}
+	prev := e.creds
+	if prev == nil || !maps.Equal(prev.Headers, creds.Headers) || !maps.Equal(prev.Env, creds.Env) {
 		e.gen = int(globalGen.Add(1))
 	}
 	e.creds = creds
+	e.epoch++
 	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
 	if !creds.ExpiresAt.IsZero() {
 		lead := c.skew + e.jitter
@@ -199,7 +222,16 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 			lead = ttl / 2
 		}
 		e.refreshAt = creds.ExpiresAt.Add(-lead)
+		// An unproductive refresh (ExpiresAt did not advance) must not
+		// re-arm relative to the shrinking remaining life — that halves the
+		// interval every round into an accelerating burst against a source
+		// that is just serving the same credential. Hold a fixed cadence
+		// instead.
+		if prev != nil && !creds.ExpiresAt.After(prev.ExpiresAt) {
+			e.refreshAt = now.Add(c.skew)
+		}
 	}
+	return nil
 }
 
 // Invalidate drops the cached credentials for one key so the next Resolve
@@ -215,6 +247,7 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	e.mu.Lock()
 	e.creds = nil
 	e.retryAt = time.Time{}
+	e.epoch++ // any in-flight refresh launched before this is now stale
 	e.mu.Unlock()
 }
 

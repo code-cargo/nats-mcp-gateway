@@ -457,3 +457,115 @@ func TestTerminalWrapping(t *testing.T) {
 	assert.NoError(t, Terminal(nil))
 	assert.ErrorIs(t, Terminal(base), base)
 }
+
+func TestExpiredCredentialsHitBackoffNotRequestRate(t *testing.T) {
+	// A source serving already-expired material (late rotator) must land in
+	// the failure backoff, not be re-resolved on every request.
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Env:       map[string]string{"T": "stale"},
+			ExpiresAt: time.Now().Add(-time.Minute),
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.Error(t, err, "expired material must surface as a resolve failure")
+	assert.Contains(t, err.Error(), "already expired")
+
+	for range 5 {
+		_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+		require.Error(t, err)
+	}
+	assert.Equal(t, 1, inner.count(), "requests inside the backoff window must not re-resolve")
+}
+
+func TestStaleRefreshResultDiscarded(t *testing.T) {
+	// A background refresh that completes AFTER the entry moved on
+	// (Invalidate, or a foreground re-resolve) must discard its result
+	// rather than overwrite fresher credentials last-writer-wins.
+	release := make(chan struct{})
+	var slowStarted atomic.Bool
+	inner := &countingResolver{}
+	inner.next = func(string) (*Credentials, error) {
+		if slowStarted.CompareAndSwap(false, true) {
+			// Only the FIRST post-prime resolve (the background refresh)
+			// blocks; later resolves return fresh material immediately.
+			<-release
+			return &Credentials{
+				Env:       map[string]string{"T": "stale-refresh"},
+				ExpiresAt: time.Now().Add(time.Minute),
+			}, nil
+		}
+		return &Credentials{
+			Env:       map[string]string{"T": "fresh"},
+			ExpiresAt: time.Now().Add(time.Minute),
+		}, nil
+	}
+	c := Cached(inner, time.Hour)
+
+	// Prime with a short-TTL credential: the lead clamps to ttl/2, so the
+	// refresh window opens at half-life. (The prime itself must not be the
+	// slow resolve; flip the flag around it.)
+	slowStarted.Store(true)
+	primeExpiry := time.Now().Add(400 * time.Millisecond)
+	inner.mu.Lock()
+	primeNext := inner.next
+	inner.next = func(string) (*Credentials, error) {
+		return &Credentials{Env: map[string]string{"T": "prime"}, ExpiresAt: primeExpiry}, nil
+	}
+	inner.mu.Unlock()
+	_, gen0, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	inner.mu.Lock()
+	inner.next = primeNext
+	inner.mu.Unlock()
+	slowStarted.Store(false)
+
+	// Enter the refresh window (past half-life, before expiry) and kick the
+	// background refresh; it blocks on the release channel.
+	time.Sleep(250 * time.Millisecond)
+	_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return slowStarted.Load() }, 2*time.Second, time.Millisecond)
+
+	// Invalidate (as a 401 would) and re-resolve: fresh material, new gen.
+	c.Invalidate("t", "u", "s")
+	fresh, genFresh, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	assert.Equal(t, "fresh", fresh.Env["T"])
+	assert.Greater(t, genFresh, gen0)
+
+	// Let the stale refresh land: it must be discarded.
+	close(release)
+	time.Sleep(50 * time.Millisecond)
+	got, genAfter, err := c.ResolveGen(context.Background(), "t", "u", "s")
+	require.NoError(t, err)
+	assert.Equal(t, "fresh", got.Env["T"], "a superseded refresh must not overwrite fresher credentials")
+	assert.Equal(t, genFresh, genAfter)
+}
+
+func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
+	// A refresh returning the SAME ExpiresAt must not re-arm relative to
+	// the shrinking remaining life (geometric acceleration); it re-arms at
+	// a fixed skew cadence instead.
+	fixedExpiry := time.Now().Add(30 * time.Second)
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{Env: map[string]string{"T": "same"}, ExpiresAt: fixedExpiry}, nil
+	}}
+	skew := 200 * time.Millisecond
+	c := Cached(inner, skew)
+
+	_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	// Hammer inside what would be the accelerating window: with a fixed
+	// cadence at skew, at most ~(elapsed/skew)+2 refreshes may fire.
+	deadline := time.Now().Add(600 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+		require.NoError(t, err)
+		time.Sleep(5 * time.Millisecond)
+	}
+	assert.LessOrEqual(t, inner.count(), 6, "unchanged ExpiresAt must refresh at fixed cadence, not accelerate")
+}

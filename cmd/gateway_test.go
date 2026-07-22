@@ -77,7 +77,6 @@ func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 	t.Cleanup(clientNC.Close)
 
 	a := &assembled{nc: nc, clientNC: clientNC}
-	registry := &credRegistry{nc: nc, log: testLogger()}
 	lookupServer := func(name string) (config.Server, bool) {
 		cur := a.rec.Current()
 		if cur == nil {
@@ -86,6 +85,7 @@ func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 		s, ok := cur.Servers[name]
 		return s, ok
 	}
+	registry := &credRegistry{nc: nc, log: testLogger(), live: lookupServer}
 	pool := backend.NewPool(backend.PoolConfig{}, func(key backend.Key) (backend.Backend, error) {
 		s, ok := lookupServer(key.Server)
 		if !ok {
@@ -417,4 +417,28 @@ func TestCredRegistryPrunesRemovedServers(t *testing.T) {
 	r.lookup("kept", srv)
 	r.prune(map[string]config.Server{"kept": srv})
 	assert.Len(t, r.entries, 1)
+}
+
+// A lookup racing a prune with a STALE config snapshot must not resurrect a
+// removed server's resolver: the insert path consults the live config.
+func TestCredRegistryLookupCannotResurrectPrunedServer(t *testing.T) {
+	liveServers := map[string]config.Server{}
+	r := &credRegistry{log: testLogger(), live: func(name string) (config.Server, bool) {
+		s, ok := liveServers[name]
+		return s, ok
+	}}
+	oldDef := config.Server{Command: "x", Auth: &config.Auth{Mode: config.AuthExec, Command: "helper"}}
+
+	// Server present: lookup populates normally.
+	liveServers["s"] = oldDef
+	resolver, _ := r.lookup("s", oldDef)
+	require.NotNil(t, resolver)
+
+	// Server removed + pruned; a caller holding the OLD snapshot races in.
+	delete(liveServers, "s")
+	r.prune(liveServers)
+	resolver, perUser := r.lookup("s", oldDef) // stale snapshot's definition
+	assert.Nil(t, resolver, "a stale snapshot must not resurrect a pruned server's resolver")
+	assert.False(t, perUser)
+	assert.Empty(t, r.entries)
 }

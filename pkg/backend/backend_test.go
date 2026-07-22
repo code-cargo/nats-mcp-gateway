@@ -498,3 +498,67 @@ func TestDeadlineReplacementSparesInFlightCalls(t *testing.T) {
 	p.mu.Unlock()
 	assert.Zero(t, orphans)
 }
+
+// Orphaned backends are still live subprocesses: they must count toward the
+// tenant cap and be closed by EvictServer despite being busy.
+func TestOrphansCountedAndEvictable(t *testing.T) {
+	expiry := time.Now().Add(credExpirySkew + 120*time.Millisecond)
+	p := NewPool(PoolConfig{MaxProcsPerTenant: 2}, func(key Key) (Backend, error) {
+		return &expiringFake{Backend: fakeBackend(nil), expiresAt: expiry}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+
+	oldMux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond) // cross the deadline while busy
+
+	// Replacement spawn orphans the busy entry.
+	_, release2, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	release2()
+
+	p.mu.Lock()
+	count := p.tenantCountLocked("acme")
+	p.mu.Unlock()
+	assert.Equal(t, 2, count, "a live orphan must count toward the tenant cap")
+
+	// The cap therefore rejects a second server for this tenant.
+	_, _, err = p.Get(context.Background(), Key{Server: "other", Tenant: "acme"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max live backends")
+
+	// EvictServer must reach the busy orphan too.
+	p.EvictServer("s")
+	_, err = oldMux.Call(context.Background(), callTool("x", "echo", `{}`, ""), nil)
+	require.Error(t, err, "an evicted server's orphan must be closed even while busy")
+	release()
+
+	p.mu.Lock()
+	orphans := len(p.orphans)
+	p.mu.Unlock()
+	assert.Zero(t, orphans)
+}
+
+// Credentials already inside the skew window at spawn must not produce a
+// born-dead entry (which would respawn a subprocess on every Get): the
+// deadline falls back to the literal expiry.
+func TestShortLivedCredsDoNotChurnSpawns(t *testing.T) {
+	expiry := time.Now().Add(credExpirySkew / 2) // inside the skew window
+	p := NewPool(PoolConfig{}, func(key Key) (Backend, error) {
+		return &expiringFake{Backend: fakeBackend(nil), expiresAt: expiry}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+
+	pidOf := func() float64 {
+		mux, release, err := p.Get(context.Background(), key)
+		require.NoError(t, err)
+		defer release()
+		resp, err := mux.Call(context.Background(), callTool("e", "echo", `{}`, ""), nil)
+		require.NoError(t, err)
+		return pidOfResp(t, resp)
+	}
+	pid1 := pidOf()
+	assert.Equal(t, pid1, pidOf(), "an entry spawned inside the skew window must live to the literal expiry, not respawn per request")
+}
