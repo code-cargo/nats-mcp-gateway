@@ -1,0 +1,136 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+      ref:
+        description: "Source ref to build from - commit SHA, branch, or tag (defaults to the triggering commit)"
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }}/${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    strategy:
+      matrix:
+        # natsmcp cross-compiles anywhere (pure Go, CGO disabled). The gateway
+        # runs on Linux; darwin covers the shim on developer laptops. Windows
+        # is intentionally absent until the stdio supervisor (Setpgid /
+        # kill(-pgid) in pkg/backend/stdio.go) is split by build tag — but the
+        # packaging below already handles the .exe suffix so adding a
+        # `{os: windows, arch: amd64}` row is then a drop-in.
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+    steps:
+      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+        with:
+          allowed-hosts: |
+            proxy.golang.org
+            sum.golang.org
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: CI_VERSION="${{ inputs.tag }}" GOOS="${{ matrix.os }}" GOARCH="${{ matrix.arch }}" make build
+
+      # Attest the raw executable (before archiving) so the EXTRACTED binary
+      # verifies directly: `gh attestation verify natsmcp --repo <repo>`.
+      # Attestations are keyed by content digest and stored in GitHub, so each
+      # matrix build's distinct binary gets its own attestation despite the
+      # shared bin/natsmcp path. The archive is separately attested in the
+      # release job.
+      - name: Attest binary provenance
+        uses: actions/attest-build-provenance@v4.1.0
+        with:
+          subject-path: bin/natsmcp*
+
+      - name: Package
+        id: pkg
+        run: |
+          os="${{ matrix.os }}"; arch="${{ matrix.arch }}"
+          ext=""; [ "$os" = "windows" ] && ext=".exe"
+          # Stage a bare binary (natsmcp / natsmcp.exe) plus LICENSE and README
+          # so `tar xzf` / `unzip` yields a clean, runnable name with no rename.
+          stage="$(mktemp -d)"
+          cp "bin/natsmcp${ext}" "${stage}/natsmcp${ext}"
+          cp LICENSE README.md "${stage}/"
+          if [ "$os" = "windows" ]; then
+            asset="natsmcp-${os}-${arch}.zip"
+            (cd "$stage" && zip -qr "${GITHUB_WORKSPACE}/${asset}" .)
+          else
+            asset="natsmcp-${os}-${arch}.tar.gz"
+            tar -czf "$asset" -C "$stage" .
+          fi
+          echo "asset=${asset}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.pkg.outputs.asset }}
+          path: ${{ steps.pkg.outputs.asset }}
+
+  release:
+    name: Upload Release Assets
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: code-cargo/cargowall-action@a2472831320add39bf8560296a1b72f9126890bd # v1.3.4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Attest build provenance
+        id: attest
+        uses: actions/attest-build-provenance@v4.1.0
+        with:
+          subject-path: artifacts/natsmcp-*
+
+      - name: Stage bundle for release upload
+        run: cp "${{ steps.attest.outputs.bundle-path }}" artifacts/attestations.sigstore.json
+
+      - name: Create checksums
+        working-directory: artifacts
+        run: sha256sum natsmcp-* > checksums.txt
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TARGET="${{ inputs.ref || github.sha }}"
+          gh release create "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.tag }}" \
+            --target "$TARGET" \
+            --generate-notes \
+            --prerelease \
+            --draft
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.tag }}" artifacts/* --repo "${{ github.repository }}"

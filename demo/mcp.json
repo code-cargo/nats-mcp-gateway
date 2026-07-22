@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "everything": {
+      "command": "natsmcp",
+      "args": ["shim", "--server", "everything"],
+      "env": {
+        "NATSMCP_NATS_URL": "nats://admin:admin@127.0.0.1:4222",
+        "NATSMCP_TENANT": "demo"
+      }
+    }
+  }
+}
