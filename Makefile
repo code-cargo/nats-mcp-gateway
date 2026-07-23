@@ -24,7 +24,7 @@ GREEN := \033[32m
 RED := \033[31m
 RESET := \033[0m
 
-.PHONY: all build ci install-tools vet fmt fmt-check test test-ci tidy clean demo
+.PHONY: all build ci install-tools vet fmt fmt-check test test-ci tidy clean demo image
 
 .DEFAULT_GOAL := build
 
@@ -102,3 +102,9 @@ demo: build
 clean:
 	@printf "${GREEN}Cleaning build artifacts...${RESET}\n"
 	rm -rf $(bin_dir)
+
+# Local single-arch image for development. Release images are multi-arch,
+# built and pushed by .github/workflows/release.yml.
+image:
+	@printf "${GREEN}Building natsmcp image (VERSION=$(VERSION))...${RESET}\n"
+	docker build --build-arg VERSION=$(VERSION) -t natsmcp:$(VERSION) .
