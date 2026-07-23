@@ -314,6 +314,32 @@ and gateway-unaware in both:
   their own queue group), and the scoped pod's NATS identity should be fenced
   to its own `{tenant}.{user}` subjects.
 
+## Docker image
+
+Releases publish a multi-arch (amd64/arm64) image: a ~20MB static binary on
+`distroless/static` — no shell, no package manager, CA certificates and a
+writable `/tmp` included (the stdio backend's workdir). `make image` builds a
+local single-arch `natsmcp:develop`.
+
+```
+docker run --rm -v ./gateway.json:/etc/natsmcp.json:ro \
+  ghcr.io/code-cargo/natsmcp:latest gateway --config /etc/natsmcp.json
+```
+
+The same image serves as the central gateway, a scoped per-user pod
+entrypoint, and the shim/call CLIs. Curated MCP server images (which need
+their own Python/Node runtime) should **copy the binary out** rather than
+build `FROM` it:
+
+```dockerfile
+COPY --from=ghcr.io/code-cargo/natsmcp:v1.2.3 /usr/local/bin/natsmcp /usr/local/bin/natsmcp
+ENTRYPOINT ["/usr/local/bin/natsmcp", "gateway", "--config", "/etc/natsmcp.json"]
+```
+
+A gateway upgrade is then one tag bump per curated image, and the image's
+provenance is attested per release
+(`gh attestation verify oci://ghcr.io/code-cargo/natsmcp:vX --repo code-cargo/nats-mcp-gateway`).
+
 ## Config sources / hot reload
 
 The **server set reloads at runtime** — add, remove, or re-credential a fronted
