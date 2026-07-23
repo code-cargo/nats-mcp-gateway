@@ -21,10 +21,6 @@ jobs:
       actions: read
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
-        with:
-          allowed-hosts: |
-            proxy.golang.org
-            sum.golang.org
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -60,10 +56,6 @@ jobs:
       actions: read
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
-        with:
-          allowed-hosts: |
-            proxy.golang.org
-            sum.golang.org
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
@@ -89,16 +81,6 @@ jobs:
       contents: read
     steps:
       - uses: code-cargo/cargowall-action@78f9fbcb3561c6ad9289e5b740616216e8cbd232 # v1.3.5
-        with:
-          allowed-hosts: |
-            proxy.golang.org
-            sum.golang.org
-            registry-1.docker.io
-            auth.docker.io
-            production.cloudflare.docker.com
-            production.cloudfront.docker.com
-            gcr.io
-            storage.googleapis.com
 
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
