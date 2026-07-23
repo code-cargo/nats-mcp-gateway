@@ -317,9 +317,9 @@ and gateway-unaware in both:
 ## Docker image
 
 Releases publish a multi-arch (amd64/arm64) image: a ~20MB static binary on
-`distroless/static` — no shell, no package manager, CA certificates and a
-writable `/tmp` included (the stdio backend's workdir). `make image` builds a
-local single-arch `natsmcp:develop`.
+`gcr.io/distroless/static-debian12:nonroot` — no shell, no package manager,
+CA certificates and a writable `/tmp` included (the stdio backend's workdir).
+`make image` builds a local single-arch `natsmcp:develop`.
 
 ```
 docker run --rm -v ./gateway.json:/etc/natsmcp.json:ro \
