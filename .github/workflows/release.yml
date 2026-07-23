@@ -16,6 +16,7 @@ jobs:
     name: Build (${{ matrix.os }}/${{ matrix.arch }})
     runs-on: ubuntu-latest
     permissions:
+      actions: read
       id-token: write
       contents: read
       attestations: write
