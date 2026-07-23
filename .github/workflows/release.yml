@@ -103,6 +103,7 @@ jobs:
             registry-1.docker.io
             auth.docker.io
             production.cloudflare.docker.com
+            production.cloudfront.docker.com
             gcr.io
             storage.googleapis.com
             ghcr.io
