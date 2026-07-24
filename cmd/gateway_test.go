@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -357,7 +358,8 @@ func TestBuildSourceInlineRejectsNatsBlock(t *testing.T) {
 func TestBuildSourceInlineHonorsPoolAndClaimCheck(t *testing.T) {
 	inline := fmt.Sprintf(
 		`{"pool":{"maxProcsPerTenant":64,"idleTtl":"30m","maxLifetime":"24h"},"claimCheck":{"maxAge":"9m","maxBytes":5},"servers":{%s}}`,
-		fakeServerJSON("a", fakeEnv(nil)))
+		fakeServerJSON("a", fakeEnv(nil)),
+	)
 	boot, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(testLogger())
 	require.NoError(t, err)
 	assert.Equal(t, 64, boot.pool.MaxProcsPerTenant)
@@ -383,6 +385,185 @@ func TestBootParamsRejectsUnsafeScopeFlags(t *testing.T) {
 	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeUser: "u1"}).bootParams(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "requires --scope-tenant")
+}
+
+// The inbox prefix is validated at boot rather than left to nats.Connect: the
+// option's own check misses spaces, and it reports neither the setting nor the
+// value.
+func TestBootParamsValidatesInboxPrefix(t *testing.T) {
+	for _, bad := range []string{
+		"_INBOX acme",   // space
+		"_INBOX.*",      // wildcard token
+		"_INBOX.>",      // wildcard token
+		"_INBOX.acme.",  // trailing dot
+		".acme",         // leading dot
+		"_INBOX..acme",  // doubled dot
+		"_INBOX.acme/1", // not token-safe
+	} {
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: bad}).bootParams(testLogger())
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "--inbox-prefix", bad)
+	}
+
+	boot, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: "_INBOX_acme.u_9f3a"}).bootParams(testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, "_INBOX_acme.u_9f3a", boot.inboxPrefix)
+
+	// Unset stays unset — the nats.go default inbox, exactly as before.
+	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(testLogger())
+	require.NoError(t, err)
+	assert.Empty(t, boot.inboxPrefix)
+}
+
+// A custom inbox prefix must cover EVERY request/reply this process issues —
+// the config fetch AND the `nats` cred resolver — because that is the whole
+// point: it lets a scoped pod's identity be granted a narrow inbox instead of
+// `_INBOX.>`, the account's entire reply namespace. Anything that built a
+// reply subject by hand would silently escape it.
+func TestInboxPrefixCoversConfigAndCredRequests(t *testing.T) {
+	_, url := fetchNATS(t)
+	const prefix = "_INBOX_acme.u_9f3a"
+
+	nc, err := nats.Connect(url, nats.CustomInboxPrefix(prefix))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	// Responders record the reply subject the gateway asked them to answer on.
+	replies := make(chan string, 2)
+	record := func(subject string, body string) {
+		sub, err := nc.Subscribe(subject, func(m *nats.Msg) {
+			replies <- m.Reply
+			_ = m.Respond([]byte(body))
+		})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sub.Unsubscribe() })
+	}
+	record("mcp.cfg.request", `{"servers":{}}`)
+	record("mcp.v1.cred.>", `{"env":{"TOKEN":"t"}}`)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	src := &configsource.NATS{Conn: nc, RequestSubject: "mcp.cfg.request", Logger: testLogger()}
+	u := <-src.Watch(ctx)
+	require.NoError(t, u.Err)
+
+	_, err = buildResolver(&config.Auth{Mode: config.AuthNATS}, nc, "").
+		Resolve(ctx, "acme", "u1", "gh")
+	require.NoError(t, err)
+
+	for i := 0; i < 2; i++ {
+		reply := <-replies
+		assert.True(t, strings.HasPrefix(reply, prefix+"."),
+			"reply inbox %q must live under the custom prefix %q", reply, prefix)
+	}
+}
+
+// The `nats` cred mode's default subject derives from the CONFIGURED wire
+// prefix. A hardcoded default agrees with the control plane only while the
+// prefix is the default one; past that the pod publishes cred requests to a
+// subject its own JWT denies, and every tool call fails while it still reports
+// healthy.
+func TestCredSubjectDerivesFromSubjectPrefix(t *testing.T) {
+	nc, _ := fetchNATS(t)
+
+	for _, tc := range []struct {
+		name       string
+		wirePrefix string
+		auth       *config.Auth
+		want       string
+	}{
+		{"default prefix", "", &config.Auth{Mode: config.AuthNATS}, "mcp.v1.cred.acme.u1.gh"},
+		{"custom prefix", "acme.mcp", &config.Auth{Mode: config.AuthNATS}, "acme.mcp.cred.acme.u1.gh"},
+		{"explicit subject wins", "acme.mcp", &config.Auth{Mode: config.AuthNATS, Subject: "ctl.creds"}, "ctl.creds.acme.u1.gh"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make(chan string, 1)
+			sub, err := nc.Subscribe(tc.want, func(m *nats.Msg) {
+				got <- m.Subject
+				_ = m.Respond([]byte(`{"env":{"TOKEN":"t"}}`))
+			})
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+			creds, err := buildResolver(tc.auth, nc, tc.wirePrefix).
+				Resolve(context.Background(), "acme", "u1", "gh")
+			require.NoError(t, err)
+			assert.Equal(t, "t", creds.Env["TOKEN"])
+			assert.Equal(t, tc.want, <-got)
+		})
+	}
+}
+
+// ...and the registry threads the boot prefix into every resolver it builds,
+// which is the whole path a --subject-prefix takes to a cred request.
+func TestCredRegistryThreadsSubjectPrefix(t *testing.T) {
+	nc, _ := fetchNATS(t)
+
+	got := make(chan string, 1)
+	sub, err := nc.Subscribe("acme.mcp.cred.>", func(m *nats.Msg) {
+		got <- m.Subject
+		_ = m.Respond([]byte(`{"env":{"TOKEN":"t"}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
+
+	r := &credRegistry{nc: nc, log: testLogger(), prefix: "acme.mcp"}
+	resolver, perUser := r.lookup("gh", config.Server{
+		Command: "x", Auth: &config.Auth{Mode: config.AuthNATS},
+	})
+	require.NotNil(t, resolver)
+	assert.True(t, perUser)
+
+	_, err = resolver.Resolve(context.Background(), "acme", "u1", "gh")
+	require.NoError(t, err)
+	assert.Equal(t, "acme.mcp.cred.acme.u1.gh", <-got)
+}
+
+// The expiry clamp bounds how long a leaked credential stays usable, so it
+// applies only when the reply carried something leakable. A reply with an
+// expiry and no material must not recycle the process on that cadence —
+// npx/uvx cold starts would surface as periodic latency spikes on a server
+// that has no credentials at all.
+func TestBuildBackendExpiryRequiresCredentialMaterial(t *testing.T) {
+	exp := time.Now().Add(time.Hour).UTC()
+	build := func(t *testing.T, s config.Server, c *cred.Credentials) backend.Backend {
+		t.Helper()
+		r := cred.Cached(cred.ResolveFunc(
+			func(context.Context, string, string, string) (*cred.Credentials, error) { return c, nil },
+		), 0)
+		_, gen, err := r.ResolveGen(context.Background(), "acme", "u1", "s")
+		require.NoError(t, err)
+		b, err := buildBackend(
+			backend.Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: gen},
+			s, r, testLogger(),
+		)
+		require.NoError(t, err)
+		return b
+	}
+	stdio := config.Server{Command: "true"}
+	http := config.Server{Transport: "http", URL: "https://example.invalid/mcp"}
+
+	// Material present: the clamp holds (the property that bounds reuse of a
+	// leaked credential).
+	b := build(t, stdio, &cred.Credentials{Env: map[string]string{"TOKEN": "t"}, ExpiresAt: exp})
+	e, ok := b.(backend.Expiring)
+	require.True(t, ok, "env material must bound the backend's life")
+	assert.Equal(t, exp, e.CredExpiresAt())
+
+	b = build(t, http, &cred.Credentials{Headers: map[string]string{"Authorization": "Bearer t"}, ExpiresAt: exp})
+	e, ok = b.(backend.Expiring)
+	require.True(t, ok, "header material must bound the backend's life")
+	assert.Equal(t, exp, e.CredExpiresAt())
+
+	// Expiry with no material: nothing to leak, so no bounded lifetime.
+	b = build(t, stdio, &cred.Credentials{ExpiresAt: exp})
+	_, ok = b.(backend.Expiring)
+	assert.False(t, ok, "a materially-empty reply must not bound the backend's life")
+
+	b = build(t, http, &cred.Credentials{Headers: map[string]string{}, Env: map[string]string{}, ExpiresAt: exp})
+	_, ok = b.(backend.Expiring)
+	assert.False(t, ok, "empty maps are not credential material")
 }
 
 // End to end: an inline --config-json document, a tenant-scoped wire, and a

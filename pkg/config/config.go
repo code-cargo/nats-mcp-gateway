@@ -54,7 +54,12 @@ type NATS struct {
 	URL           string `json:"url"`
 	CredsFile     string `json:"credsFile"`
 	SubjectPrefix string `json:"subjectPrefix"`
-	QueueGroup    string `json:"queueGroup"`
+	// InboxPrefix moves this process's own request/reply inboxes (the config
+	// fetch, the `nats` cred resolver, JetStream) off the account-wide
+	// _INBOX.> namespace, so its NATS identity can be granted just this
+	// prefix. Empty keeps the nats.go default.
+	InboxPrefix string `json:"inboxPrefix"`
+	QueueGroup  string `json:"queueGroup"`
 	// Tenant/User scope this instance's subjects. Tenant alone binds
 	// {prefix}.req.{tenant}.*.{server}.> — an org deployment fronting its
 	// servers for all of one tenant's users. Tenant+User binds
@@ -132,7 +137,9 @@ type Auth struct {
 	SubjectTokenType string `json:"subjectTokenType,omitempty"` // oauth-token-exchange
 	RefreshTokenFile string `json:"refreshTokenFile,omitempty"` // oauth-refresh
 
-	// nats mode: subject prefix override (default "mcp.v1.cred").
+	// nats mode: subject prefix override. Unset derives it from the wire
+	// subject prefix ("{subjectPrefix}.cred"), so one configured prefix
+	// governs both the wire and the cred exchange.
 	Subject string `json:"subject,omitempty"`
 }
 
@@ -280,6 +287,11 @@ func (c *Config) validate() error {
 	if c.Pool.MaxLifetime != "" {
 		if _, err := time.ParseDuration(c.Pool.MaxLifetime); err != nil {
 			return fmt.Errorf("pool.maxLifetime: %w", err)
+		}
+	}
+	if c.NATS.InboxPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.NATS.InboxPrefix); err != nil {
+			return fmt.Errorf("nats.inboxPrefix: %w", err)
 		}
 	}
 	if c.NATS.Tenant == "" && c.NATS.User != "" {

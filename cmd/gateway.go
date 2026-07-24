@@ -50,6 +50,7 @@ type bootParams struct {
 	url           string
 	credsFile     string
 	prefix        string
+	inboxPrefix   string
 	queueGroup    string
 	tenant        string
 	user          string
@@ -89,6 +90,17 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	if boot.credsFile != "" {
 		opts = append(opts, nats.UserCredentials(boot.credsFile))
 	}
+	if boot.inboxPrefix != "" {
+		// Every request/reply this process issues — the config fetch, the
+		// `nats` cred resolver, JetStream — derives its reply subject from the
+		// connection, so this one option moves them all under a prefix the
+		// identity can be granted ALONE. Without it that identity needs
+		// `_INBOX.>`, the account's entire reply namespace: for a pod running
+		// third-party MCP server code beside the gateway, a child process that
+		// lifts the connection's credential could then subscribe there and read
+		// every other tenant's credential replies.
+		opts = append(opts, nats.CustomInboxPrefix(boot.inboxPrefix))
+	}
 	nc, err := nats.Connect(boot.url, opts...)
 	if err != nil {
 		return fmt.Errorf("connect NATS %s: %w", boot.url, err)
@@ -114,7 +126,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	// from the newest config. The credential registry lives beside it so the
 	// resolvers' caches survive requests but not an auth-config change.
 	var rec *reconcile.Reconciler
-	registry := &credRegistry{nc: nc, log: log}
+	registry := &credRegistry{nc: nc, log: log, prefix: boot.prefix}
 	registry.live = func(name string) (config.Server, bool) {
 		cur := rec.Current()
 		if cur == nil {
@@ -256,13 +268,14 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 			url = nats.DefaultURL
 		}
 		boot := bootParams{
-			url:        url,
-			credsFile:  cfg.NATS.CredsFile,
-			prefix:     cfg.NATS.SubjectPrefix,
-			queueGroup: cfg.NATS.QueueGroup,
-			tenant:     cfg.NATS.Tenant,
-			user:       cfg.NATS.User,
-			pool:       cfg.Pool,
+			url:         url,
+			credsFile:   cfg.NATS.CredsFile,
+			prefix:      cfg.NATS.SubjectPrefix,
+			inboxPrefix: cfg.NATS.InboxPrefix, // validated in config.validate()
+			queueGroup:  cfg.NATS.QueueGroup,
+			tenant:      cfg.NATS.Tenant,
+			user:        cfg.NATS.User,
+			pool:        cfg.Pool,
 		}
 		if cc := cfg.ClaimCheck; cc != nil {
 			boot.claimCheck = true
@@ -287,11 +300,20 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 	if c.ScopeUser != "" && !wire.TokenSafe(c.ScopeUser) {
 		return bootParams{}, fmt.Errorf("--scope-user %q is not subject-token safe (%s)", c.ScopeUser, `A-Za-z0-9_-`)
 	}
+	// Validated here rather than left to nats.Connect: the option's own check
+	// misses spaces, and its "invalid custom prefix" names neither the setting
+	// nor the value.
+	if c.InboxPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+			return bootParams{}, fmt.Errorf("--inbox-prefix: %w", err)
+		}
+	}
 
 	boot := bootParams{
 		url:           c.NatsURL,
 		credsFile:     c.NatsCreds,
 		prefix:        c.SubjectPrefix,
+		inboxPrefix:   c.InboxPrefix,
 		queueGroup:    c.QueueGroup,
 		tenant:        c.ScopeTenant,
 		user:          c.ScopeUser,
@@ -426,7 +448,13 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		// Default: 2025-11-25, because that is what exists in the wild.
 		out = &legacy.Backend{Inner: inner, DiscoverTTLMs: s.DiscoverTTLMs, Logger: blog}
 	}
-	if creds != nil && !creds.ExpiresAt.IsZero() {
+	// Clamp the backend's life to the credentials' expiry — but only when the
+	// reply actually carried material. The clamp exists to bound how long a
+	// leaked credential stays usable; a reply with an expiry and no env or
+	// headers has nothing to leak, and honoring it anyway would kill and
+	// respawn the child on the responder's cadence, paying an npx/uvx cold
+	// start every cycle for a server that has no credentials at all.
+	if creds != nil && !creds.ExpiresAt.IsZero() && (len(creds.Env) > 0 || len(creds.Headers) > 0) {
 		out = &expiringBackend{Backend: out, expiresAt: creds.ExpiresAt}
 	}
 	return out, nil
@@ -465,6 +493,12 @@ func (t *credTokenSource) Invalidate() { t.resolver.Invalidate(t.tenant, t.user,
 type credRegistry struct {
 	nc  *nats.Conn
 	log *slog.Logger
+	// prefix is the boot subject prefix the WIRE serves on. The `nats` cred
+	// mode's default subject derives from it, so one configured prefix governs
+	// both halves of the control-plane contract: a deployment that moves its
+	// wire also moves its cred requests, instead of publishing them to a
+	// hardcoded subject its own JWT denies.
+	prefix string
 	// live returns the server's CURRENT definition, or false if it is no
 	// longer configured. Consulted before inserting a new entry: a request
 	// holding a pre-reload config snapshot must not resurrect a
@@ -545,15 +579,17 @@ func (r *credRegistry) lookup(name string, s config.Server) (*cred.CachedResolve
 	e = &credRegEntry{
 		authPtr:  s.Auth,
 		authJSON: string(authJSON),
-		resolver: cred.Cached(buildResolver(s.Auth, r.nc), 0),
+		resolver: cred.Cached(buildResolver(s.Auth, r.nc, r.prefix), 0),
 		perUser:  s.Auth.PerUser(),
 	}
 	r.entries[name] = e
 	return e.resolver, e.perUser
 }
 
-// buildResolver maps a validated auth config to its built-in resolver.
-func buildResolver(a *config.Auth, nc *nats.Conn) cred.Resolver {
+// buildResolver maps a validated auth config to its built-in resolver. prefix
+// is the wire's subject prefix ("" = wire.DefaultPrefix); only the `nats` mode
+// reads it, to default its cred subject.
+func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	switch a.Mode {
 	case config.AuthExec:
 		return &cred.Exec{Command: a.Command, Args: a.Args, Env: a.Env}
@@ -577,7 +613,19 @@ func buildResolver(a *config.Auth, nc *nats.Conn) cred.Resolver {
 			Scope: a.Scope, Store: &cred.FileTokenStore{Path: a.RefreshTokenFile},
 		}
 	case config.AuthNATS:
-		return &cred.NATS{Conn: nc, SubjectPrefix: a.Subject}
+		subject := a.Subject
+		if subject == "" {
+			// Derive from the configured wire prefix, not a hardcoded one: the
+			// control plane grants cred-publish from ITS prefix, so a gateway
+			// asking on "mcp.v1.cred.…" under a custom --subject-prefix would
+			// be denied by its own JWT — and only at request time, with the pod
+			// still reporting healthy.
+			if prefix == "" {
+				prefix = wire.DefaultPrefix
+			}
+			subject = prefix + ".cred"
+		}
+		return &cred.NATS{Conn: nc, SubjectPrefix: subject}
 	}
 	// Unreachable after config validation; a nil resolver would panic in
 	// Cached, so fail closed with an erroring resolver instead.

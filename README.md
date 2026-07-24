@@ -225,7 +225,7 @@ credential, and per-user modes keep secrets out of the config entirely.
 | `exec` | per-user | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
 | `oauth-token-exchange` | per-user | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |
 | `oauth-refresh` | per-user | refresh_token grant (`tokenUrl`, `clientId`, `refreshTokenFile`; a rotated refresh token is written back) |
-| `nats` | per-user | request/reply to a controller (below; optional `subject` overrides the `mcp.v1.cred` prefix) |
+| `nats` | per-user | request/reply to a controller (below; the subject prefix defaults to `{subjectPrefix}.cred` and `subject` overrides it) |
 
 The file-path fields (`path`, `subjectTokenFile`, `refreshTokenFile`) accept
 `{tenant}`, `{user}`, `{server}` placeholders, and `file` reads the same
@@ -236,7 +236,9 @@ Per-user servers are pooled per `(server, tenant, user, credential
 generation)`: two users of one server get separate processes with their own
 credentials, a refreshed credential drains the old backend, and the pool
 recycles a backend before its credentials expire (an in-flight call at expiry
-fails with `-32010` and the client re-issues). HTTP servers get the current
+fails with `-32010` and the client re-issues) — the expiry bounds the process
+only when the resolver actually returned `env`/`headers`, so a reply carrying
+nothing but an `expiresAt` costs no respawn. HTTP servers get the current
 bearer on every request, so a mid-life refresh needs no reconnect; on a `401`
 the gateway drops the cached credential, re-resolves, and retries exactly
 once — safe for any method, since a `401` rejects the request before the
@@ -270,7 +272,9 @@ Adding a credential source has the same three tiers as config reloading
    the TTL cache, single-flight, and failure backoff every mode gets.
 
 **Controller contract (`mode: "nats"`):** respond to
-`mcp.v1.cred.{tenant}.{user}.{server}` with the same
+`{subjectPrefix}.cred.{tenant}.{user}.{server}` — `mcp.v1.cred.…` by default,
+and it follows a custom `--subject-prefix` so one configured prefix governs
+both the wire and the cred exchange (`auth.subject` overrides it) — with the same
 `{"headers"|"env", "expiresAt"}` JSON — how the controller produced it
 (authorization-code + refresh, STS, RFC 8693 token exchange) is invisible to
 the gateway and can evolve freely. Refuse with a `Nats-Service-Error` header;
@@ -333,7 +337,25 @@ and gateway-unaware in both:
      queue groups differ, NATS delivers that user's request to *both* — the
      call executes twice against two backends, and only the first reply is
      kept. Pick one granularity per server name.
-  3. The pod's NATS identity should be fenced to its own subjects.
+  3. The pod's NATS identity should be fenced to its own subjects — **including
+     its inbox**. A scoped instance should set `--inbox-prefix` /
+     `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`), which moves every
+     request/reply the process issues — the config fetch, the `nats` cred
+     resolver, JetStream — under that prefix:
+
+     ```
+     # instead of subscribe: ["_INBOX.>"] — the whole account's replies
+     publish:   ["mcp.v1.req.acme.u_9f3a.>", "mcp.v1.cfg.request", "mcp.v1.cred.acme.u_9f3a.>"]
+     subscribe: ["_INBOX_acme_u_9f3a.>"]
+     ```
+
+     Without it the identity needs `_INBOX.>` just to receive its own replies,
+     which grants it the entire account-wide reply namespace. That matters most
+     for a per-org pod running **third-party MCP server code** beside the
+     gateway: a child process that lifts the connection's credential could
+     subscribe there and read every other tenant's credential-responder replies.
+     The value must be a literal subject prefix — no spaces, no `*`/`>`, no
+     trailing dot — and is rejected at boot otherwise.
 
   The document above is the file-source form. A pod with no file mount carries
   it inline instead — `NATSMCP_CONFIG_JSON` holds a plain-only
@@ -405,8 +427,17 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
   carries the credential); a config change is a new pod, not a hot reload.
 
 Note: only the **file** source reads connection settings (URL, prefix, queue
-group, scope) from the document's `nats` block. The fetch and inline sources
-take those from flags/env — the document supplies only the server set.
+group, inbox prefix, scope) from the document's `nats` block. The fetch and
+inline sources take those from flags/env — the document supplies only the
+server set.
+
+`--inbox-prefix` / `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`)
+sets the prefix for this process's own request/reply inboxes — the config
+fetch, the `nats` cred resolver, and JetStream all derive their reply subject
+from the connection, so one setting covers them. Scoped instances **should**
+set it: without one, the gateway replies land under `_INBOX.>` and its NATS
+identity has to be granted that whole namespace (see
+[Local and remote servers](#local-and-remote-servers)).
 
 ### Reloading from something else
 

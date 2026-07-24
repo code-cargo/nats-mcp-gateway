@@ -60,6 +60,30 @@ func TokenSafe(s string) bool {
 	return s != "" && tokenRe.MatchString(s)
 }
 
+// ValidateSubjectPrefix checks that s is usable as a LITERAL subject prefix —
+// a dotted run of safe tokens, no wildcard, no empty token. Callers prefix the
+// error with the setting name.
+//
+// The wildcard rejection is the security-relevant one. A prefix is what a
+// narrow NATS grant is written against, so a "*" or ">" inside it would widen
+// the very subscription the prefix exists to narrow; an empty token (leading,
+// doubled or trailing dot) subscribes to something other than what was
+// written. nats.CustomInboxPrefix catches the first three of those, but only
+// at connect time and with no mention of which setting was wrong.
+func ValidateSubjectPrefix(s string) error {
+	for _, tok := range strings.Split(s, ".") {
+		switch {
+		case tok == "":
+			return fmt.Errorf("invalid subject prefix %q: empty token (leading, doubled, or trailing dot)", s)
+		case strings.ContainsAny(tok, "*>"):
+			return fmt.Errorf("invalid subject prefix %q: wildcards (* and >) are not allowed", s)
+		case !TokenSafe(tok):
+			return fmt.Errorf("invalid subject prefix %q: token %q is not subject-token safe (%s)", s, tok, `A-Za-z0-9_-`)
+		}
+	}
+	return nil
+}
+
 // NameToken maps a raw MCP name (tool name, prompt name, resource URI) to its
 // subject token. Token-safe names map to themselves; everything else maps to
 // NameUnset. The integrity check enforces the inverse rules: a token-safe

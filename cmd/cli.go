@@ -65,6 +65,7 @@ type GatewayCmd struct {
 	NatsURL             string        `help:"NATS URL (fetch + inline sources)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
 	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch + inline sources)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
+	InboxPrefix         string        `help:"Custom NATS inbox prefix for this process's own request/reply (fetch + inline sources; the file source uses nats.inboxPrefix). A scoped instance should set it so its identity can be granted a narrow inbox instead of _INBOX.>." env:"NATSMCP_INBOX_PREFIX"`
 	QueueGroup          string        `help:"Wire queue group (fetch + inline sources; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
 	ScopeTenant         string        `help:"Serve only this tenant's subjects (org deployment; per-user pod when combined with --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
 	ScopeUser           string        `help:"Serve only this user's subjects (per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
