@@ -182,13 +182,40 @@ func TestNATSScopingValidation(t *testing.T) {
 	assert.Equal(t, "acme", cfg.NATS.Tenant)
 	assert.Equal(t, "u1", cfg.NATS.User)
 
-	_, err = Parse([]byte(`{"nats":{"tenant":"acme"},"servers":{}}`))
-	require.Error(t, err, "tenant without user must be rejected")
-	assert.Contains(t, err.Error(), "both tenant and user")
+	// Tenant alone is valid: an org deployment serving all of one tenant's users.
+	cfg, err = Parse([]byte(`{"nats":{"tenant":"acme"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "acme", cfg.NATS.Tenant)
+	assert.Empty(t, cfg.NATS.User)
+
+	// A user without a tenant is rejected.
+	_, err = Parse([]byte(`{"nats":{"user":"u1"},"servers":{}}`))
+	require.Error(t, err, "user without tenant must be rejected")
+	assert.Contains(t, err.Error(), "requires a tenant")
 
 	_, err = Parse([]byte(`{"nats":{"tenant":"bad tenant","user":"u1"},"servers":{}}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not subject-token safe")
+}
+
+// The file source's equivalent of --inbox-prefix. It is validated here so a
+// bad value fails the load rather than nats.Connect, whose "invalid custom
+// prefix" names neither the setting nor the value — and whose own check misses
+// spaces entirely.
+func TestNATSInboxPrefixValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"nats":{"inboxPrefix":"_INBOX_acme.u_9f3a"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "_INBOX_acme.u_9f3a", cfg.NATS.InboxPrefix)
+
+	cfg, err = Parse([]byte(`{"servers":{}}`))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.NATS.InboxPrefix, "absent = the nats.go default inbox")
+
+	for _, bad := range []string{"_INBOX acme", "_INBOX.>", "_INBOX.*", "_INBOX.acme.", "_INBOX..acme"} {
+		_, err = Parse([]byte(`{"nats":{"inboxPrefix":"` + bad + `"},"servers":{}}`))
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "nats.inboxPrefix", bad)
+	}
 }
 
 func TestClaimCheckValidation(t *testing.T) {

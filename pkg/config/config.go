@@ -54,12 +54,19 @@ type NATS struct {
 	URL           string `json:"url"`
 	CredsFile     string `json:"credsFile"`
 	SubjectPrefix string `json:"subjectPrefix"`
-	QueueGroup    string `json:"queueGroup"`
-	// Tenant/User, when set (always together), scope this instance to one
-	// caller: it binds {prefix}.req.{tenant}.{user}.{server}.> instead of
-	// the all-callers wildcard. This is the per-user pod shape — the
-	// instance fronts its servers for exactly one identity, typically with
-	// that identity's credentials injected into its environment.
+	// InboxPrefix moves this process's own request/reply inboxes (the config
+	// fetch, the `nats` cred resolver, JetStream) off the account-wide
+	// _INBOX.> namespace, so its NATS identity can be granted just this
+	// prefix. Empty keeps the nats.go default.
+	InboxPrefix string `json:"inboxPrefix"`
+	QueueGroup  string `json:"queueGroup"`
+	// Tenant/User scope this instance's subjects. Tenant alone binds
+	// {prefix}.req.{tenant}.*.{server}.> — an org deployment fronting its
+	// servers for all of one tenant's users. Tenant+User binds
+	// {prefix}.req.{tenant}.{user}.{server}.> — the per-user pod shape,
+	// serving one identity, typically with that identity's credentials
+	// injected into its environment. Both empty is the all-callers central
+	// gateway; user without tenant is invalid.
 	Tenant string `json:"tenant"`
 	User   string `json:"user"`
 }
@@ -130,7 +137,9 @@ type Auth struct {
 	SubjectTokenType string `json:"subjectTokenType,omitempty"` // oauth-token-exchange
 	RefreshTokenFile string `json:"refreshTokenFile,omitempty"` // oauth-refresh
 
-	// nats mode: subject prefix override (default "mcp.v1.cred").
+	// nats mode: subject prefix override. Unset derives it from the wire
+	// subject prefix ("{subjectPrefix}.cred"), so one configured prefix
+	// governs both the wire and the cred exchange.
 	Subject string `json:"subject,omitempty"`
 }
 
@@ -270,8 +279,23 @@ func (c *Config) validate() error {
 			return fmt.Errorf("claimCheck.maxBytes must be >= 0")
 		}
 	}
-	if (c.NATS.Tenant == "") != (c.NATS.User == "") {
-		return fmt.Errorf("nats: scoping requires both tenant and user (got tenant=%q, user=%q)", c.NATS.Tenant, c.NATS.User)
+	if c.Pool.IdleTTL != "" {
+		if _, err := time.ParseDuration(c.Pool.IdleTTL); err != nil {
+			return fmt.Errorf("pool.idleTtl: %w", err)
+		}
+	}
+	if c.Pool.MaxLifetime != "" {
+		if _, err := time.ParseDuration(c.Pool.MaxLifetime); err != nil {
+			return fmt.Errorf("pool.maxLifetime: %w", err)
+		}
+	}
+	if c.NATS.InboxPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.NATS.InboxPrefix); err != nil {
+			return fmt.Errorf("nats.inboxPrefix: %w", err)
+		}
+	}
+	if c.NATS.Tenant == "" && c.NATS.User != "" {
+		return fmt.Errorf("nats: scoping with a user requires a tenant (got user=%q)", c.NATS.User)
 	}
 	if c.NATS.Tenant != "" && !wire.TokenSafe(c.NATS.Tenant) {
 		return fmt.Errorf("nats: tenant %q is not subject-token safe (%s)", c.NATS.Tenant, `A-Za-z0-9_-`)

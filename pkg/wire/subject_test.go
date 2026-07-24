@@ -113,14 +113,19 @@ func TestEndpointSubject(t *testing.T) {
 }
 
 func TestEndpointSubjectScoped(t *testing.T) {
+	// Fully scoped: one caller's slice (per-user pod).
 	got, err := EndpointSubject("", "acme", "u1", "github")
 	require.NoError(t, err)
 	assert.Equal(t, "mcp.v1.req.acme.u1.github.>", got)
 
-	// Scoping is both-or-neither: one token alone would silently serve
-	// either everyone or no one, so it is rejected outright.
-	_, err = EndpointSubject("", "acme", "", "github")
-	assert.Error(t, err)
+	// Tenant-only: the whole tenant's slice, user token wildcarded — an org
+	// deployment serving all of one tenant's users.
+	got, err = EndpointSubject("", "acme", "", "github")
+	require.NoError(t, err)
+	assert.Equal(t, "mcp.v1.req.acme.*.github.>", got)
+
+	// A user without a tenant would scope by the attribution token alone,
+	// spanning every tenant — never a shape we bind.
 	_, err = EndpointSubject("", "", "u1", "github")
 	assert.Error(t, err)
 

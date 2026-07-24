@@ -342,11 +342,50 @@ func TestScopedEndpointServesOnlyItsUser(t *testing.T) {
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 }
 
-func TestServeRejectsHalfScoping(t *testing.T) {
+// A tenant-scoped instance (org-deployment shape) binds its whole tenant's
+// slice with the user token wildcarded: every user of that tenant reaches it,
+// other tenants hit no-responders. Like a per-user pod, it must not share a
+// queue group with an unscoped instance serving the same server names.
+func TestTenantScopedEndpointServesAllItsUsers(t *testing.T) {
 	nc := runNATS(t, nil)
-	_, err := Serve(nc, ServerConfig{Tenant: "acme", Servers: []string{"test"}}, nil)
+	serve(t, nc, ServerConfig{Tenant: "acme", QueueGroup: "qg-acme"},
+		func(ctx context.Context, in *Inbound, w StreamWriter) error {
+			assert.Equal(t, "acme", in.Subject.Tenant)
+			return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{"served_by":"tenant-scoped"}}`))
+		})
+
+	inTenant := func(tenant, user string) []Frame {
+		c, err := NewClient(nc, ClientConfig{Tenant: tenant, User: user, Inactivity: 2 * time.Second})
+		require.NoError(t, err)
+		s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+		require.NoError(t, err)
+		return collect(t, s)
+	}
+
+	// Any user of the scoped tenant is served — including the unattributed
+	// placeholder — because the user token is a wildcard.
+	for _, user := range []string{"u1", "u2", UserUnattributed} {
+		frames := inTenant("acme", user)
+		require.Len(t, frames, 1)
+		assert.Equal(t, FrameEnd, frames[0].Kind, "user %q of the scoped tenant must be served", user)
+		assert.Contains(t, string(frames[0].Body), "tenant-scoped")
+	}
+
+	// Another tenant's request must not reach it.
+	frames := inTenant("other", "u1")
+	require.Len(t, frames, 1)
+	require.NotNil(t, frames[0].Err, "another tenant's request must not reach the tenant-scoped instance")
+	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
+}
+
+// A User without a Tenant would scope by the attribution token alone,
+// spanning every tenant — Serve rejects it. (Tenant alone is the valid
+// org-deployment scope; see TestTenantScopedEndpointServesAllItsUsers.)
+func TestServeRejectsUserWithoutTenant(t *testing.T) {
+	nc := runNATS(t, nil)
+	_, err := Serve(nc, ServerConfig{User: "u1", Servers: []string{"test"}}, nil)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "both Tenant and User")
+	assert.Contains(t, err.Error(), "requires a Tenant")
 }
 
 // A NATS publish denial must fail the stream immediately with -32013 — not
@@ -413,6 +452,9 @@ func TestQueueGroupDefaults(t *testing.T) {
 	nc := runNATS(t, nil)
 	s := serve(t, nc, ServerConfig{}, nil)
 	assert.Equal(t, "mcpgw", s.queueGroup)
+
+	s = serve(t, nc, ServerConfig{Tenant: "acme"}, nil)
+	assert.Equal(t, "mcpgw.acme", s.queueGroup, "tenant-scoped instances default to their tenant group")
 
 	s = serve(t, nc, ServerConfig{Tenant: "acme", User: "u1"}, nil)
 	assert.Equal(t, "mcpgw.acme.u1", s.queueGroup, "scoped instances must default to their own group")

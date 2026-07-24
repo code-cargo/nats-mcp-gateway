@@ -60,6 +60,30 @@ func TokenSafe(s string) bool {
 	return s != "" && tokenRe.MatchString(s)
 }
 
+// ValidateSubjectPrefix checks that s is usable as a LITERAL subject prefix —
+// a dotted run of safe tokens, no wildcard, no empty token. Callers prefix the
+// error with the setting name.
+//
+// The wildcard rejection is the security-relevant one. A prefix is what a
+// narrow NATS grant is written against, so a "*" or ">" inside it would widen
+// the very subscription the prefix exists to narrow; an empty token (leading,
+// doubled or trailing dot) subscribes to something other than what was
+// written. nats.CustomInboxPrefix catches the first three of those, but only
+// at connect time and with no mention of which setting was wrong.
+func ValidateSubjectPrefix(s string) error {
+	for _, tok := range strings.Split(s, ".") {
+		switch {
+		case tok == "":
+			return fmt.Errorf("invalid subject prefix %q: empty token (leading, doubled, or trailing dot)", s)
+		case strings.ContainsAny(tok, "*>"):
+			return fmt.Errorf("invalid subject prefix %q: wildcards (* and >) are not allowed", s)
+		case !TokenSafe(tok):
+			return fmt.Errorf("invalid subject prefix %q: token %q is not subject-token safe (%s)", s, tok, `A-Za-z0-9_-`)
+		}
+	}
+	return nil
+}
+
 // NameToken maps a raw MCP name (tool name, prompt name, resource URI) to its
 // subject token. Token-safe names map to themselves; everything else maps to
 // NameUnset. The integrity check enforces the inverse rules: a token-safe
@@ -155,11 +179,18 @@ func ParseSubject(subject, prefix string) (*ParsedSubject, error) {
 	}, nil
 }
 
-// EndpointSubject is the micro endpoint subject fronting one server. Empty
-// tenant and user give the central-gateway form serving all callers:
-// {prefix}.req.*.*.{server}.> — set both (never just one) to scope the
-// endpoint to a single caller's slice of the subject space, the shape a
-// per-user pod binds so NATS routes only that user's traffic to it.
+// EndpointSubject is the micro endpoint subject fronting one server. The
+// (tenant, user) pair selects one of three scopes, an unset token widening to
+// the "*" wildcard:
+//
+//	both unset       {prefix}.req.*.*.{server}.>            central fleet, all callers
+//	tenant only      {prefix}.req.{tenant}.*.{server}.>     one org, all its users
+//	tenant + user    {prefix}.req.{tenant}.{user}.{server}.>  one caller (per-user pod)
+//
+// A user without a tenant is rejected: scoping by the attribution token alone
+// would span every tenant, never a shape we bind. The tenant-only form is how
+// a per-org deployment claims its whole org's slice; the fully-scoped form is
+// what a per-user pod binds so NATS routes only that user's traffic to it.
 func EndpointSubject(prefix, tenant, user, server string) (string, error) {
 	if prefix == "" {
 		prefix = DefaultPrefix
@@ -167,17 +198,22 @@ func EndpointSubject(prefix, tenant, user, server string) (string, error) {
 	if !TokenSafe(server) {
 		return "", fmt.Errorf("wire: server %q is not subject-token safe", server)
 	}
-	if (tenant == "") != (user == "") {
-		return "", fmt.Errorf("wire: endpoint scoping requires both tenant and user (got tenant=%q, user=%q)", tenant, user)
+	if tenant == "" && user != "" {
+		return "", fmt.Errorf("wire: endpoint scoping with a user requires a tenant (got user=%q)", user)
 	}
-	if tenant == "" {
-		return prefix + ".req.*.*." + server + ".>", nil
+	tenantTok := "*"
+	if tenant != "" {
+		if !TokenSafe(tenant) {
+			return "", fmt.Errorf("wire: tenant %q is not subject-token safe", tenant)
+		}
+		tenantTok = tenant
 	}
-	if !TokenSafe(tenant) {
-		return "", fmt.Errorf("wire: tenant %q is not subject-token safe", tenant)
+	userTok := "*"
+	if user != "" {
+		if !TokenSafe(user) {
+			return "", fmt.Errorf("wire: user %q is not subject-token safe", user)
+		}
+		userTok = user
 	}
-	if !TokenSafe(user) {
-		return "", fmt.Errorf("wire: user %q is not subject-token safe", user)
-	}
-	return prefix + ".req." + tenant + "." + user + "." + server + ".>", nil
+	return prefix + ".req." + tenantTok + "." + userTok + "." + server + ".>", nil
 }
