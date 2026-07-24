@@ -57,6 +57,10 @@ type bootParams struct {
 	claimCheck    bool
 	claimMaxAge   time.Duration
 	claimMaxBytes int64
+	// inline is the already-parsed --config-json document (nil for the other
+	// sources): bootParams has to parse it to read pool/claimCheck, so the
+	// source reuses that parse rather than doing a second one.
+	inline *config.Config
 }
 
 func runGateway(c *GatewayCmd, g *Globals, version string) error {
@@ -100,7 +104,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	// Build the config source before the serving machinery, so a malformed
 	// inline document fails the boot here rather than after the pool and wire
 	// are up. The NATS source needs the connection; file/inline don't.
-	source, onSighup, err := c.buildSource(nc, log)
+	source, onSighup, err := c.buildSource(boot, nc, log)
 	if err != nil {
 		return err
 	}
@@ -131,10 +135,19 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		resolver, _ := registry.lookup(key.Server, s)
 		return buildBackend(key, s, resolver, log)
 	}
-	pool := backend.NewPool(backend.PoolConfig{
+	// Durations are strings in the config schema; they parsed at load, so a
+	// zero here means "unset" and NewPool applies its own default.
+	poolCfg := backend.PoolConfig{
 		MaxConcurrent:     boot.pool.MaxConcurrent,
 		MaxProcsPerTenant: boot.pool.MaxProcsPerTenant,
-	}, factory, log)
+	}
+	if boot.pool.IdleTTL != "" {
+		poolCfg.IdleTTL, _ = time.ParseDuration(boot.pool.IdleTTL) // validated at parse
+	}
+	if boot.pool.MaxLifetime != "" {
+		poolCfg.MaxLifetime, _ = time.ParseDuration(boot.pool.MaxLifetime) // validated at parse
+	}
+	pool := backend.NewPool(poolCfg, factory, log)
 	defer pool.Shutdown()
 
 	// Claim-check: park oversize responses in a JetStream Object Store for
@@ -195,6 +208,11 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 				if onSighup != nil {
 					log.Info("SIGHUP: reloading config")
 					onSighup()
+				} else {
+					// Say so rather than going silent: an operator who HUPs an
+					// inline/fetch gateway can't otherwise tell "received and
+					// ignored" from "signal never arrived".
+					log.Info("SIGHUP ignored: this config source does not reload", "source", c.sourceKind())
 				}
 				continue
 			}
@@ -255,7 +273,22 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 		}
 		return boot, nil
 	}
-	return bootParams{
+	// Fetch and inline sources: connection, prefix, queue group and scope come
+	// from flags. The file source validated these in config.validate(); do the
+	// same here, because an unsafe token would otherwise sail past boot (an
+	// empty server set never reaches EndpointSubject) and only fail once the
+	// first config arrives.
+	if c.ScopeTenant == "" && c.ScopeUser != "" {
+		return bootParams{}, fmt.Errorf("--scope-user requires --scope-tenant (got user=%q)", c.ScopeUser)
+	}
+	if c.ScopeTenant != "" && !wire.TokenSafe(c.ScopeTenant) {
+		return bootParams{}, fmt.Errorf("--scope-tenant %q is not subject-token safe (%s)", c.ScopeTenant, `A-Za-z0-9_-`)
+	}
+	if c.ScopeUser != "" && !wire.TokenSafe(c.ScopeUser) {
+		return bootParams{}, fmt.Errorf("--scope-user %q is not subject-token safe (%s)", c.ScopeUser, `A-Za-z0-9_-`)
+	}
+
+	boot := bootParams{
 		url:           c.NatsURL,
 		credsFile:     c.NatsCreds,
 		prefix:        c.SubjectPrefix,
@@ -265,25 +298,55 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 		claimCheck:    c.ClaimCheck,
 		claimMaxAge:   c.ClaimMaxAge,
 		claimMaxBytes: c.ClaimMaxBytes,
-	}, nil
+	}
+
+	if c.ConfigJSON != "" {
+		// Parse up front so a malformed NATSMCP_CONFIG_JSON fails the boot
+		// loudly instead of leaving the gateway serving nothing. Parsed
+		// forward-compatibly for the same reason the fetch source is: an
+		// inline document is machine-generated (the controller mints the pod
+		// spec), so a newer controller's additive field must not crash-loop an
+		// older gateway through a rollback.
+		cfg, err := config.ParseForwardCompatible([]byte(c.ConfigJSON))
+		if err != nil {
+			return bootParams{}, fmt.Errorf("config-json: %w", err)
+		}
+		// The inline document is PLAIN-ONLY: the token-bearing URL and the
+		// scope must not sit in a pod spec, so they arrive as flags/env.
+		// Silently ignoring a nats block would be dangerous rather than merely
+		// surprising — a document asking to be scoped to one tenant would
+		// serve every tenant — so reject it outright.
+		if cfg.NATS != (config.NATS{}) {
+			return bootParams{}, fmt.Errorf(`config-json: the "nats" block is not honored inline; use --nats-url/--nats-creds/--subject-prefix/--queue-group/--scope-tenant/--scope-user (or their NATSMCP_* env vars)`)
+		}
+		// pool and claimCheck carry no credentials, so the document does own
+		// them — a per-org deployment fronting many users has to be able to
+		// raise maxProcsPerTenant above the default.
+		boot.pool = cfg.Pool
+		if cc := cfg.ClaimCheck; cc != nil {
+			boot.claimCheck = true
+			if cc.MaxAge != "" {
+				boot.claimMaxAge, _ = time.ParseDuration(cc.MaxAge) // validated at parse
+			}
+			boot.claimMaxBytes = cc.MaxBytes
+		}
+		boot.inline = cfg
+	}
+	return boot, nil
 }
 
 // buildSource constructs the config source and, for the file source, a SIGHUP
 // reload hook. The caller has already checked exactly one source is selected.
-func (c *GatewayCmd) buildSource(nc *nats.Conn, log *slog.Logger) (configsource.Source, func(), error) {
+func (c *GatewayCmd) buildSource(boot bootParams, nc *nats.Conn, log *slog.Logger) (configsource.Source, func(), error) {
 	switch {
 	case c.Config != "":
 		f := configsource.NewFile(c.Config, c.ReloadInterval)
 		return f, f.Reload, nil
 	case c.ConfigJSON != "":
-		// Parse up front so a malformed NATSMCP_CONFIG_JSON fails the boot
-		// loudly instead of leaving the gateway serving nothing. The document
-		// is fixed for the pod's life, so it emits once and never reloads.
-		cfg, err := config.Parse([]byte(c.ConfigJSON))
-		if err != nil {
-			return nil, nil, fmt.Errorf("config-json: %w", err)
-		}
-		return configsource.Static(cfg), nil, nil
+		// Already parsed (and rejected if malformed) in bootParams. The
+		// document is fixed for the pod's life, so it emits once and never
+		// reloads.
+		return configsource.Static(boot.inline), nil, nil
 	default:
 		return &configsource.NATS{
 			Conn:           nc,
@@ -296,10 +359,14 @@ func (c *GatewayCmd) buildSource(nc *nats.Conn, log *slog.Logger) (configsource.
 }
 
 func (c *GatewayCmd) sourceKind() string {
-	if c.Config != "" {
+	switch {
+	case c.Config != "":
 		return "file:" + c.Config
+	case c.ConfigJSON != "":
+		return "inline"
+	default:
+		return "nats:" + c.ConfigSubject
 	}
-	return "nats:" + c.ConfigSubject
 }
 
 // buildBackend resolves a server definition into a Backend (stdio/http,

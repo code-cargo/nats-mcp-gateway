@@ -342,9 +342,6 @@ func TestScopedEndpointServesOnlyItsUser(t *testing.T) {
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 }
 
-// A User without a Tenant would scope by the attribution token alone,
-// spanning every tenant — Serve rejects it. (Tenant alone is the valid
-// org-deployment scope; see TestTenantScopedEndpointServesAllItsUsers.)
 // A tenant-scoped instance (org-deployment shape) binds its whole tenant's
 // slice with the user token wildcarded: every user of that tenant reaches it,
 // other tenants hit no-responders. Like a per-user pod, it must not share a

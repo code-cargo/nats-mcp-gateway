@@ -37,9 +37,10 @@ type CLI struct {
 }
 
 // GatewayCmd runs the gateway process. Its config comes from exactly one
-// source: a local file (--config) or over NATS request/reply
-// (--config-subject). Either way, only the SERVER SET reloads at runtime; the
-// NATS connection, subject prefix, and queue group are fixed at boot.
+// source: a local file (--config), over NATS request/reply (--config-subject),
+// or inline as a document (--config-json). Whichever it is, only the SERVER
+// SET reloads at runtime; the NATS connection, subject prefix, queue group and
+// scope are fixed at boot.
 type GatewayCmd struct {
 	// File source.
 	Config         string        `help:"Path to gateway config JSON (file source; SIGHUP reloads)." type:"existingfile" env:"NATSMCP_CONFIG" xor:"source"`
@@ -47,23 +48,29 @@ type GatewayCmd struct {
 
 	// Inline source: the whole config document as a string, for environments
 	// with no file mount and no config responder (the scoped stdio pod). It
-	// never reloads; connection params come from the fetch-source flags below,
-	// since the document is plain-only and the NATS URL carries the credential.
+	// never reloads; connection params and scope come from the flags below,
+	// since the document is plain-only and the NATS URL carries the
+	// credential — an inline `nats` block is REJECTED rather than ignored, so
+	// a document that asks to be scoped can never silently serve everyone.
+	// Its `pool` and `claimCheck` blocks (no credentials) are honored.
 	ConfigJSON string `help:"Inline gateway config JSON (config source; same schema as --config, never reloads)." env:"NATSMCP_CONFIG_JSON" xor:"source"`
 
-	// NATS fetch source. Connection params come from flags here, because the
-	// gateway must connect before it can fetch its config.
+	// NATS fetch source, plus the connection/wire params the fetch AND inline
+	// sources both take from flags — fetch because the gateway must connect
+	// before it can fetch its config, inline because its document is
+	// plain-only. Only the file source reads these from its `nats` block.
 	ConfigSubject       string        `help:"NATS subject to request config JSON from (fetch source)." env:"NATSMCP_CONFIG_SUBJECT" xor:"source"`
 	ConfigEventsSubject string        `help:"NATS subject that signals a config change (fetch source)." default:"mcp.v1.cfg.changed" env:"NATSMCP_CONFIG_EVENTS_SUBJECT"`
 	ConfigRefetch       time.Duration `help:"Fetch source: periodic re-fetch as the missed-event safety net." default:"60s" env:"NATSMCP_CONFIG_REFETCH"`
-	NatsURL             string        `help:"NATS URL (fetch source)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	NatsCreds           string        `help:"NATS credentials file (fetch source)." env:"NATSMCP_NATS_CREDS"`
-	SubjectPrefix       string        `help:"Wire subject prefix (fetch source)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
-	QueueGroup          string        `help:"Wire queue group (fetch source; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
+	NatsURL             string        `help:"NATS URL (fetch + inline sources)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
+	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS"`
+	SubjectPrefix       string        `help:"Wire subject prefix (fetch + inline sources)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
+	QueueGroup          string        `help:"Wire queue group (fetch + inline sources; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
 	ScopeTenant         string        `help:"Serve only this tenant's subjects (org deployment; per-user pod when combined with --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
 	ScopeUser           string        `help:"Serve only this user's subjects (per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 
-	// Claim-check (fetch source; the file source reads the claimCheck block).
+	// Claim-check (fetch source; the file and inline sources read the
+	// claimCheck block from their document).
 	ClaimCheck    bool          `help:"Park oversize responses in a JetStream Object Store for claim-accepting clients (fetch source; needs JetStream)." env:"NATSMCP_CLAIM_CHECK"`
 	ClaimMaxAge   time.Duration `help:"Claim bucket TTL — the cleanup backstop behind client deletes." default:"5m" env:"NATSMCP_CLAIM_MAX_AGE"`
 	ClaimMaxBytes int64         `help:"Per-tenant claim bucket size cap in bytes." default:"1073741824" env:"NATSMCP_CLAIM_MAX_BYTES"`

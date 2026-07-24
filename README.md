@@ -319,17 +319,27 @@ and gateway-unaware in both:
   only dials out. Whatever creates the pod injects the user's credentials into
   its environment, and the pod's lifetime bounds the credential's. Dropping
   the `user` field makes it a per-org deployment that fronts the same servers
-  for the whole tenant with one shared set of credentials. Two rules hold for
-  any scoped instance: a given server name must be served by **either** the
-  central gateway **or** scoped instances, never both (they would compete for
-  the overlapping subjects — scoped instances therefore default to their own
-  queue group, `mcpgw.{tenant}` or `mcpgw.{tenant}.{user}`), and the pod's
-  NATS identity should be fenced to its own subjects.
+  for the whole tenant with one shared set of credentials.
+
+  Three rules hold for any scoped instance:
+
+  1. A given server name must be served by **either** the central gateway
+     **or** scoped instances, never both — they would compete for the
+     overlapping subjects. Scoped instances therefore default to their own
+     queue group, `mcpgw.{tenant}` or `mcpgw.{tenant}.{user}`.
+  2. For the same reason, **do not run a tenant-scoped instance and a per-user
+     instance of the same tenant over the same server name.**
+     `{tenant}.*` and `{tenant}.{user}` overlap, and because their default
+     queue groups differ, NATS delivers that user's request to *both* — the
+     call executes twice against two backends, and only the first reply is
+     kept. Pick one granularity per server name.
+  3. The pod's NATS identity should be fenced to its own subjects.
 
   The document above is the file-source form. A pod with no file mount carries
-  it inline instead — `NATSMCP_CONFIG_JSON` holds a plain-only `{"servers":…}`
-  document, while the scope and the token-bearing NATS URL arrive as env (see
-  [Config sources](#config-sources--hot-reload)).
+  it inline instead — `NATSMCP_CONFIG_JSON` holds a plain-only
+  `{"servers":…}` document (a `nats` block there is rejected, so scope can
+  never be silently dropped), while the scope and the token-bearing NATS URL
+  arrive as env (see [Config sources](#config-sources--hot-reload)).
 
 ## Docker image
 

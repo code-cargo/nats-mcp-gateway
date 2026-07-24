@@ -272,6 +272,16 @@ func (c *Config) validate() error {
 			return fmt.Errorf("claimCheck.maxBytes must be >= 0")
 		}
 	}
+	if c.Pool.IdleTTL != "" {
+		if _, err := time.ParseDuration(c.Pool.IdleTTL); err != nil {
+			return fmt.Errorf("pool.idleTtl: %w", err)
+		}
+	}
+	if c.Pool.MaxLifetime != "" {
+		if _, err := time.ParseDuration(c.Pool.MaxLifetime); err != nil {
+			return fmt.Errorf("pool.maxLifetime: %w", err)
+		}
+	}
 	if c.NATS.Tenant == "" && c.NATS.User != "" {
 		return fmt.Errorf("nats: scoping with a user requires a tenant (got user=%q)", c.NATS.User)
 	}

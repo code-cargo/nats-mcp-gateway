@@ -298,12 +298,22 @@ func TestGatewayRejectsWrongSourceCount(t *testing.T) {
 	}
 }
 
+// inlineSource resolves boot params and the source the way runGateway does:
+// the inline document is parsed once in bootParams, and buildSource reuses it.
+func inlineSource(t *testing.T, c *GatewayCmd) (configsource.Source, func()) {
+	t.Helper()
+	boot, err := c.bootParams(testLogger())
+	require.NoError(t, err)
+	src, reload, err := c.buildSource(boot, nil, testLogger())
+	require.NoError(t, err)
+	return src, reload
+}
+
 // buildSource turns --config-json into a source that emits the parsed document
 // once and never reloads.
 func TestBuildSourceInline(t *testing.T) {
 	inline := fmt.Sprintf(`{"servers":{%s}}`, fakeServerJSON("a", fakeEnv(nil)))
-	src, reload, err := (&GatewayCmd{ConfigJSON: inline}).buildSource(nil, testLogger())
-	require.NoError(t, err)
+	src, reload := inlineSource(t, &GatewayCmd{ConfigJSON: inline})
 	require.NotNil(t, src)
 	assert.Nil(t, reload, "inline config never reloads")
 
@@ -314,16 +324,65 @@ func TestBuildSourceInline(t *testing.T) {
 	assert.Equal(t, []string{"a"}, u.Config.ServerNames())
 }
 
-// A malformed inline document fails buildSource — hence the boot — rather than
-// leaving the gateway up and serving nothing.
+// A malformed inline document fails the boot rather than leaving the gateway
+// up and serving nothing.
 func TestBuildSourceInlineInvalidJSON(t *testing.T) {
-	_, _, err := (&GatewayCmd{ConfigJSON: `{"servers":{"a":{"transport":"grpc"}}}`}).buildSource(nil, testLogger())
+	_, err := (&GatewayCmd{ConfigJSON: `{"servers":{"a":{"transport":"grpc"}}}`}).bootParams(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "config-json")
 
-	_, _, err = (&GatewayCmd{ConfigJSON: `not json`}).buildSource(nil, testLogger())
+	_, err = (&GatewayCmd{ConfigJSON: `not json`}).bootParams(testLogger())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "config-json")
+}
+
+// The inline document is plain-only: connection and SCOPE come from flags, so
+// a `nats` block is rejected outright. Ignoring it silently would let a
+// document that asked to be scoped to one tenant serve every tenant.
+func TestBuildSourceInlineRejectsNatsBlock(t *testing.T) {
+	for _, block := range []string{
+		`"nats":{"tenant":"acme","user":"u1"}`,
+		`"nats":{"url":"nats://elsewhere:4222"}`,
+		`"nats":{"queueGroup":"other"}`,
+	} {
+		inline := fmt.Sprintf(`{%s,"servers":{%s}}`, block, fakeServerJSON("a", fakeEnv(nil)))
+		_, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(testLogger())
+		require.Error(t, err, block)
+		assert.Contains(t, err.Error(), `"nats" block is not honored inline`)
+	}
+}
+
+// pool and claimCheck carry no credentials, so the inline document does own
+// them — a per-org deployment has to be able to raise maxProcsPerTenant.
+func TestBuildSourceInlineHonorsPoolAndClaimCheck(t *testing.T) {
+	inline := fmt.Sprintf(
+		`{"pool":{"maxProcsPerTenant":64,"idleTtl":"30m","maxLifetime":"24h"},"claimCheck":{"maxAge":"9m","maxBytes":5},"servers":{%s}}`,
+		fakeServerJSON("a", fakeEnv(nil)))
+	boot, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(testLogger())
+	require.NoError(t, err)
+	assert.Equal(t, 64, boot.pool.MaxProcsPerTenant)
+	assert.Equal(t, "30m", boot.pool.IdleTTL)
+	assert.Equal(t, "24h", boot.pool.MaxLifetime)
+	assert.True(t, boot.claimCheck)
+	assert.Equal(t, 9*time.Minute, boot.claimMaxAge)
+	assert.Equal(t, int64(5), boot.claimMaxBytes)
+}
+
+// Scope flags are token-validated at boot. Without this the process connects,
+// binds a queue group built from the bad token, and only dies when the first
+// config arrives (an empty server set never reaches EndpointSubject).
+func TestBootParamsRejectsUnsafeScopeFlags(t *testing.T) {
+	_, err := (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "bad tenant"}).bootParams(testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not subject-token safe")
+
+	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "acme", ScopeUser: "bad user"}).bootParams(testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not subject-token safe")
+
+	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeUser: "u1"}).bootParams(testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires --scope-tenant")
 }
 
 // End to end: an inline --config-json document, a tenant-scoped wire, and a
@@ -334,8 +393,7 @@ func TestGatewayInlineConfigServesTenantScoped(t *testing.T) {
 	a := assembleScoped(t, nc, url, "demo", "") // tenant-only scope
 
 	inline := fmt.Sprintf(`{"servers":{%s}}`, fakeServerJSON("a", fakeEnv(nil)))
-	src, _, err := (&GatewayCmd{ConfigJSON: inline}).buildSource(nil, testLogger())
-	require.NoError(t, err)
+	src, _ := inlineSource(t, &GatewayCmd{ConfigJSON: inline})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -76,8 +76,14 @@ func Poll(interval time.Duration, fetch FetchFunc) Source {
 // Static returns a Source that emits cfg once and then holds it: the config
 // never changes, and — like every other source — the channel stays open until
 // ctx is cancelled, so a long-running server keeps serving cfg for its whole
-// life (this is the inline-config source). A caller that only wants the single
-// revision (a test, a one-shot apply) passes a bounded or cancelled context.
+// life (this is the inline-config source).
+//
+// The context is what ends it: Watch parks a goroutine until ctx is done, so a
+// caller that wants the single revision and nothing more passes a BOUNDED
+// context (a timeout/explicit cancel after the apply), never
+// context.Background(). Do not pass an ALREADY-cancelled context to Run
+// expecting one apply — Run selects between ctx.Done() and the buffered
+// update, both ready, so the apply would happen only about half the time.
 func Static(cfg *config.Config) Source {
 	return SourceFunc(func(ctx context.Context) <-chan Update {
 		out := make(chan Update, 1)
