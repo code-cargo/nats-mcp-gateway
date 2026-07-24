@@ -248,7 +248,13 @@ refused), and failures are memoized with a short backoff (1s doubling to
 30s), so a resolver outage degrades into fast, legible errors instead of
 hammering the source at request rate. Mind `pool.maxProcsPerTenant`
 (default 16): per-user stdio servers count each `(user, server)` process
-against it, so size it to roughly users × stdio servers per tenant.
+against it, so size it to roughly users × stdio servers per tenant. A
+tenant-scoped deployment fronts a whole org through one pool, so it is the
+shape most likely to need raising. Pool limits are boot-fixed: the file and
+inline sources read them from the document's `pool` block, and the fetch
+source — whose config arrives after the pool is built — takes them from
+`--pool-max-procs-per-tenant`, `--pool-max-concurrent`, `--pool-idle-ttl`
+and `--pool-max-lifetime` (or their `NATSMCP_POOL_*` env vars).
 
 Adding a credential source has the same three tiers as config reloading
 (`pkg/backend/cred`), cheapest first:

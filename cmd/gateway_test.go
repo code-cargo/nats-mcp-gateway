@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -299,14 +300,87 @@ func TestGatewayRejectsWrongSourceCount(t *testing.T) {
 	}
 }
 
+// selectSource is the single place that maps flags to a source, so everything
+// downstream (boot params, the source itself, the boot log, the SIGHUP reply)
+// agrees by construction. This pins the mapping and the reload semantics that
+// hang off it — the boot log previously reported an inline gateway as a NATS
+// fetch with an empty subject, because the kind was re-derived per call site.
+func TestSelectSourceMapsFlagsToKind(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		cmd        *GatewayCmd
+		want       sourceKind
+		wantDesc   string
+		wantSighup bool
+	}{
+		{"file", &GatewayCmd{Config: "/etc/gw.json"}, sourceFile, "file:/etc/gw.json", true},
+		{"inline", &GatewayCmd{ConfigJSON: `{"servers":{}}`}, sourceInline, "inline", false},
+		{"fetch", &GatewayCmd{ConfigSubject: "mcp.v1.cfg.gateway"}, sourceFetch, "nats:mcp.v1.cfg.gateway", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kind, err := tc.cmd.selectSource()
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, kind)
+			assert.Equal(t, tc.wantDesc, kind.describe(tc.cmd), "boot log must name the real source")
+			assert.Equal(t, tc.wantSighup, kind.reloadsOnSighup())
+		})
+	}
+}
+
+// Only the file source re-reads on SIGHUP. The fetch source reloads on its own
+// (change events + --config-refetch), so it must never be described as
+// non-reloading — an operator HUPing it to force a refresh would otherwise be
+// told its config is frozen, which is the opposite of true.
+func TestOnlyFileSourceReloadsOnSighup(t *testing.T) {
+	assert.True(t, sourceFile.reloadsOnSighup())
+	assert.False(t, sourceFetch.reloadsOnSighup())
+	assert.False(t, sourceInline.reloadsOnSighup())
+}
+
+// Pool limits are boot-fixed, so the fetch source can only get them from flags
+// — a fetched config arrives after the pool is built. An inline document
+// overrides them, and omitting its pool block falls back to the flags.
+func TestPoolLimitsFromFlagsAndInlineDocument(t *testing.T) {
+	flags := &GatewayCmd{
+		ConfigSubject:         "cfg",
+		PoolMaxConcurrent:     7,
+		PoolMaxProcsPerTenant: 64,
+		PoolIdleTTL:           30 * time.Minute,
+		PoolMaxLifetime:       24 * time.Hour,
+	}
+	boot, err := flags.bootParams(sourceFetch)
+	require.NoError(t, err)
+	assert.Equal(t, 7, boot.pool.MaxConcurrent)
+	assert.Equal(t, 64, boot.pool.MaxProcsPerTenant)
+	assert.Equal(t, 30*time.Minute, boot.pool.IdleTTL)
+	assert.Equal(t, 24*time.Hour, boot.pool.MaxLifetime)
+
+	// An inline pool block wins over the flags.
+	doc := fmt.Sprintf(`{"pool":{"maxProcsPerTenant":9,"idleTtl":"1m"},"servers":{%s}}`,
+		fakeServerJSON("a", fakeEnv(nil)))
+	boot, err = (&GatewayCmd{ConfigJSON: doc, PoolMaxProcsPerTenant: 64}).bootParams(sourceInline)
+	require.NoError(t, err)
+	assert.Equal(t, 9, boot.pool.MaxProcsPerTenant)
+	assert.Equal(t, time.Minute, boot.pool.IdleTTL)
+
+	// No inline pool block: the flags still apply.
+	doc = fmt.Sprintf(`{"servers":{%s}}`, fakeServerJSON("a", fakeEnv(nil)))
+	boot, err = (&GatewayCmd{ConfigJSON: doc, PoolMaxProcsPerTenant: 64}).bootParams(sourceInline)
+	require.NoError(t, err)
+	assert.Equal(t, 64, boot.pool.MaxProcsPerTenant)
+}
+
 // inlineSource resolves boot params and the source the way runGateway does:
-// the inline document is parsed once in bootParams, and buildSource reuses it.
+// the source is selected once, the inline document is parsed in bootParams,
+// and buildSource reuses that parse.
 func inlineSource(t *testing.T, c *GatewayCmd) (configsource.Source, func()) {
 	t.Helper()
-	boot, err := c.bootParams(testLogger())
+	kind, err := c.selectSource()
 	require.NoError(t, err)
-	src, reload, err := c.buildSource(boot, nil, testLogger())
+	require.Equal(t, sourceInline, kind)
+	boot, err := c.bootParams(kind)
 	require.NoError(t, err)
+	src, reload := c.buildSource(kind, boot, nil, testLogger())
 	return src, reload
 }
 
@@ -328,11 +402,11 @@ func TestBuildSourceInline(t *testing.T) {
 // A malformed inline document fails the boot rather than leaving the gateway
 // up and serving nothing.
 func TestBuildSourceInlineInvalidJSON(t *testing.T) {
-	_, err := (&GatewayCmd{ConfigJSON: `{"servers":{"a":{"transport":"grpc"}}}`}).bootParams(testLogger())
+	_, err := (&GatewayCmd{ConfigJSON: `{"servers":{"a":{"transport":"grpc"}}}`}).bootParams(sourceInline)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "config-json")
 
-	_, err = (&GatewayCmd{ConfigJSON: `not json`}).bootParams(testLogger())
+	_, err = (&GatewayCmd{ConfigJSON: `not json`}).bootParams(sourceInline)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "config-json")
 }
@@ -347,7 +421,7 @@ func TestBuildSourceInlineRejectsNatsBlock(t *testing.T) {
 		`"nats":{"queueGroup":"other"}`,
 	} {
 		inline := fmt.Sprintf(`{%s,"servers":{%s}}`, block, fakeServerJSON("a", fakeEnv(nil)))
-		_, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(testLogger())
+		_, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(sourceInline)
 		require.Error(t, err, block)
 		assert.Contains(t, err.Error(), `"nats" block is not honored inline`)
 	}
@@ -360,11 +434,12 @@ func TestBuildSourceInlineHonorsPoolAndClaimCheck(t *testing.T) {
 		`{"pool":{"maxProcsPerTenant":64,"idleTtl":"30m","maxLifetime":"24h"},"claimCheck":{"maxAge":"9m","maxBytes":5},"servers":{%s}}`,
 		fakeServerJSON("a", fakeEnv(nil)),
 	)
-	boot, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(testLogger())
+	boot, err := (&GatewayCmd{ConfigJSON: inline}).bootParams(sourceInline)
 	require.NoError(t, err)
 	assert.Equal(t, 64, boot.pool.MaxProcsPerTenant)
-	assert.Equal(t, "30m", boot.pool.IdleTTL)
-	assert.Equal(t, "24h", boot.pool.MaxLifetime)
+	// Parsed on the way in — bootParams hands NewPool the pool's own shape.
+	assert.Equal(t, 30*time.Minute, boot.pool.IdleTTL)
+	assert.Equal(t, 24*time.Hour, boot.pool.MaxLifetime)
 	assert.True(t, boot.claimCheck)
 	assert.Equal(t, 9*time.Minute, boot.claimMaxAge)
 	assert.Equal(t, int64(5), boot.claimMaxBytes)
@@ -374,15 +449,15 @@ func TestBuildSourceInlineHonorsPoolAndClaimCheck(t *testing.T) {
 // binds a queue group built from the bad token, and only dies when the first
 // config arrives (an empty server set never reaches EndpointSubject).
 func TestBootParamsRejectsUnsafeScopeFlags(t *testing.T) {
-	_, err := (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "bad tenant"}).bootParams(testLogger())
+	_, err := (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "bad tenant"}).bootParams(sourceFetch)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not subject-token safe")
 
-	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "acme", ScopeUser: "bad user"}).bootParams(testLogger())
+	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeTenant: "acme", ScopeUser: "bad user"}).bootParams(sourceFetch)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not subject-token safe")
 
-	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeUser: "u1"}).bootParams(testLogger())
+	_, err = (&GatewayCmd{ConfigSubject: "cfg", ScopeUser: "u1"}).bootParams(sourceFetch)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "requires --scope-tenant")
 }
@@ -400,17 +475,17 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 		"_INBOX..acme",  // doubled dot
 		"_INBOX.acme/1", // not token-safe
 	} {
-		_, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: bad}).bootParams(testLogger())
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: bad}).bootParams(sourceFetch)
 		require.Error(t, err, bad)
 		assert.Contains(t, err.Error(), "--inbox-prefix", bad)
 	}
 
-	boot, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: "_INBOX_acme.u_9f3a"}).bootParams(testLogger())
+	boot, err := (&GatewayCmd{ConfigSubject: "cfg", InboxPrefix: "_INBOX_acme.u_9f3a"}).bootParams(sourceFetch)
 	require.NoError(t, err)
 	assert.Equal(t, "_INBOX_acme.u_9f3a", boot.inboxPrefix)
 
 	// Unset stays unset — the nats.go default inbox, exactly as before.
-	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(testLogger())
+	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
 	require.NoError(t, err)
 	assert.Empty(t, boot.inboxPrefix)
 }
@@ -457,6 +532,104 @@ func TestInboxPrefixCoversConfigAndCredRequests(t *testing.T) {
 		assert.True(t, strings.HasPrefix(reply, prefix+"."),
 			"reply inbox %q must live under the custom prefix %q", reply, prefix)
 	}
+}
+
+// The POINT of the inbox prefix, against a real NATS identity that is actually
+// restricted: a gateway granted subscribe on ONLY its own inbox works, and the
+// same identity without the prefix is denied.
+//
+// This is what the feature exists for. Without the prefix, an identity needs
+// subscribe on `_INBOX.>` — the account's entire reply namespace — so a pod
+// running third-party MCP server code beside the gateway could lift the
+// connection's credential and read every other tenant's credential replies.
+// Asserting that reply subjects merely *start with* the prefix does not prove
+// a narrowed grant is survivable; only the server refusing the wider form does.
+func TestInboxPrefixWorksUnderARestrictedIdentity(t *testing.T) {
+	const prefix = "_INBOX_mcpgw.acme"
+
+	// The gateway may publish its two request subjects and subscribe to
+	// NOTHING but its own prefixed inbox. No `_INBOX.>`. NoAuthUser binds the
+	// unauthenticated connection natstest opens to the unrestricted responder,
+	// so that connection serves the replies.
+	rConn, url := natstest.Run(t, &server.Options{
+		NoAuthUser: "responder",
+		Users: []*server.User{
+			{
+				Username: "gateway", Password: "gw",
+				Permissions: &server.Permissions{
+					Publish:   &server.SubjectPermission{Allow: []string{"mcp.cfg.request", "mcp.v1.cred.>"}},
+					Subscribe: &server.SubjectPermission{Allow: []string{prefix + ".>"}},
+				},
+			},
+			{Username: "responder", Password: "r"}, // unrestricted; serves the replies
+		},
+	})
+
+	for subject, body := range map[string]string{
+		"mcp.cfg.request": `{"servers":{}}`,
+		"mcp.v1.cred.>":   `{"env":{"TOKEN":"t"}}`,
+	} {
+		sub, err := rConn.Subscribe(subject, func(m *nats.Msg) { _ = m.Respond([]byte(body)) })
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = sub.Unsubscribe() })
+	}
+	require.NoError(t, rConn.Flush())
+
+	// connect returns a gateway connection plus a channel of async errors, so
+	// the denied case is observed directly rather than inferred from a timeout.
+	connect := func(inboxPrefix string) (*nats.Conn, chan error) {
+		errs := make(chan error, 8)
+		opts := []nats.Option{
+			nats.UserInfo("gateway", "gw"),
+			nats.ErrorHandler(func(_ *nats.Conn, _ *nats.Subscription, err error) {
+				select {
+				case errs <- err:
+				default:
+				}
+			}),
+		}
+		if inboxPrefix != "" {
+			opts = append(opts, nats.CustomInboxPrefix(inboxPrefix))
+		}
+		nc, err := nats.Connect(url, opts...)
+		require.NoError(t, err)
+		t.Cleanup(nc.Close)
+		return nc, errs
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	t.Run("with the prefix the narrow grant is enough", func(t *testing.T) {
+		nc, errs := connect(prefix)
+
+		u := <-(&configsource.NATS{Conn: nc, RequestSubject: "mcp.cfg.request", Logger: testLogger()}).Watch(ctx)
+		require.NoError(t, u.Err, "config fetch must succeed under the narrow grant")
+
+		creds, err := buildResolver(&config.Auth{Mode: config.AuthNATS}, nc, "").Resolve(ctx, "acme", "u1", "gh")
+		require.NoError(t, err, "cred fetch must succeed under the narrow grant")
+		assert.Equal(t, "t", creds.Env["TOKEN"])
+
+		select {
+		case err := <-errs:
+			t.Fatalf("no permission error expected, got %v", err)
+		default:
+		}
+	})
+
+	t.Run("without the prefix the same identity is denied", func(t *testing.T) {
+		nc, errs := connect("") // default _INBOX.<nuid>, which the grant excludes
+
+		_, err := buildResolver(&config.Auth{Mode: config.AuthNATS}, nc, "").Resolve(ctx, "acme", "u1", "gh")
+		require.Error(t, err, "the default inbox is outside the grant, so the reply can never arrive")
+
+		select {
+		case err := <-errs:
+			assert.ErrorIs(t, err, nats.ErrPermissionViolation)
+		case <-time.After(2 * time.Second):
+			t.Fatal("expected a subscribe permission violation on the default inbox")
+		}
+	})
 }
 
 // The `nats` cred mode's default subject derives from the CONFIGURED wire

@@ -70,6 +70,15 @@ type GatewayCmd struct {
 	ScopeTenant         string        `help:"Serve only this tenant's subjects (org deployment; per-user pod when combined with --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
 	ScopeUser           string        `help:"Serve only this user's subjects (per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 
+	// Backend pool limits. Boot-fixed, so the fetch source can only get them
+	// from flags — its config arrives after the pool is built. The file source
+	// and an inline document supply them via their `pool` block instead; an
+	// inline document that omits the block falls back to these.
+	PoolMaxConcurrent     int           `help:"Max concurrent in-flight calls per backend (0 = pool default)." env:"NATSMCP_POOL_MAX_CONCURRENT"`
+	PoolMaxProcsPerTenant int           `help:"Max live backends per tenant (0 = pool default, 16). Size to roughly users × stdio servers for a tenant-scoped deployment." env:"NATSMCP_POOL_MAX_PROCS_PER_TENANT"`
+	PoolIdleTTL           time.Duration `help:"Reap backends idle this long (0 = pool default, 5m)." env:"NATSMCP_POOL_IDLE_TTL"`
+	PoolMaxLifetime       time.Duration `help:"Recycle backends older than this regardless of activity (0 = pool default, 1h)." env:"NATSMCP_POOL_MAX_LIFETIME"`
+
 	// Claim-check (fetch source; the file and inline sources read the
 	// claimCheck block from their document).
 	ClaimCheck    bool          `help:"Park oversize responses in a JetStream Object Store for claim-accepting clients (fetch source; needs JetStream)." env:"NATSMCP_CLAIM_CHECK"`
