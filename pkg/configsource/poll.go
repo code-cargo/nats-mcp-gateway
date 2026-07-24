@@ -73,13 +73,19 @@ func Poll(interval time.Duration, fetch FetchFunc) Source {
 	})
 }
 
-// Static returns a Source that emits cfg once and never changes — useful for
-// embedding a fixed config or in tests.
+// Static returns a Source that emits cfg once and then holds it: the config
+// never changes, and — like every other source — the channel stays open until
+// ctx is cancelled, so a long-running server keeps serving cfg for its whole
+// life (this is the inline-config source). A caller that only wants the single
+// revision (a test, a one-shot apply) passes a bounded or cancelled context.
 func Static(cfg *config.Config) Source {
 	return SourceFunc(func(ctx context.Context) <-chan Update {
 		out := make(chan Update, 1)
 		out <- Update{Config: cfg}
-		close(out)
+		go func() {
+			<-ctx.Done()
+			close(out)
+		}()
 		return out
 	})
 }

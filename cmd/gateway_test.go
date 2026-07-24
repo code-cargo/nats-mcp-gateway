@@ -67,6 +67,13 @@ type assembled struct {
 
 func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 	t.Helper()
+	return assembleScoped(t, nc, url, "", "")
+}
+
+// assembleScoped is assemble with the wire bound to a (tenant, user) scope —
+// "" for either token leaves it unscoped/wildcarded, matching wire.Serve.
+func assembleScoped(t *testing.T, nc *nats.Conn, url, tenant, user string) *assembled {
+	t.Helper()
 	// The wire client mutates/reads the connection's async error handler
 	// (permission-violation fast-fail), which micro's per-service Add/Stop
 	// also touches. In production the gateway and the shim are separate
@@ -104,7 +111,7 @@ func assemble(t *testing.T, nc *nats.Conn, url string) *assembled {
 		}
 		return registry.lookup(server, s)
 	}
-	ws, err := wire.Serve(nc, wire.ServerConfig{KeepAlive: 50 * time.Millisecond}, px.Handler())
+	ws, err := wire.Serve(nc, wire.ServerConfig{KeepAlive: 50 * time.Millisecond, Tenant: tenant, User: user}, px.Handler())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -272,6 +279,94 @@ func TestGatewayFetchModeBootRetry(t *testing.T) {
 	mc.serve(t)
 
 	waitServing(t, a, "a")
+}
+
+// Zero or many config sources is a boot error, caught before any connection is
+// attempted (kong's xor guards the parsed CLI; this guards every entry point).
+func TestGatewayRejectsWrongSourceCount(t *testing.T) {
+	g := &Globals{LogLevel: "error", LogFormat: "text"}
+	for _, c := range []*GatewayCmd{
+		{},                                     // zero
+		{Config: "/x", ConfigSubject: "s"},     // two
+		{Config: "/x", ConfigJSON: "{}"},       // two
+		{ConfigSubject: "s", ConfigJSON: "{}"}, // two
+		{Config: "/x", ConfigSubject: "s", ConfigJSON: "{}"}, // three
+	} {
+		err := runGateway(c, g, "0.0.0")
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "exactly one of")
+	}
+}
+
+// buildSource turns --config-json into a source that emits the parsed document
+// once and never reloads.
+func TestBuildSourceInline(t *testing.T) {
+	inline := fmt.Sprintf(`{"servers":{%s}}`, fakeServerJSON("a", fakeEnv(nil)))
+	src, reload, err := (&GatewayCmd{ConfigJSON: inline}).buildSource(nil, testLogger())
+	require.NoError(t, err)
+	require.NotNil(t, src)
+	assert.Nil(t, reload, "inline config never reloads")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := <-src.Watch(ctx)
+	require.NoError(t, u.Err)
+	assert.Equal(t, []string{"a"}, u.Config.ServerNames())
+}
+
+// A malformed inline document fails buildSource — hence the boot — rather than
+// leaving the gateway up and serving nothing.
+func TestBuildSourceInlineInvalidJSON(t *testing.T) {
+	_, _, err := (&GatewayCmd{ConfigJSON: `{"servers":{"a":{"transport":"grpc"}}}`}).buildSource(nil, testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config-json")
+
+	_, _, err = (&GatewayCmd{ConfigJSON: `not json`}).buildSource(nil, testLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config-json")
+}
+
+// End to end: an inline --config-json document, a tenant-scoped wire, and a
+// real stdio backend — every user of the scoped tenant is served, another
+// tenant is not. This is the scoped stdio-pod shape.
+func TestGatewayInlineConfigServesTenantScoped(t *testing.T) {
+	nc, url := fetchNATS(t)
+	a := assembleScoped(t, nc, url, "demo", "") // tenant-only scope
+
+	inline := fmt.Sprintf(`{"servers":{%s}}`, fakeServerJSON("a", fakeEnv(nil)))
+	src, _, err := (&GatewayCmd{ConfigJSON: inline}).buildSource(nil, testLogger())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		_ = configsource.Run(ctx, testLogger(), src, func(cfg *config.Config) error {
+			_, err := a.rec.Apply(cfg)
+			return err
+		})
+	}()
+
+	// The inline server comes up and serves any user of the scoped tenant.
+	waitServing(t, a, "a") // user "_"
+	for _, user := range []string{"u1", "u2"} {
+		assert.Equal(t, wire.FrameEnd, a.callAs(t, user, "a", "echo", nil).Kind,
+			"user %q of the scoped tenant must be served", user)
+	}
+
+	// Another tenant's request never reaches the scoped pod.
+	other, err := wire.NewClient(a.clientNC, wire.ClientConfig{Tenant: "other", User: "u1", Inactivity: 3 * time.Second})
+	require.NoError(t, err)
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": "1", "method": "tools/call", "params": map[string]any{}})
+	s, err := other.Do(context.Background(), &wire.Request{
+		Server: "a", Method: "tools/call", ProtocolVersion: mcpspec.ProtocolVersion, Body: body,
+	})
+	require.NoError(t, err)
+	var last wire.Frame
+	for f := range s.C {
+		last = f
+	}
+	require.NotNil(t, last.Err, "another tenant must not reach the scoped pod")
+	assert.Equal(t, wire.ErrCodeNoGateway, last.Err.Code)
 }
 
 func waitServing(t *testing.T, a *assembled, serverName string) {

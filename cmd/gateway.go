@@ -62,13 +62,20 @@ type bootParams struct {
 func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	log := NewLogger(g)
 
-	if (c.Config == "") == (c.ConfigSubject == "") {
-		return fmt.Errorf("exactly one of --config or --config-subject is required")
+	sources := 0
+	for _, s := range []string{c.Config, c.ConfigSubject, c.ConfigJSON} {
+		if s != "" {
+			sources++
+		}
+	}
+	if sources != 1 {
+		return fmt.Errorf("exactly one of --config, --config-subject, or --config-json is required")
 	}
 
-	// Resolve boot params. File mode reads them from the file (one time);
-	// fetch mode takes them from flags, since we must connect before we can
-	// fetch the config.
+	// Resolve boot params. File mode reads them from the file (one time); the
+	// fetch and inline sources take them from flags — fetch because we must
+	// connect before we can fetch, inline because its document is plain-only
+	// (the NATS URL, not the document, carries the credential).
 	boot, err := c.bootParams(log)
 	if err != nil {
 		return err
@@ -88,6 +95,14 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		log.Warn("NATS max_payload is small for MCP traffic; large tool results will fail",
 			"max_payload", mp, "recommended", minRecommendedPayload,
 			"fix", "set max_payload: 8MB in nats-server config")
+	}
+
+	// Build the config source before the serving machinery, so a malformed
+	// inline document fails the boot here rather than after the pool and wire
+	// are up. The NATS source needs the connection; file/inline don't.
+	source, onSighup, err := c.buildSource(nc, log)
+	if err != nil {
+		return err
 	}
 
 	// The reconciler holds the live config; the pool factory resolves each
@@ -167,9 +182,6 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		return err
 	}
 	rec = reconcile.New(ws, pool, log)
-
-	// Build the config source.
-	source, onSighup := c.buildSource(nc, log)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -257,19 +269,30 @@ func (c *GatewayCmd) bootParams(_ *slog.Logger) (bootParams, error) {
 }
 
 // buildSource constructs the config source and, for the file source, a SIGHUP
-// reload hook.
-func (c *GatewayCmd) buildSource(nc *nats.Conn, log *slog.Logger) (configsource.Source, func()) {
-	if c.Config != "" {
+// reload hook. The caller has already checked exactly one source is selected.
+func (c *GatewayCmd) buildSource(nc *nats.Conn, log *slog.Logger) (configsource.Source, func(), error) {
+	switch {
+	case c.Config != "":
 		f := configsource.NewFile(c.Config, c.ReloadInterval)
-		return f, f.Reload
+		return f, f.Reload, nil
+	case c.ConfigJSON != "":
+		// Parse up front so a malformed NATSMCP_CONFIG_JSON fails the boot
+		// loudly instead of leaving the gateway serving nothing. The document
+		// is fixed for the pod's life, so it emits once and never reloads.
+		cfg, err := config.Parse([]byte(c.ConfigJSON))
+		if err != nil {
+			return nil, nil, fmt.Errorf("config-json: %w", err)
+		}
+		return configsource.Static(cfg), nil, nil
+	default:
+		return &configsource.NATS{
+			Conn:           nc,
+			RequestSubject: c.ConfigSubject,
+			EventSubject:   c.ConfigEventsSubject,
+			Refetch:        c.ConfigRefetch,
+			Logger:         log,
+		}, nil, nil
 	}
-	return &configsource.NATS{
-		Conn:           nc,
-		RequestSubject: c.ConfigSubject,
-		EventSubject:   c.ConfigEventsSubject,
-		Refetch:        c.ConfigRefetch,
-		Logger:         log,
-	}, nil
 }
 
 func (c *GatewayCmd) sourceKind() string {

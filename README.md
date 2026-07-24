@@ -289,10 +289,21 @@ and gateway-unaware in both:
   the gateway, HTTP endpoints called by it. Right for single-binary
   deployments and for hosted HTTP servers, which take per-user credentials as
   request headers.
-- **Remote scoped instances (per-user pods):** stdio-only servers can't be
-  networked, so to run one *outside* the gateway (its own pod, with its own
-  resources), run this same binary in front of it as the container
-  entrypoint, **scoped** to one caller:
+- **Remote scoped instances:** stdio-only servers can't be networked, so to
+  run one *outside* the central gateway (its own pod, with its own resources),
+  run this same binary in front of it as the container entrypoint, **scoped**
+  to a slice of the subject space. The `nats.tenant`/`nats.user` config fields
+  (file source) or `--scope-tenant`/`--scope-user` / their env (fetch and
+  inline sources) select one of three scopes:
+
+  | scope | binds | serves | use |
+  |-------|-------|--------|-----|
+  | *unset* | `mcp.v1.req.*.*.{server}.>` | all callers | the central fleet |
+  | tenant only | `mcp.v1.req.{tenant}.*.{server}.>` | all of one tenant's users | a per-org deployment |
+  | tenant + user | `mcp.v1.req.{tenant}.{user}.{server}.>` | one caller | a per-user pod |
+
+  Setting `user` without `tenant` is invalid — a user token spans every
+  tenant. The example below is a per-user pod:
 
   ```json
   { "nats": { "url": "nats://nats:4222", "tenant": "acme", "user": "u_9f3a" },
@@ -303,16 +314,22 @@ and gateway-unaware in both:
                                     "AWS_SESSION_TOKEN": "${AWS_SESSION_TOKEN}" } } } }
   ```
 
-  A scoped instance binds `mcp.v1.req.acme.u_9f3a.{server}.>` instead of the
-  all-callers wildcard (flags: `--scope-tenant`/`--scope-user` in fetch
-  mode), so NATS routes exactly that user's traffic to the pod — no inbound
-  Service, DNS, or ingress; the pod only dials out. Whatever creates the pod
-  injects the user's credentials into its environment, and the pod's lifetime
-  bounds the credential's. Two rules: a server name must be served by
-  **either** the central gateway **or** scoped instances, never both (they
-  would compete for the same subjects — scoped instances therefore default to
-  their own queue group), and the scoped pod's NATS identity should be fenced
-  to its own `{tenant}.{user}` subjects.
+  It binds `mcp.v1.req.acme.u_9f3a.{server}.>`, so NATS routes exactly that
+  user's traffic to the pod — no inbound Service, DNS, or ingress; the pod
+  only dials out. Whatever creates the pod injects the user's credentials into
+  its environment, and the pod's lifetime bounds the credential's. Dropping
+  the `user` field makes it a per-org deployment that fronts the same servers
+  for the whole tenant with one shared set of credentials. Two rules hold for
+  any scoped instance: a given server name must be served by **either** the
+  central gateway **or** scoped instances, never both (they would compete for
+  the overlapping subjects — scoped instances therefore default to their own
+  queue group, `mcpgw.{tenant}` or `mcpgw.{tenant}.{user}`), and the pod's
+  NATS identity should be fenced to its own subjects.
+
+  The document above is the file-source form. A pod with no file mount carries
+  it inline instead — `NATSMCP_CONFIG_JSON` holds a plain-only `{"servers":…}`
+  document, while the scope and the token-bearing NATS URL arrive as env (see
+  [Config sources](#config-sources--hot-reload)).
 
 ## Docker image
 
@@ -354,8 +371,9 @@ new definition. In-flight calls on a removed/changed server fail retryably
 Config comes from a **source**, selected by flag:
 
 ```
-natsmcp gateway --config /etc/natsmcp.json          # file; SIGHUP or poll reloads
-natsmcp gateway --config-subject mcp.v1.cfg.request # fetch over NATS request/reply
+natsmcp gateway --config /etc/natsmcp.json           # file; SIGHUP or poll reloads
+natsmcp gateway --config-subject mcp.v1.cfg.request  # fetch over NATS request/reply
+NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the process life
 ```
 
 - **File** (`--config`, `--reload-interval` default 10s): re-reads on change and
@@ -369,6 +387,16 @@ natsmcp gateway --config-subject mcp.v1.cfg.request # fetch over NATS request/re
   contract:** respond to the request subject with the same config JSON the file
   source parses, and publish any message to the events subject on change; NATS
   permissions fence both subjects to the controller.
+- **Inline** (`--config-json` / `NATSMCP_CONFIG_JSON`): the whole config
+  document as a string, applied once and never reloaded — for pods with no file
+  mount and no config responder (the scoped stdio deployment injects its one
+  server this way). Connection and scope come from the fetch-source flags/env,
+  not the document (which is plain-only, so the NATS URL — not the config —
+  carries the credential); a config change is a new pod, not a hot reload.
+
+Note: only the **file** source reads connection settings (URL, prefix, queue
+group, scope) from the document's `nats` block. The fetch and inline sources
+take those from flags/env — the document supplies only the server set.
 
 ### Reloading from something else
 

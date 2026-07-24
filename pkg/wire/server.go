@@ -76,12 +76,13 @@ type ServerConfig struct {
 	Prefix string
 	// QueueGroup for load-balancing gateway replicas (default "mcpgw").
 	QueueGroup string
-	// Tenant/User, when set (always together), scope every endpoint to one
-	// caller: the instance binds {prefix}.req.{tenant}.{user}.{server}.>
-	// instead of the all-callers wildcard form. This is how a per-user pod
-	// claims exactly its slice of the subject space. A scoped instance must
-	// not share a queue group with an unscoped gateway serving the same
-	// server names, or the two would compete for the scoped traffic.
+	// Tenant/User scope every endpoint to a slice of the subject space:
+	// Tenant alone binds {prefix}.req.{tenant}.*.{server}.> (an org
+	// deployment serving all of one tenant's users); Tenant+User binds
+	// {prefix}.req.{tenant}.{user}.{server}.> (a per-user pod). Both empty is
+	// the all-callers central form; User without Tenant is invalid. A scoped
+	// instance must not share a queue group with an unscoped gateway serving
+	// the same server names, or the two would compete for the scoped traffic.
 	Tenant string
 	User   string
 	// Servers is the list of MCP server names to register endpoints for.
@@ -129,12 +130,16 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		// A scoped instance defaults to its OWN queue group: NATS dedupes
 		// queue subscribers by group name across different subject patterns,
 		// so sharing "mcpgw" with an unscoped fleet serving the same server
-		// names would make the two compete for the scoped user's traffic.
-		// This default lives here — not in the CLI — so every config source
-		// gets it.
-		if cfg.Tenant != "" {
+		// names would make the two compete for the scoped traffic. The group
+		// mirrors the scope — mcpgw.{tenant} for an org deployment,
+		// mcpgw.{tenant}.{user} for a per-user pod. This default lives here —
+		// not in the CLI — so every config source gets it.
+		switch {
+		case cfg.Tenant != "" && cfg.User != "":
 			cfg.QueueGroup = "mcpgw." + cfg.Tenant + "." + cfg.User
-		} else {
+		case cfg.Tenant != "":
+			cfg.QueueGroup = "mcpgw." + cfg.Tenant
+		default:
 			cfg.QueueGroup = "mcpgw"
 		}
 	}
@@ -152,8 +157,8 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		prefix = DefaultPrefix
 	}
 
-	if (cfg.Tenant == "") != (cfg.User == "") {
-		return nil, fmt.Errorf("wire: endpoint scoping requires both Tenant and User (got tenant=%q, user=%q)", cfg.Tenant, cfg.User)
+	if cfg.Tenant == "" && cfg.User != "" {
+		return nil, fmt.Errorf("wire: endpoint scoping with a User requires a Tenant (got tenant=%q, user=%q)", cfg.Tenant, cfg.User)
 	}
 
 	base, cancel := context.WithCancelCause(context.Background())

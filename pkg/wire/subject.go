@@ -155,11 +155,18 @@ func ParseSubject(subject, prefix string) (*ParsedSubject, error) {
 	}, nil
 }
 
-// EndpointSubject is the micro endpoint subject fronting one server. Empty
-// tenant and user give the central-gateway form serving all callers:
-// {prefix}.req.*.*.{server}.> — set both (never just one) to scope the
-// endpoint to a single caller's slice of the subject space, the shape a
-// per-user pod binds so NATS routes only that user's traffic to it.
+// EndpointSubject is the micro endpoint subject fronting one server. The
+// (tenant, user) pair selects one of three scopes, an unset token widening to
+// the "*" wildcard:
+//
+//	both unset       {prefix}.req.*.*.{server}.>            central fleet, all callers
+//	tenant only      {prefix}.req.{tenant}.*.{server}.>     one org, all its users
+//	tenant + user    {prefix}.req.{tenant}.{user}.{server}.>  one caller (per-user pod)
+//
+// A user without a tenant is rejected: scoping by the attribution token alone
+// would span every tenant, never a shape we bind. The tenant-only form is how
+// a per-org deployment claims its whole org's slice; the fully-scoped form is
+// what a per-user pod binds so NATS routes only that user's traffic to it.
 func EndpointSubject(prefix, tenant, user, server string) (string, error) {
 	if prefix == "" {
 		prefix = DefaultPrefix
@@ -167,17 +174,22 @@ func EndpointSubject(prefix, tenant, user, server string) (string, error) {
 	if !TokenSafe(server) {
 		return "", fmt.Errorf("wire: server %q is not subject-token safe", server)
 	}
-	if (tenant == "") != (user == "") {
-		return "", fmt.Errorf("wire: endpoint scoping requires both tenant and user (got tenant=%q, user=%q)", tenant, user)
+	if tenant == "" && user != "" {
+		return "", fmt.Errorf("wire: endpoint scoping with a user requires a tenant (got user=%q)", user)
 	}
-	if tenant == "" {
-		return prefix + ".req.*.*." + server + ".>", nil
+	tenantTok := "*"
+	if tenant != "" {
+		if !TokenSafe(tenant) {
+			return "", fmt.Errorf("wire: tenant %q is not subject-token safe", tenant)
+		}
+		tenantTok = tenant
 	}
-	if !TokenSafe(tenant) {
-		return "", fmt.Errorf("wire: tenant %q is not subject-token safe", tenant)
+	userTok := "*"
+	if user != "" {
+		if !TokenSafe(user) {
+			return "", fmt.Errorf("wire: user %q is not subject-token safe", user)
+		}
+		userTok = user
 	}
-	if !TokenSafe(user) {
-		return "", fmt.Errorf("wire: user %q is not subject-token safe", user)
-	}
-	return prefix + ".req." + tenant + "." + user + "." + server + ".>", nil
+	return prefix + ".req." + tenantTok + "." + userTok + "." + server + ".>", nil
 }

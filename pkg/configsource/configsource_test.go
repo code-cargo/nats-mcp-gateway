@@ -93,6 +93,44 @@ func TestStatic(t *testing.T) {
 	assert.Equal(t, []string{"only"}, got[0])
 }
 
+// Static emits its one config and then holds — Run keeps serving it (does not
+// return) until ctx is cancelled, the same lifetime the file/NATS sources have.
+// This is what keeps an inline-config gateway running instead of exiting at boot.
+func TestStaticHoldsUntilContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	applied := make(chan []string, 1)
+	done := make(chan error, 1)
+	go func() {
+		done <- Run(ctx, nil, Static(cfgWith("only")), func(c *config.Config) error {
+			applied <- names(c)
+			return nil
+		})
+	}()
+
+	select {
+	case got := <-applied:
+		assert.Equal(t, []string{"only"}, got)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Static never emitted its config")
+	}
+
+	// Run must still be serving, not returned.
+	select {
+	case err := <-done:
+		t.Fatalf("Run returned before ctx cancel: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after ctx cancel")
+	}
+}
+
 func TestDedupSuppressesRepeats(t *testing.T) {
 	// A push source that emits the same config three times, then a new one.
 	raw := SourceFunc(func(ctx context.Context) <-chan Update {

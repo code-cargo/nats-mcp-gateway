@@ -55,11 +55,13 @@ type NATS struct {
 	CredsFile     string `json:"credsFile"`
 	SubjectPrefix string `json:"subjectPrefix"`
 	QueueGroup    string `json:"queueGroup"`
-	// Tenant/User, when set (always together), scope this instance to one
-	// caller: it binds {prefix}.req.{tenant}.{user}.{server}.> instead of
-	// the all-callers wildcard. This is the per-user pod shape — the
-	// instance fronts its servers for exactly one identity, typically with
-	// that identity's credentials injected into its environment.
+	// Tenant/User scope this instance's subjects. Tenant alone binds
+	// {prefix}.req.{tenant}.*.{server}.> — an org deployment fronting its
+	// servers for all of one tenant's users. Tenant+User binds
+	// {prefix}.req.{tenant}.{user}.{server}.> — the per-user pod shape,
+	// serving one identity, typically with that identity's credentials
+	// injected into its environment. Both empty is the all-callers central
+	// gateway; user without tenant is invalid.
 	Tenant string `json:"tenant"`
 	User   string `json:"user"`
 }
@@ -270,8 +272,8 @@ func (c *Config) validate() error {
 			return fmt.Errorf("claimCheck.maxBytes must be >= 0")
 		}
 	}
-	if (c.NATS.Tenant == "") != (c.NATS.User == "") {
-		return fmt.Errorf("nats: scoping requires both tenant and user (got tenant=%q, user=%q)", c.NATS.Tenant, c.NATS.User)
+	if c.NATS.Tenant == "" && c.NATS.User != "" {
+		return fmt.Errorf("nats: scoping with a user requires a tenant (got user=%q)", c.NATS.User)
 	}
 	if c.NATS.Tenant != "" && !wire.TokenSafe(c.NATS.Tenant) {
 		return fmt.Errorf("nats: tenant %q is not subject-token safe (%s)", c.NATS.Tenant, `A-Za-z0-9_-`)

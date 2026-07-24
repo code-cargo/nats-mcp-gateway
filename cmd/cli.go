@@ -45,6 +45,12 @@ type GatewayCmd struct {
 	Config         string        `help:"Path to gateway config JSON (file source; SIGHUP reloads)." type:"existingfile" env:"NATSMCP_CONFIG" xor:"source"`
 	ReloadInterval time.Duration `help:"File source: poll interval for change detection (0 disables polling)." default:"10s" env:"NATSMCP_RELOAD_INTERVAL"`
 
+	// Inline source: the whole config document as a string, for environments
+	// with no file mount and no config responder (the scoped stdio pod). It
+	// never reloads; connection params come from the fetch-source flags below,
+	// since the document is plain-only and the NATS URL carries the credential.
+	ConfigJSON string `help:"Inline gateway config JSON (config source; same schema as --config, never reloads)." env:"NATSMCP_CONFIG_JSON" xor:"source"`
+
 	// NATS fetch source. Connection params come from flags here, because the
 	// gateway must connect before it can fetch its config.
 	ConfigSubject       string        `help:"NATS subject to request config JSON from (fetch source)." env:"NATSMCP_CONFIG_SUBJECT" xor:"source"`
@@ -53,9 +59,9 @@ type GatewayCmd struct {
 	NatsURL             string        `help:"NATS URL (fetch source)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
 	NatsCreds           string        `help:"NATS credentials file (fetch source)." env:"NATSMCP_NATS_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch source)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
-	QueueGroup          string        `help:"Wire queue group (fetch source; default mcpgw, or mcpgw.{tenant}.{user} for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
-	ScopeTenant         string        `help:"Serve only this tenant's subjects (scoped/per-user pod mode; requires --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
-	ScopeUser           string        `help:"Serve only this user's subjects (scoped/per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
+	QueueGroup          string        `help:"Wire queue group (fetch source; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
+	ScopeTenant         string        `help:"Serve only this tenant's subjects (org deployment; per-user pod when combined with --scope-user)." env:"NATSMCP_SCOPE_TENANT"`
+	ScopeUser           string        `help:"Serve only this user's subjects (per-user pod mode; requires --scope-tenant)." env:"NATSMCP_SCOPE_USER"`
 
 	// Claim-check (fetch source; the file source reads the claimCheck block).
 	ClaimCheck    bool          `help:"Park oversize responses in a JetStream Object Store for claim-accepting clients (fetch source; needs JetStream)." env:"NATSMCP_CLAIM_CHECK"`

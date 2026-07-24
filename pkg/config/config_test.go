@@ -182,9 +182,16 @@ func TestNATSScopingValidation(t *testing.T) {
 	assert.Equal(t, "acme", cfg.NATS.Tenant)
 	assert.Equal(t, "u1", cfg.NATS.User)
 
-	_, err = Parse([]byte(`{"nats":{"tenant":"acme"},"servers":{}}`))
-	require.Error(t, err, "tenant without user must be rejected")
-	assert.Contains(t, err.Error(), "both tenant and user")
+	// Tenant alone is valid: an org deployment serving all of one tenant's users.
+	cfg, err = Parse([]byte(`{"nats":{"tenant":"acme"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "acme", cfg.NATS.Tenant)
+	assert.Empty(t, cfg.NATS.User)
+
+	// A user without a tenant is rejected.
+	_, err = Parse([]byte(`{"nats":{"user":"u1"},"servers":{}}`))
+	require.Error(t, err, "user without tenant must be rejected")
+	assert.Contains(t, err.Error(), "requires a tenant")
 
 	_, err = Parse([]byte(`{"nats":{"tenant":"bad tenant","user":"u1"},"servers":{}}`))
 	require.Error(t, err)
