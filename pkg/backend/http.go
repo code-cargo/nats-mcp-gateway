@@ -500,7 +500,6 @@ func (c *httpConn) Close() error {
 // inbox, so it cannot collide with a muxed caller id.
 const annotationProbeID = "natsmcp-annotations"
 
-// errorBodyLimit bounds a 4xx/5xx body read.
 // errorBodyLimit bounds a 4xx/5xx body read. Big enough for a JSON-RPC error
 // whose data enumerates expected headers — the old 4KiB cap truncated those
 // and lost the retry that recognizes them — and small enough that a backend

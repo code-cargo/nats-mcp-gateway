@@ -77,7 +77,19 @@ func parseToolAnnotations(schema json.RawMessage) ([]headerParam, error) {
 	}
 	var root any
 	if err := json.Unmarshal(schema, &root); err != nil {
-		return nil, nil // not an object we can read; no annotations to honor
+		// The bytes are syntactically valid JSON — absorbToolsList decoded the
+		// enclosing tool object, which scans them — so this is a value Go cannot
+		// represent, in practice a number outside float64 (`1e999`). If the
+		// schema names the annotation somewhere in there, we cannot say which
+		// parameter it marks, and a tool whose headers we cannot derive fails
+		// every call with -32020. Excluding it says so; keeping it would learn
+		// zero params for a tool that needs some, which reads as "no headers
+		// required" everywhere downstream. With the annotation absent, an
+		// unreadable schema is simply none of this code's business.
+		if bytes.Contains(schema, []byte(mcpspec.SchemaHeaderAnnotation)) {
+			return nil, &annotationError{"inputSchema names x-mcp-header but cannot be read: " + err.Error()}
+		}
+		return nil, nil
 	}
 	w := &annotationWalk{seen: map[string]string{}}
 	if err := w.walk(root, nil, true); err != nil {

@@ -110,6 +110,32 @@ func TestParseToolAnnotationsIgnoresUnannotatedSchemas(t *testing.T) {
 	}
 }
 
+func TestParseToolAnnotationsExcludesUnreadableAnnotatedSchemas(t *testing.T) {
+	// A schema can be syntactically valid JSON — which is all absorbToolsList's
+	// decode of the enclosing tool object proves — and still fail to decode into
+	// `any`, because a number outside float64 has no Go representation. Left
+	// tolerated, the tool is kept having learned ZERO parameters, so the
+	// annotated header is never sent and every call fails -32020 with the
+	// annotations cache reporting the tool as fully known, which suppresses the
+	// probe that would otherwise recover.
+	unreadable := json.RawMessage(
+		`{"properties":{"region":{"type":"string","x-mcp-header":"Region","default":1e999}}}`,
+	)
+
+	var syntaxOK any
+	require.Error(t, json.Unmarshal(unreadable, &syntaxOK), "premise: this must be undecodable")
+	require.True(t, json.Valid(unreadable), "premise: yet syntactically valid, so absorbToolsList admits it")
+
+	_, err := parseToolAnnotations(unreadable)
+	assert.Error(t, err, "an unreadable schema that names x-mcp-header must invalidate the tool")
+
+	// The same unreadable value WITHOUT the annotation is none of our business:
+	// excluding it would delete a working tool over a number we never look at.
+	got, err := parseToolAnnotations(json.RawMessage(`{"properties":{"region":{"default":1e999}}}`))
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
 func TestParamHeaders(t *testing.T) {
 	params := []headerParam{
 		{name: "Region", path: []string{"region"}},
