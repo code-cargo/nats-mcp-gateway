@@ -23,6 +23,8 @@ import (
 	"time"
 
 	nats "github.com/nats-io/nats.go"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 const (
@@ -227,13 +229,20 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 		Reply:   reply,
 		Data:    req.Body,
 		Header: nats.Header{
-			HeaderWire:            []string{WireVersion},
-			HeaderMethod:          []string{req.Method},
-			HeaderProtocolVersion: []string{req.ProtocolVersion},
+			HeaderWire:   []string{WireVersion},
+			HeaderMethod: []string{req.Method},
+			// Encoded like Name, and for the same reason: the shim lifts this
+			// straight out of the client's params._meta without validating it,
+			// so it is caller-controlled text on its way into a header. A CR
+			// or LF here would forge extra header lines in the published frame.
+			HeaderProtocolVersion: []string{mcpspec.EncodeHeaderValue(req.ProtocolVersion)},
 		},
 	}
 	if req.Name != "" {
-		msg.Header.Set(HeaderName, req.Name)
+		// Encoded only for the header. The subject above was already built
+		// from the RAW name, which is what the permission grant is written
+		// against — encoding before that point would silently change it.
+		msg.Header.Set(HeaderName, mcpspec.EncodeHeaderValue(req.Name))
 	}
 	if c.claims != nil {
 		msg.Header.Set(HeaderAcceptClaim, "1")

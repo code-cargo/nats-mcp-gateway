@@ -509,7 +509,12 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 	var out backend.Backend = inner
 	if !modern {
 		// Default: 2025-11-25, because that is what exists in the wild.
-		out = &legacy.Backend{Inner: inner, DiscoverTTLMs: s.DiscoverTTLMs, Logger: blog}
+		out = &legacy.Backend{
+			Inner:         inner,
+			DiscoverTTLMs: s.DiscoverTTLMs,
+			CacheScope:    s.CacheScope,
+			Logger:        blog,
+		}
 	}
 	// Clamp the backend's life to the credentials' expiry — but only when the
 	// reply actually carried material. The clamp exists to bound how long a

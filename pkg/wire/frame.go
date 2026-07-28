@@ -16,23 +16,38 @@
 // a stream of zero-or-more notification frames out, exactly one terminal
 // frame. It moves opaque JSON-RPC bytes and knows no MCP schema — when the
 // MCP spec moves, this package does not.
+//
+// One narrow exception: header VALUE encoding (mcpspec.EncodeHeaderValue).
+// This binding writes tool names and resource URIs into NATS headers, and a
+// value carrying CR/LF would corrupt the protocol frame, so the encoding is a
+// property of writing a header at all rather than of any MCP schema. It has to
+// live here because the subject's name token is derived from the RAW name —
+// encoding earlier would change the token and with it the permission check.
 package wire
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
+)
 
 // WireVersion is the value of the Mcp-Wire header. Bump on any incompatible
 // change to subjects or framing.
 const WireVersion = "1"
 
-// Request headers. Mcp-Method / Mcp-Name / MCP-Protocol-Version deliberately
-// mirror the names the 2026-07-28 spec requires on Streamable HTTP (they are
-// binding-level strings, not MCP schema; pkg/proxy asserts they stay in sync
-// with pkg/mcpspec).
+// Request headers. Mcp-Method / Mcp-Name / MCP-Protocol-Version mirror the
+// names the 2026-07-28 spec requires on Streamable HTTP, so an intermediary
+// can route on the NATS side exactly as it would on the HTTP side.
 const (
-	HeaderWire            = "Mcp-Wire"
-	HeaderMethod          = "Mcp-Method"
-	HeaderName            = "Mcp-Name"
-	HeaderProtocolVersion = "MCP-Protocol-Version"
+	HeaderWire = "Mcp-Wire"
+	// The MCP-defined names are aliased, not respelled. This package used to
+	// keep its own copies to avoid depending on pkg/mcpspec; client.go now
+	// imports it for header value encoding, so a second spelling would only
+	// be a way for the two to drift — and pkg/proxy's integrity check compares
+	// a header it looks up by wire's name against a value mcpspec encoded.
+	HeaderMethod          = mcpspec.HeaderMethod
+	HeaderName            = mcpspec.HeaderName
+	HeaderProtocolVersion = mcpspec.HeaderProtocolVersion
 )
 
 // HeaderFrame carries the frame kind on every reply-stream message.

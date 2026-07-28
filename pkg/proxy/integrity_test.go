@@ -192,3 +192,39 @@ func TestIntegrityUnsupportedVersion(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, mcpspec.LegacyProtocolVersion, data["requested"])
 }
+
+func TestIntegrityAcceptsSentinelEncodedName(t *testing.T) {
+	// A tool name outside the header-safe set MUST reach us base64-encoded.
+	// Comparing the raw header to the body would reject a conformant client,
+	// so the check decodes first.
+	const name = "crème.brûlée"
+	b := body(mcpspec.MethodToolsCall, name, true)
+	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call._", mcpspec.MethodToolsCall, "", b)
+	encoded := mcpspec.EncodeHeaderValue(name)
+	require.NotEqual(t, name, encoded, "the fixture must actually be encoded")
+	in.Header.Set(wire.HeaderName, encoded)
+
+	assert.Nil(t, Check(in))
+}
+
+func TestIntegrityStillCatchesMismatchUnderEncoding(t *testing.T) {
+	// Decoding must not become a way to smuggle a different name past the
+	// subject the caller was authorized for.
+	b := body(mcpspec.MethodToolsCall, "crème.brûlée", true)
+	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call._", mcpspec.MethodToolsCall, "", b)
+	in.Header.Set(wire.HeaderName, mcpspec.EncodeHeaderValue("délicieux"))
+
+	got := Check(in)
+	require.NotNil(t, got)
+	assert.Equal(t, mcpspec.ErrHeaderMismatch, got.Code)
+}
+
+func TestIntegrityRejectsMalformedSentinel(t *testing.T) {
+	b := body(mcpspec.MethodToolsCall, "crème.brûlée", true)
+	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call._", mcpspec.MethodToolsCall, "", b)
+	in.Header.Set(wire.HeaderName, "=?base64?not!base64!?=")
+
+	got := Check(in)
+	require.NotNil(t, got)
+	assert.Equal(t, mcpspec.ErrHeaderMismatch, got.Code)
+}

@@ -5,6 +5,12 @@ leave a laptop become network services; NATS accounts and subject permissions
 become the MCP authorization plane; the gateway injects backend credentials so
 end users never hold them.
 
+> **Status: under active development.** This is not yet a stable release.
+> The wire (subjects, framing, headers) is versioned `Mcp-Wire: 1` but may
+> still change incompatibly, and MCP 2026-07-28 — the revision the wire
+> carries — was itself only finalized on 2026-07-28. Pin a commit, expect
+> breaking changes, and read the git log before upgrading.
+
 ```
 [MCP client]           [gateway fleet, queue group]       [real MCP servers]
  2025-11-25               2026-07-28 on NATS                 2025-11-25
@@ -193,6 +199,35 @@ never share a process or a credential.
 point; clients never see backend secrets. Set `max_payload: 8MB` on the NATS
 server: MCP results carry base64 blobs, and oversize messages fail with a
 legible `-32012` instead of a hang.
+
+### Caching hints
+
+2026-07-28 requires `ttlMs` and `cacheScope` on every cacheable result
+(`server/discover`, the `*/list` methods, `resources/read`). For a legacy
+backend the gateway supplies both, since a 2025-11-25 server cannot:
+
+```json
+"github": { "discoverTtlMs": 300000, "cacheScope": "private" }
+```
+
+`cacheScope` defaults to **`private`** and you should usually leave it there.
+Backends are pooled per `(server, tenant[, user, credential-generation])` and
+credentials are injected per caller, so a result generally is not safe for a
+shared cache to hand to a different authorization context — which is exactly
+what `public` licenses. Set `public` only for a server whose listings are
+provably identical for every caller. An unrecognized value is rejected at
+config load rather than defaulted, so a typo cannot quietly widen it.
+
+### Tool parameters mirrored into headers
+
+A backend MAY annotate tool parameters with `x-mcp-header`, asking that their
+values also travel as `Mcp-Param-{Name}` headers. The gateway honors this for
+HTTP backends without giving up being schema-blind: it learns annotations from
+`tools/list` responses passing through, and if a `tools/call` is rejected with
+`-32020` before it has seen one, it re-reads the schema and retries that call
+once — the recovery the spec defines for exactly this case. A tool whose
+annotations are invalid is dropped from `tools/list` with a warning, so one
+malformed definition cannot cost a server its whole toolset.
 
 ## Per-user backend credentials
 
@@ -511,7 +546,12 @@ code running**. See `demo/README-steps` inside `demo/run.sh`.
   Request-direction bodies (large uploads) are always bounded by
   `max_payload` — claim-check covers responses only.
 - `resourceSubscriptions` inside `subscriptions/listen` is not yet bridged
-  for legacy backends (`*/list_changed` events are).
+  for legacy backends (`*/list_changed` events are). The subscription
+  acknowledgment reports only what is honored, so a client that asked for it
+  is told up front rather than waiting for updates that never come.
+- `x-mcp-header` is honored for **HTTP backends only** — the spec makes it a
+  client requirement on Streamable HTTP and lets other transports ignore it,
+  and a stdio subprocess has no headers to mirror into.
 - Credential-expired backends are recycled on their next use and by the
   reaper, but only when idle: a long-lived in-flight call (a
   `subscriptions/listen` stream) can pin its process past the credentials'
