@@ -15,6 +15,7 @@
 package shim
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"time"
@@ -99,9 +100,10 @@ func (s *Shim) answerInitialize(ctx context.Context, initID json.RawMessage) {
 	}
 
 	var d struct {
-		Capabilities json.RawMessage `json:"capabilities"`
-		ServerInfo   json.RawMessage `json:"serverInfo"`
-		Instructions json.RawMessage `json:"instructions"`
+		Capabilities json.RawMessage            `json:"capabilities"`
+		ServerInfo   json.RawMessage            `json:"serverInfo"`
+		Instructions json.RawMessage            `json:"instructions"`
+		Meta         map[string]json.RawMessage `json:"_meta"`
 	}
 	if err := json.Unmarshal(resp.Result, &d); err != nil {
 		s.writeError(initID, jsonrpc.CodeInternalError, "bad DiscoverResult")
@@ -113,7 +115,7 @@ func (s *Shim) answerInitialize(ctx context.Context, initID json.RawMessage) {
 	init := map[string]any{
 		"protocolVersion": mcpspec.LegacyProtocolVersion,
 		"capabilities":    orEmptyObject(d.Capabilities),
-		"serverInfo":      orEmptyObject(d.ServerInfo),
+		"serverInfo":      orEmptyObject(discoverServerInfo(d.Meta, d.ServerInfo)),
 	}
 	if len(d.Instructions) > 0 {
 		init["instructions"] = d.Instructions
@@ -145,21 +147,53 @@ func (s *Shim) interceptLegacyRequest(msg *jsonrpc.Message) bool {
 }
 
 // legacyMeta returns the _meta entries to inject on every outbound request.
+//
+// protocolVersion and clientCapabilities are REQUIRED, so both are always
+// present — an empty object is a valid capability set, an absent one is not.
+// clientInfo is only SHOULD (it was required until 2026-07-16), so it is sent
+// when the legacy client identified itself and omitted when it did not, rather
+// than fabricated.
 func (l *legacyClient) legacyMeta() map[string]json.RawMessage {
 	verRaw, _ := json.Marshal(mcpspec.ProtocolVersion)
-	m := map[string]json.RawMessage{mcpspec.MetaProtocolVersion: verRaw}
-	if len(l.clientInfo) > 0 {
-		m[mcpspec.MetaClientInfo] = l.clientInfo
+	caps := l.clientCaps
+	if isEmptyJSON(caps) {
+		caps = json.RawMessage(`{}`)
 	}
-	if len(l.clientCaps) > 0 {
-		m[mcpspec.MetaClientCapabilities] = l.clientCaps
+	m := map[string]json.RawMessage{
+		mcpspec.MetaProtocolVersion:    verRaw,
+		mcpspec.MetaClientCapabilities: caps,
+	}
+	if !isEmptyJSON(l.clientInfo) {
+		m[mcpspec.MetaClientInfo] = l.clientInfo
 	}
 	return m
 }
 
+// discoverServerInfo picks the server's identity out of a DiscoverResult.
+//
+// serverInfo moved out of the result's top level into result _meta on
+// 2026-07-16, late in the 2026-07-28 draft. The _meta key is preferred; the
+// top-level field is still read so a backend built against the earlier draft
+// identifies itself instead of surfacing to the client as an empty object.
+// The fallback can go once nothing pre-final is in service.
+func discoverServerInfo(meta map[string]json.RawMessage, topLevel json.RawMessage) json.RawMessage {
+	if si, ok := meta[mcpspec.MetaServerInfo]; ok && !isEmptyJSON(si) {
+		return si
+	}
+	return topLevel
+}
+
 func orEmptyObject(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 {
+	if isEmptyJSON(raw) {
 		return json.RawMessage(`{}`)
 	}
 	return raw
+}
+
+// isEmptyJSON reports whether raw carries no usable value. A literal `null`
+// counts: a legacy client may send "capabilities": null, and forwarding that
+// as clientCapabilities would satisfy a length check while giving a strict
+// backend neither an object nor an absent field.
+func isEmptyJSON(raw json.RawMessage) bool {
+	return len(raw) == 0 || string(bytes.TrimSpace(raw)) == "null"
 }

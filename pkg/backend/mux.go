@@ -56,6 +56,10 @@ type Mux struct {
 }
 
 type call struct {
+	// method is the request's MCP method. Only a subscriptions/listen call
+	// can produce a response whose body names a subscription, so this is what
+	// gates the closure rewrite below.
+	method    string
 	origID    json.RawMessage
 	origToken json.RawMessage // caller's progressToken, nil if none
 	notify    func(*jsonrpc.Message)
@@ -110,6 +114,7 @@ func (m *Mux) Call(ctx context.Context, msg *jsonrpc.Message, notify func(*jsonr
 	muxToken := "gt" + strconv.FormatUint(n, 10)
 
 	c := &call{
+		method: msg.Method,
 		origID: msg.ID,
 		notify: notify,
 		resp:   make(chan *jsonrpc.Message, 1),
@@ -158,6 +163,15 @@ func (m *Mux) Call(ctx context.Context, msg *jsonrpc.Message, notify func(*jsonr
 		return resp, nil
 	case <-ctx.Done():
 		unregister()
+		// A response that already landed wins here too: both channels can be
+		// ready at once, and reporting a deadline for work the backend finished
+		// would also send it a cancel for a request it already answered.
+		select {
+		case resp := <-c.resp:
+			resp.ID = c.origID
+			return resp, nil
+		default:
+		}
 		// Best-effort cancellation toward the backend; fresh context because
 		// ctx is already done.
 		cancelParams, _ := json.Marshal(map[string]json.RawMessage{"requestId": muxID})
@@ -166,6 +180,17 @@ func (m *Mux) Call(ctx context.Context, msg *jsonrpc.Message, notify func(*jsonr
 		return nil, ctx.Err()
 	case <-m.dead:
 		unregister()
+		// A response that landed before the connection died wins. Closing the
+		// conn is HOW a graceful subscription closure is delivered, so both
+		// channels are ready at once and a bare select would pick randomly —
+		// reporting "connection dead" for a stream that ended cleanly, which
+		// is the exact distinction the closure exists to draw.
+		select {
+		case resp := <-c.resp:
+			resp.ID = c.origID
+			return resp, nil
+		default:
+		}
 		return nil, m.deadError()
 	}
 }
@@ -213,6 +238,24 @@ func (m *Mux) routeResponse(msg *jsonrpc.Message) {
 	if c == nil {
 		m.log.Debug("response for unknown id dropped", "id", string(msg.ID))
 		return
+	}
+	// A subscriptions/listen closure is the one response whose BODY names a
+	// request: it carries the subscription id in result _meta. That id is this
+	// mux's rewritten one, so restore the caller's — otherwise the message
+	// that ends the stream refers to an id the caller never issued, and leaks
+	// a gateway-internal identifier while doing it.
+	//
+	// Gated on the METHOD, not on the payload. This is the funnel every
+	// response passes through, including multi-megabyte tool results, and
+	// metaField has to walk the whole document; a content probe would also
+	// fire on any result that merely mentions the key, such as a resource
+	// containing this specification. Only a listen call can close a stream.
+	if c.method == mcpspec.MethodListen {
+		if _, ok := metaField(msg.Result, mcpspec.MetaSubscriptionID); ok {
+			if result, ok := setMetaField(msg.Result, mcpspec.MetaSubscriptionID, c.origID); ok {
+				msg.Result = result
+			}
+		}
 	}
 	select {
 	case c.resp <- msg:
@@ -301,12 +344,12 @@ func rewriteProgressToken(params json.RawMessage, muxToken string) (json.RawMess
 		return nil, nil, false
 	}
 	meta["progressToken"] = json.RawMessage(strconv.Quote(muxToken))
-	metaRaw, err := json.Marshal(meta)
+	metaRaw, err := marshalNoEscape(meta)
 	if err != nil {
 		return nil, nil, false
 	}
 	obj["_meta"] = metaRaw
-	out, err := json.Marshal(obj)
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return nil, nil, false
 	}
@@ -320,7 +363,7 @@ func setObjectField(params json.RawMessage, key string, val json.RawMessage) (js
 		return nil, false
 	}
 	obj[key] = val
-	out, err := json.Marshal(obj)
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return nil, false
 	}
@@ -352,12 +395,14 @@ func setMetaField(params json.RawMessage, key string, val json.RawMessage) (json
 		return nil, false
 	}
 	meta[key] = val
-	metaRaw, err := json.Marshal(meta)
+	metaRaw, err := marshalNoEscape(meta)
 	if err != nil {
 		return nil, false
 	}
 	obj["_meta"] = metaRaw
-	out, err := json.Marshal(obj)
+	// Escape-free: this rewrites a whole result or params document to change
+	// one nested field, and the rest of it belongs to the backend.
+	out, err := marshalNoEscape(obj)
 	if err != nil {
 		return nil, false
 	}

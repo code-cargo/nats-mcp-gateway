@@ -240,3 +240,45 @@ func TestClaimCheckValidation(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "maxBytes")
 }
+
+func TestCacheScopeValidation(t *testing.T) {
+	server := func(extra string) string {
+		return `{"servers":{"gh":{"transport":"stdio","command":"x"` + extra + `}}}`
+	}
+	tests := []struct {
+		name    string
+		extra   string
+		wantErr string
+	}{
+		{name: "absent", extra: ""},
+		{name: "private", extra: `,"cacheScope":"private"`},
+		{name: "public", extra: `,"cacheScope":"public"`},
+		{
+			// Not defaulted to private: a typo silently becoming "public"
+			// would license shared caches across authorization contexts.
+			name:    "unknown value",
+			extra:   `,"cacheScope":"shared"`,
+			wantErr: "unknown cacheScope",
+		},
+		{
+			// The gateway can only stamp results it bridges. Accepting the
+			// field on a modern server would let an operator believe they had
+			// constrained sharing when nothing reads the setting.
+			name:    "rejected on a modern server",
+			extra:   `,"protocol":"2026-07-28","cacheScope":"private"`,
+			wantErr: "applies only to bridged",
+		},
+		{name: "allowed on an explicit legacy server", extra: `,"protocol":"2025-11-25","cacheScope":"public"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, server(tc.extra)))
+			if tc.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}

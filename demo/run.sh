@@ -11,13 +11,17 @@ fi
 echo "==> starting nats-server (demo config: 8MB payloads, 3 users)"
 nats-server -c nats.conf &
 NATS_PID=$!
-trap 'kill $NATS_PID 2>/dev/null' EXIT
+trap 'kill $NATS_PID 2>/dev/null || true' EXIT
 sleep 1
 
 echo "==> starting gateway fronting @modelcontextprotocol/server-everything"
 ../bin/natsmcp gateway --config gateway.json &
 GW_PID=$!
-trap 'kill $GW_PID $NATS_PID 2>/dev/null' EXIT
+# `|| true` matters: the orderly shutdown at the end of the script kills these
+# first, so by the time the trap runs there is usually nothing left to kill.
+# Under `set -e` that failing kill would become the script's exit status, and
+# `make demo` would report failure on every successful run.
+trap 'kill $GW_PID $NATS_PID 2>/dev/null || true' EXIT
 sleep 2
 
 echo
@@ -46,5 +50,7 @@ NATSMCP_TENANT=demo ../bin/natsmcp call --server everything --method tools/call 
 echo
 echo "==> done. To try Claude Code: copy demo/mcp.json into your project as"
 echo "    .mcp.json (with bin/natsmcp on PATH) and run /mcp."
-kill $GW_PID $NATS_PID 2>/dev/null
+# `|| true` here too: if the gateway already exited, this kill fails and
+# `set -e` would abort the script before the trap ever runs.
+kill $GW_PID $NATS_PID 2>/dev/null || true
 wait 2>/dev/null || true

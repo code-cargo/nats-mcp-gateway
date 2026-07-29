@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"strings"
 	"sync"
@@ -96,6 +97,25 @@ type httpConn struct {
 	sessionID string
 	inflight  sync.WaitGroup
 
+	// annotations maps a tool name to its honored x-mcp-header parameters,
+	// learned from tools/list responses passing through. A tool with no
+	// annotations maps to nil, which is indistinguishable from "not learned
+	// yet" — deliberately: both mean "send no Mcp-Param-* headers", and the
+	// refresh path decides whether to retry by comparing what it knew before
+	// against what it knows after, not by consulting a third state.
+	annotations map[string][]headerParam
+	// annotationsKnown records that a full tools/list has been read at least
+	// once. Without it a backend rejecting for a reason mirroring cannot fix
+	// re-probes its whole (paginated) tool list on every call, forever.
+	annotationsKnown bool
+	// refreshGen counts completed out-of-band schema fetches, so concurrent
+	// callers can tell whether one they waited on covered their need.
+	refreshGen uint64
+
+	// refreshMu serializes those fetches. Separate from mu, which is only
+	// ever held briefly: this one is held across a network round trip.
+	refreshMu sync.Mutex
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -135,20 +155,27 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	c.inflight.Add(1)
 	go func() {
 		defer c.inflight.Done()
-		c.roundTrip(context.WithoutCancel(ctx), body, msg)
+		c.roundTripOnce(context.WithoutCancel(ctx), body, msg, false)
 	}()
 	return nil
 }
 
 // newRequest builds one POST with the static headers, the token source's
 // current headers, and the MCP framing headers.
-func (c *httpConn) newRequest(ctx context.Context, body []byte, msg *jsonrpc.Message) (*http.Request, error) {
+func (c *httpConn) newRequest(ctx context.Context, body []byte, msg *jsonrpc.Message, name string, paramHeaders map[string]string) (*http.Request, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.backend.URL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
+	// Mirrored parameter headers go on BEFORE credentials below. They are
+	// derived from caller-supplied arguments, and the credential headers are
+	// the gateway's own; setting them first means an Mcp-Param-* can never
+	// displace an injected secret even if the two ever collide by name.
+	for k, v := range paramHeaders {
+		req.Header.Set(k, v)
+	}
 	for k, v := range c.backend.Headers {
 		req.Header.Set(k, v)
 	}
@@ -164,8 +191,10 @@ func (c *httpConn) newRequest(ctx context.Context, body []byte, msg *jsonrpc.Mes
 	if msg.Kind() == jsonrpc.KindRequest {
 		// Required by 2026-07-28; harmless extras for legacy servers.
 		req.Header.Set(mcpspec.HeaderMethod, msg.Method)
-		if name := paramsName(msg); name != "" {
-			req.Header.Set(mcpspec.HeaderName, name)
+		if name != "" {
+			// Resource URIs are never header-safe by grammar, and tool names
+			// are only SHOULD-constrained, so this may be sentinel-encoded.
+			req.Header.Set(mcpspec.HeaderName, mcpspec.EncodeHeaderValue(name))
 		}
 		if c.backend.Legacy {
 			req.Header.Set(mcpspec.HeaderProtocolVersion, mcpspec.LegacyProtocolVersion)
@@ -181,29 +210,50 @@ func (c *httpConn) newRequest(ctx context.Context, body []byte, msg *jsonrpc.Mes
 	return req, nil
 }
 
-func (c *httpConn) roundTrip(ctx context.Context, body []byte, msg *jsonrpc.Message) {
-	var resp *http.Response
+// doWithAuthRetry performs one POST, retrying once with freshly-resolved
+// credentials on 401. Every request on this conn goes through here, the
+// out-of-band annotation probe included — otherwise an expired token that any
+// normal request would refresh would silently defeat the probe.
+func (c *httpConn) doWithAuthRetry(ctx context.Context, body []byte, msg *jsonrpc.Message, name string, paramHeaders map[string]string) (*http.Response, error) {
 	for attempt := 0; ; attempt++ {
-		req, err := c.newRequest(ctx, body, msg)
+		req, err := c.newRequest(ctx, body, msg, name, paramHeaders)
 		if err != nil {
-			c.fail(msg, err.Error())
-			return
+			return nil, err
 		}
-		resp, err = c.client.Do(req)
+		resp, err := c.client.Do(req)
 		if err != nil {
-			c.fail(msg, fmt.Sprintf("http request failed: %v", err))
-			return
+			return nil, fmt.Errorf("http request failed: %w", err)
 		}
-		// One retry on 401 with freshly-resolved credentials. Safe for any
-		// method, idempotent or not: a 401 rejects the request before the
-		// server executes it.
+		// Safe for any method, idempotent or not: a 401 rejects the request
+		// before the server executes it.
 		if resp.StatusCode == http.StatusUnauthorized && attempt == 0 && c.backend.TokenSource != nil {
 			_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
 			c.backend.TokenSource.Invalidate()
 			continue
 		}
-		break
+		return resp, nil
+	}
+}
+
+// roundTripOnce performs one HTTP exchange. retried marks the reissue after a
+// header mismatch, so the recovery cannot recurse.
+func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.Message, retried bool) {
+	// Parsed once and threaded through: params can be megabytes, and the
+	// name is wanted by the Mcp-Name header, the mirrored parameter headers
+	// and the recovery below.
+	name := paramsName(msg)
+	// Captured before the request goes out, so the recovery can compare what
+	// this request actually carried against what it would carry now, and can
+	// tell a refresh that postdates it from one that merely finished later.
+	sent := c.paramHeadersFor(msg, name)
+	c.mu.Lock()
+	gen := c.refreshGen
+	c.mu.Unlock()
+	resp, err := c.doWithAuthRetry(ctx, body, msg, name, sent)
+	if err != nil {
+		c.fail(msg, err.Error())
+		return
 	}
 	defer resp.Body.Close()
 
@@ -219,8 +269,36 @@ func (c *httpConn) roundTrip(ctx context.Context, body []byte, msg *jsonrpc.Mess
 	case resp.StatusCode == http.StatusAccepted:
 		return // notification/response accepted, no body
 	case resp.StatusCode >= 300:
-		data, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		c.fail(msg, fmt.Sprintf("http %d: %s", resp.StatusCode, bytes.TrimSpace(data)))
+		// Generous enough for a JSON-RPC error whose data enumerates the
+		// expected Mcp-Param-* headers — a 4KiB cap truncated those and lost
+		// both the structured error and the retry that recognizes it — but far
+		// below max_payload, because this body can end up inside an error
+		// message that travels back over NATS.
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, errorBodyLimit))
+		// A modern server answers version, capability and header-validation
+		// failures with 4xx AND a JSON-RPC error body. Surfacing that body is
+		// what lets a caller tell "you addressed me wrong" from "the backend
+		// is broken" — and it is how a missing Mcp-Param-* is reported.
+		//
+		// Only for a REQUEST: a rejected notification has no id to answer on,
+		// so delivering one would produce a response the mux cannot route and
+		// drops at debug level. fail() logs it instead, which is the whole
+		// visibility a backend rejecting our cancellations will ever get.
+		if rpcErr, ok := decodeRPCError(data); ok && msg.Kind() == jsonrpc.KindRequest {
+			if c.retryWithParamHeaders(ctx, rpcErr, body, msg, name, sent, gen, retried) {
+				return
+			}
+			// Logged as well as delivered. The caller gets the RPC error, but a
+			// backend that starts 503-ing every call must leave a trace on the
+			// gateway too, and the HTTP status reaches nobody otherwise.
+			c.log.Warn("backend rejected request", "method", msg.Method,
+				"status", resp.StatusCode, "code", rpcErr.Error.Code,
+				"detail", rpcErr.Error.Message)
+			rpcErr.ID = msg.ID
+			c.deliver(rpcErr)
+			return
+		}
+		c.fail(msg, fmt.Sprintf("http %d: %s", resp.StatusCode, truncate(bytes.TrimSpace(data), 512)))
 		return
 	}
 
@@ -232,46 +310,137 @@ func (c *httpConn) roundTrip(ctx context.Context, body []byte, msg *jsonrpc.Mess
 			c.fail(msg, fmt.Sprintf("reading response: %v", err))
 			return
 		}
-		c.deliverBytes(data)
+		c.deliverBytes(data, msg)
 	case strings.HasPrefix(ct, "text/event-stream"):
-		c.pumpSSE(resp.Body)
+		c.pumpSSE(resp.Body, msg)
 	default:
 		c.fail(msg, fmt.Sprintf("unexpected content-type %q", ct))
 	}
 }
 
+// decodeRPCError reports whether body is a JSON-RPC error response.
+func decodeRPCError(body []byte) (*jsonrpc.Message, bool) {
+	m, err := jsonrpc.Decode(bytes.TrimSpace(body))
+	if err != nil || m.Error == nil {
+		return nil, false
+	}
+	return m, true
+}
+
+// retryWithParamHeaders implements the spec's recovery for a tools/call
+// rejected because its Mcp-Param-* headers were missing or stale: re-read the
+// tool's inputSchema from tools/list, then reissue the call once with the
+// headers the annotations call for. Reporting whether it took over.
+//
+// This is why the gateway can stay schema-blind on the fast path — it learns
+// a schema only when a backend tells it that it needed one.
+func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Message, body []byte, msg *jsonrpc.Message, name string, sent map[string]string, gen uint64, retried bool) bool {
+	if retried || c.backend.Legacy || msg.Method != mcpspec.MethodToolsCall ||
+		rpcErr.Error == nil || rpcErr.Error.Code != mcpspec.ErrHeaderMismatch {
+		return false
+	}
+	// If this tool's schema was already read, a missing Mcp-Param-* cannot be
+	// the cause — we would have sent them. Re-reading it would cost a full
+	// paginated tools/list on every rejection for as long as the backend keeps
+	// rejecting, and could not change the outcome.
+	c.mu.Lock()
+	_, toolKnown := c.annotations[name]
+	known := c.annotationsKnown && (toolKnown || len(c.annotations) == 0)
+	c.mu.Unlock()
+	if known {
+		return false
+	}
+	if err := c.refreshAnnotations(ctx, gen); err != nil {
+		c.log.Warn("could not re-read tool annotations after a header mismatch", "err", err)
+		return false
+	}
+	// Compared against what THIS request actually sent, not against a snapshot
+	// taken after it failed. On a cold conn a concurrent caller's refresh may
+	// already have landed by then, and a before/after snapshot would show no
+	// change even though this request went out with no headers at all.
+	now := c.paramHeadersFor(msg, name)
+	if maps.Equal(sent, now) {
+		// The reissue would be byte-identical and earn the same rejection: the
+		// mismatch was about something mirroring cannot fix.
+		return false
+	}
+	c.log.Debug("retrying tools/call with mirrored parameter headers",
+		"tool", name, "headers", len(now))
+	c.roundTripOnce(ctx, body, msg, true)
+	return true
+}
+
 // pumpSSE delivers each SSE data payload as a message.
-func (c *httpConn) pumpSSE(body io.Reader) {
+func (c *httpConn) pumpSSE(body io.Reader, req *jsonrpc.Message) {
+	err := scanSSE(body, func(data []byte) bool {
+		c.deliverBytes(data, req)
+		return true
+	})
+	if err != nil {
+		// An oversize or unreadable event truncates the payload, which then
+		// fails to decode and is dropped. Without this the request simply
+		// never gets an answer and the caller waits out its whole context —
+		// a payload-too-large reported as a timeout.
+		c.fail(req, fmt.Sprintf("reading response stream: %v", err))
+	}
+}
+
+// scanSSE calls fn with each SSE data payload until fn returns false, and
+// reports any error that ended the scan early.
+func scanSSE(body io.Reader, fn func([]byte) bool) error {
 	sc := bufio.NewScanner(body)
 	sc.Buffer(make([]byte, 64*1024), maxLineBytes)
 	var data bytes.Buffer
-	flush := func() {
+	flush := func() bool {
 		if data.Len() == 0 {
-			return
+			return true
 		}
-		c.deliverBytes(append([]byte(nil), data.Bytes()...))
+		payload := append([]byte(nil), data.Bytes()...)
 		data.Reset()
+		return fn(payload)
 	}
 	for sc.Scan() {
 		line := sc.Text()
 		switch {
 		case line == "":
-			flush()
+			if !flush() {
+				return nil
+			}
 		case strings.HasPrefix(line, "data:"):
+			// The SSE spec joins an event's data lines with a newline. Dropping
+			// the separator silently welds two lines together, which JSON usually
+			// tolerates and a payload with a meaningful newline does not.
+			if data.Len() > 0 {
+				data.WriteByte('\n')
+			}
 			data.WriteString(strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
 		default:
 			// id:/event:/retry:/comments — 2026-07-28 removed resumability,
 			// so ids carry nothing we need.
 		}
 	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
 	flush()
+	return nil
 }
 
-func (c *httpConn) deliverBytes(data []byte) {
+// deliverBytes decodes one message and hands it on. req is the request this
+// response belongs to, or nil; it is what lets a tools/list result be
+// recognized without correlating ids.
+func (c *httpConn) deliverBytes(data []byte, req *jsonrpc.Message) {
 	m, err := jsonrpc.Decode(data)
 	if err != nil {
 		c.log.Warn("dropping undecodable http message", "err", err)
 		return
+	}
+	// Legacy backends are excluded: x-mcp-header does not exist in 2025-11-25,
+	// so judging a legacy server's schemas against SEP-2243 — and deleting the
+	// tools that fail — would enforce a rule its author never agreed to.
+	if req != nil && !c.backend.Legacy &&
+		req.Method == mcpspec.MethodToolsList && m.Kind() == jsonrpc.KindResponse {
+		c.absorbToolsList(m)
 	}
 	c.deliver(m)
 }
@@ -324,6 +493,279 @@ func (c *httpConn) Close() error {
 		close(c.done)
 	})
 	return nil
+}
+
+// annotationProbeID is the JSON-RPC id of the out-of-band tools/list the
+// backend issues to (re)learn x-mcp-header annotations. It never reaches the
+// inbox, so it cannot collide with a muxed caller id.
+const annotationProbeID = "natsmcp-annotations"
+
+// errorBodyLimit bounds a 4xx/5xx body read. Big enough for a JSON-RPC error
+// whose data enumerates expected headers — the old 4KiB cap truncated those
+// and lost the retry that recognizes them — and small enough that a backend
+// outage does not have every failing call pull a megabyte of HTML off the
+// wire only to discard it.
+const errorBodyLimit = 64 << 10
+
+// schemaAnnotationBytes is the cheap presence test that keeps the schema walk
+// off the delivery path of servers that publish no annotations.
+var schemaAnnotationBytes = []byte(mcpspec.SchemaHeaderAnnotation)
+
+const (
+	// annotationProbeTimeout bounds one out-of-band schema fetch.
+	annotationProbeTimeout = 30 * time.Second
+	// annotationProbeMaxPages bounds cursor following on a paginated
+	// tools/list, so a server with a runaway cursor cannot loop us forever.
+	annotationProbeMaxPages = 50
+)
+
+// absorbToolsList learns each tool's x-mcp-header annotations and removes any
+// tool whose annotations are invalid. Exclusion is what the spec asks for:
+// one malformed definition must not cost a server its whole toolset, and
+// silently keeping it would leave the client unable to call it successfully.
+func (c *httpConn) absorbToolsList(m *jsonrpc.Message) {
+	if m.Error != nil || len(m.Result) == 0 {
+		return
+	}
+	// A listing with the annotation nowhere in it needs no parsing at all —
+	// which is every server that does not use the feature, i.e. all of them
+	// today. Recording the fact is what stops a -32020 raised for some other
+	// reason from re-probing on every single call thereafter.
+	if !bytes.Contains(m.Result, schemaAnnotationBytes) {
+		c.mu.Lock()
+		c.annotationsKnown = true
+		c.mu.Unlock()
+		return
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(m.Result, &result) != nil {
+		return
+	}
+	var tools []json.RawMessage
+	if raw, ok := result["tools"]; !ok || json.Unmarshal(raw, &tools) != nil {
+		return
+	}
+
+	learned := map[string][]headerParam{}
+	var invalid []string
+	kept := make([]json.RawMessage, 0, len(tools))
+	for _, t := range tools {
+		var def struct {
+			Name        string          `json:"name"`
+			InputSchema json.RawMessage `json:"inputSchema"`
+		}
+		if json.Unmarshal(t, &def) != nil || def.Name == "" {
+			kept = append(kept, t) // not ours to judge
+			continue
+		}
+		params, err := parseToolAnnotations(def.InputSchema)
+		if err != nil {
+			c.log.Warn("excluding tool with an invalid x-mcp-header annotation",
+				"tool", def.Name, "reason", err.Error())
+			invalid = append(invalid, def.Name)
+			continue
+		}
+		learned[def.Name] = params
+		kept = append(kept, t)
+	}
+
+	c.mu.Lock()
+	c.annotationsKnown = true
+	if c.annotations == nil {
+		c.annotations = make(map[string][]headerParam, len(learned))
+	}
+	// Merged, not replaced: tools/list is paginated, so one response is not
+	// necessarily the whole toolset.
+	maps.Copy(c.annotations, learned)
+	for _, name := range invalid {
+		delete(c.annotations, name)
+	}
+	c.mu.Unlock()
+
+	if len(invalid) == 0 {
+		return
+	}
+	// Re-encoded WITHOUT HTML escaping. Dropping a tool means rebuilding the
+	// array, but json.Marshal would rewrite every < > and & inside every
+	// remaining description and schema — the same payload rewriting the legacy
+	// bridge splices to avoid (pkg/backend/legacy: spliceFields).
+	if encoded, err := marshalNoEscape(kept); err == nil {
+		result["tools"] = encoded
+		if out, err := marshalNoEscape(result); err == nil {
+			m.Result = out
+		}
+	}
+}
+
+// marshalNoEscape encodes v with HTML escaping off, so <, > and & inside
+// strings survive as themselves.
+func marshalNoEscape(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// refreshAnnotations re-reads tool schemas out of band. The response is
+// consumed here and never delivered — no caller asked for it.
+//
+// One conn is shared by many concurrent callers, and a cold conn can have
+// dozens of tools/call rejected at once. Without collapsing them, each would
+// POST its own tools/list. Callers that arrive while a refresh is running
+// wait for it and then use its result: the generation counter tells them
+// whether the work they were waiting on is the work they needed.
+func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
+	c.mu.Lock()
+	current := c.refreshGen
+	c.mu.Unlock()
+	if current != gen {
+		// A refresh that began after our request went out has since completed,
+		// so it saw at least as much as one starting now would. gen is sampled
+		// before the request for exactly this reason: a refresh that STARTED
+		// earlier and merely finished later proves nothing about what we need.
+		return nil
+	}
+
+	// The probe needs its own deadline. The conn's http.Client has no timeout
+	// (response streams are long-lived by design) and roundTrip runs under an
+	// uncancellable context, so a backend that accepts this POST and never
+	// answers would hold refreshMu for the life of the process — and every
+	// later recovery attempt behind it.
+	ctx, cancel := context.WithTimeout(ctx, annotationProbeTimeout)
+	defer cancel()
+
+	cursor := ""
+	for page := range annotationProbeMaxPages {
+		next, err := c.probeToolsPage(ctx, cursor)
+		if err != nil {
+			return err
+		}
+		cursor = next
+		if cursor == "" {
+			break
+		}
+		if page == annotationProbeMaxPages-1 {
+			// Never truncate silently: an unread page is a tool whose
+			// annotations we will keep failing to find.
+			c.log.Warn("stopped paging tools/list while learning annotations",
+				"pages", annotationProbeMaxPages)
+		}
+	}
+
+	// Bumped only on SUCCESS. A caller queued behind a failed refresh must go
+	// on to run its own — crediting it with work that did not happen would
+	// have it skip the retry and fail a call whose fix was available.
+	c.mu.Lock()
+	c.refreshGen++
+	c.mu.Unlock()
+	return nil
+}
+
+// probeToolsPage fetches one page of tools/list out of band and absorbs its
+// annotations, returning the next page's cursor ("" when done). The response
+// is consumed here and never delivered — no caller asked for it.
+func (c *httpConn) probeToolsPage(ctx context.Context, cursor string) (string, error) {
+	params := json.RawMessage(`{}`)
+	if cursor != "" {
+		encoded, err := json.Marshal(map[string]string{"cursor": cursor})
+		if err != nil {
+			return "", err
+		}
+		params = encoded
+	}
+	probe := jsonrpc.NewRequest(annotationProbeID, mcpspec.MethodToolsList, params)
+	body, err := jsonrpc.Encode(probe)
+	if err != nil {
+		return "", err
+	}
+	resp, err := c.doWithAuthRetry(ctx, body, probe, "", nil)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+
+	var data []byte
+	if strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+		if err := scanSSE(resp.Body, func(payload []byte) bool {
+			if m, err := jsonrpc.Decode(payload); err == nil && m.Kind() == jsonrpc.KindResponse {
+				data = payload
+				return false // the response ends the stream; stop reading
+			}
+			return true
+		}); err != nil {
+			return "", err
+		}
+	} else {
+		data, err = io.ReadAll(io.LimitReader(resp.Body, maxLineBytes))
+		if err != nil {
+			return "", err
+		}
+	}
+	m, err := jsonrpc.Decode(data)
+	if err != nil {
+		return "", err
+	}
+	if m.Error != nil {
+		return "", fmt.Errorf("tools/list rejected: %s", m.Error)
+	}
+	c.absorbToolsList(m)
+
+	var page struct {
+		NextCursor string `json:"nextCursor"`
+	}
+	_ = json.Unmarshal(m.Result, &page)
+	return page.NextCursor, nil
+}
+
+// paramHeadersFor renders the Mcp-Param-* headers for one request, if it is a
+// tools/call on a tool whose annotations we have already learned.
+func (c *httpConn) paramHeadersFor(msg *jsonrpc.Message, name string) map[string]string {
+	if msg.Kind() != jsonrpc.KindRequest || msg.Method != mcpspec.MethodToolsCall {
+		return nil
+	}
+	// Nothing learned yet means nothing to mirror, and on a backend that
+	// publishes no annotations that is every call. Check before parsing:
+	// tools/call arguments can be megabytes.
+	c.mu.Lock()
+	known := len(c.annotations)
+	c.mu.Unlock()
+	if known == 0 {
+		return nil
+	}
+	params := c.annotationsFor(name)
+	if len(params) == 0 {
+		return nil
+	}
+	var p struct {
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if json.Unmarshal(msg.Params, &p) != nil {
+		return nil
+	}
+	headers, skipped := paramHeaders(params, p.Arguments)
+	if len(skipped) > 0 {
+		// The backend will reject the call for the missing header and the
+		// recovery cannot help — the schema is already known. Say so, or the
+		// only trace is a -32020 with no explanation on this side.
+		c.log.Warn("tool argument cannot be mirrored into a header",
+			"tool", name, "params", skipped)
+	}
+	return headers
+}
+
+func (c *httpConn) annotationsFor(tool string) []headerParam {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.annotations[tool]
 }
 
 // paramsName extracts params.name / params.uri for the Mcp-Name header.

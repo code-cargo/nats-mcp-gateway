@@ -164,3 +164,85 @@ func TestLegacyInitializeWithNoGateway(t *testing.T) {
 	assert.Equal(t, wire.ErrCodeNoGateway, m.Error.Code)
 	assert.JSONEq(t, `0`, string(m.ID))
 }
+
+func TestDiscoverServerInfoPrefersMetaAndFallsBack(t *testing.T) {
+	const final = `{"name":"final","version":"2"}`
+	const draft = `{"name":"draft","version":"1"}`
+
+	tests := []struct {
+		name     string
+		meta     map[string]json.RawMessage
+		topLevel json.RawMessage
+		want     string
+	}{
+		{
+			name: "final shape: _meta only",
+			meta: map[string]json.RawMessage{mcpspec.MetaServerInfo: json.RawMessage(final)},
+			want: final,
+		},
+		{
+			// A backend built against the draft as it stood before 2026-07-16
+			// still identifies itself, rather than reaching the client as {}.
+			name:     "pre-final shape: top level only",
+			topLevel: json.RawMessage(draft),
+			want:     draft,
+		},
+		{
+			// Belt and braces during the transition: _meta is authoritative.
+			name:     "both present",
+			meta:     map[string]json.RawMessage{mcpspec.MetaServerInfo: json.RawMessage(final)},
+			topLevel: json.RawMessage(draft),
+			want:     final,
+		},
+		{
+			name:     "an empty _meta value does not mask the top level",
+			meta:     map[string]json.RawMessage{mcpspec.MetaServerInfo: json.RawMessage("")},
+			topLevel: json.RawMessage(draft),
+			want:     draft,
+		},
+		{name: "neither", want: ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := discoverServerInfo(tc.meta, tc.topLevel)
+			assert.Equal(t, tc.want, string(got))
+		})
+	}
+}
+
+func TestLegacyMetaHandlesNullCapabilities(t *testing.T) {
+	// A 2025-11-25 client may send "capabilities": null. That is neither an
+	// object nor an absent field, and clientCapabilities is REQUIRED — so
+	// forwarding it verbatim hands a strict backend something it must reject.
+	for _, caps := range []string{``, `null`, ` null `, `{}`} {
+		l := &legacyClient{clientCaps: json.RawMessage(caps)}
+		got := l.legacyMeta()
+		assert.JSONEq(t, `{}`, string(got[mcpspec.MetaClientCapabilities]),
+			"capabilities %q must normalize to an empty object", caps)
+	}
+
+	// A real capability set is passed through untouched.
+	l := &legacyClient{clientCaps: json.RawMessage(`{"roots":{}}`)}
+	assert.JSONEq(t, `{"roots":{}}`,
+		string(l.legacyMeta()[mcpspec.MetaClientCapabilities]))
+}
+
+func TestLegacyMetaOmitsAbsentClientInfo(t *testing.T) {
+	// clientInfo is only SHOULD, so an unidentified client gets no key —
+	// but a null must not be forwarded as if it were an identity either.
+	for _, info := range []string{``, `null`} {
+		l := &legacyClient{clientInfo: json.RawMessage(info)}
+		assert.NotContains(t, l.legacyMeta(), mcpspec.MetaClientInfo)
+	}
+	l := &legacyClient{clientInfo: json.RawMessage(`{"name":"x"}`)}
+	assert.Contains(t, l.legacyMeta(), mcpspec.MetaClientInfo)
+}
+
+func TestDiscoverServerInfoIgnoresNullMeta(t *testing.T) {
+	got := discoverServerInfo(
+		map[string]json.RawMessage{mcpspec.MetaServerInfo: json.RawMessage(`null`)},
+		json.RawMessage(`{"name":"draft"}`),
+	)
+	assert.JSONEq(t, `{"name":"draft"}`, string(got),
+		"a null _meta value must not mask a usable top-level one")
+}

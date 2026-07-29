@@ -88,8 +88,31 @@ type Server struct {
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
 
-	// DiscoverTTLMs is served in DiscoverResult.ttlMs (default 300000).
+	// DiscoverTTLMs is the freshness hint served as ttlMs on the results this
+	// gateway synthesizes or bridges for a legacy server (default 300000).
+	//
+	// Applies only to a bridged legacy server; a 2026-07-28 server sets its
+	// own hints and this field is ignored for it.
+	//
+	// It covers server/discover and the *list* methods — the server's shape,
+	// which changes rarely and whose changes this bridge forwards as
+	// */list_changed. It deliberately does NOT apply to resources/read: that
+	// returns content, for which a 2025-11-25 server offers no invalidation
+	// signal, so those results are always hinted as immediately stale.
 	DiscoverTTLMs int `json:"discoverTtlMs"`
+
+	// CacheScope is served as cacheScope on every cacheable result the
+	// gateway bridges for a LEGACY server: "private" (default) or "public".
+	// A 2026-07-28 server sets its own and is passed through untouched, so
+	// setting this on one is rejected rather than silently ignored.
+	//
+	// The default is deliberately the restrictive one. Backends are pooled
+	// per (server, tenant[, user, credential-generation]) and credentials are
+	// injected per caller, so a result is generally NOT safe for a shared
+	// cache to hand to a different authorization context — which is exactly
+	// what "public" licenses. Set it only for a server whose listings are
+	// provably identical for every caller.
+	CacheScope string `json:"cacheScope"`
 
 	// Auth selects how backend credentials are resolved (absent = static =
 	// env/headers above). Additive by design: an older gateway ignoring this
@@ -318,6 +341,31 @@ func (c *Config) validate() error {
 		case "", mcpspec.LegacyProtocolVersion, mcpspec.ProtocolVersion:
 		default:
 			return fmt.Errorf("server %q: unknown protocol %q", name, s.Protocol)
+		}
+		// Rejected rather than defaulted: a typo'd cacheScope silently
+		// becoming "private" is fine, but silently becoming "public" would
+		// license shared caches to cross authorization contexts.
+		switch s.CacheScope {
+		case "", mcpspec.CacheScopePrivate, mcpspec.CacheScopePublic:
+		default:
+			return fmt.Errorf("server %q: unknown cacheScope %q (want %q or %q)",
+				name, s.CacheScope, mcpspec.CacheScopePrivate, mcpspec.CacheScopePublic)
+		}
+		// cacheScope is consumed only by the legacy bridge — a modern server
+		// emits its own hints and is passed through untouched. Rejected rather
+		// than ignored so an operator cannot come away believing they had
+		// constrained sharing when nothing reads the setting.
+		//
+		// discoverTtlMs gets no such check even though it is equally
+		// bridge-only: it predates this validation, so configs already carry it
+		// on modern servers. Failing them now would break a running fleet's
+		// hot reload (pkg/configsource) to correct a harmless no-op. Its doc
+		// comment says where it applies.
+		if s.CacheScope != "" && s.Protocol == mcpspec.ProtocolVersion {
+			return fmt.Errorf(
+				"server %q: cacheScope applies only to bridged %s servers; a %s server sets its own",
+				name, mcpspec.LegacyProtocolVersion, mcpspec.ProtocolVersion,
+			)
 		}
 		switch s.Transport {
 		case "", "stdio":

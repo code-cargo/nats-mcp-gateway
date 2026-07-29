@@ -107,8 +107,23 @@ func (s *server) send(m *jsonrpc.Message) {
 	s.out.Flush()
 }
 
+// result sends a JSON-RPC result. In legacy mode the fields that only exist
+// from 2026-07-28 are stripped: a 2025-11-25 server has no concept of them,
+// and leaving them in would let the legacy bridge's own stamping pass its
+// tests without ever running.
 func (s *server) result(id json.RawMessage, v any) {
 	raw, _ := json.Marshal(v)
+	if s.legacy {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) == nil && obj != nil {
+			delete(obj, "resultType")
+			delete(obj, "ttlMs")
+			delete(obj, "cacheScope")
+			if stripped, err := json.Marshal(obj); err == nil {
+				raw = stripped
+			}
+		}
+	}
 	s.send(jsonrpc.NewResponse(id, raw))
 }
 
@@ -178,11 +193,18 @@ func (s *server) handle(msg *jsonrpc.Message) {
 			"resultType":        mcpspec.ResultTypeComplete,
 			"supportedVersions": []string{mcpspec.ProtocolVersion},
 			"capabilities":      map[string]any{"tools": map[string]any{"listChanged": true}},
-			"serverInfo":        map[string]any{"name": "fakemcp", "version": "1.0.0"},
+			"ttlMs":             300000,
+			"cacheScope":        mcpspec.CacheScopePrivate,
+			// serverInfo rides in result _meta as of 2026-07-16.
+			"_meta": map[string]any{
+				mcpspec.MetaServerInfo: map[string]any{"name": "fakemcp", "version": "1.0.0"},
+			},
 		})
-	case "tools/list":
+	case mcpspec.MethodToolsList:
 		s.result(msg.ID, map[string]any{
 			"resultType": mcpspec.ResultTypeComplete,
+			"ttlMs":      300000,
+			"cacheScope": mcpspec.CacheScopePrivate,
 			"tools": []map[string]any{
 				{"name": "echo", "description": "echoes arguments", "inputSchema": map[string]any{"type": "object"}},
 				{"name": "slow", "description": "emits progress then a result", "inputSchema": map[string]any{"type": "object"}},

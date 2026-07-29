@@ -27,6 +27,7 @@ import (
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend/cred"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
 
@@ -72,8 +73,15 @@ func (p *Proxy) Handler() wire.Handler {
 			"server", in.Subject.Server,
 			"method", in.Subject.Method,
 		)
-		if in.Header.Get(wire.HeaderName) != "" {
-			reqLog = reqLog.With("name", in.Header.Get(wire.HeaderName))
+		if raw := in.Header.Get(wire.HeaderName); raw != "" {
+			// Decoded for the log: a name that needed sentinel encoding is
+			// precisely the one an operator will struggle to trace, so it
+			// must not appear in the audit trail as a base64 blob.
+			name, err := mcpspec.DecodeHeaderValue(raw)
+			if err != nil {
+				name = raw
+			}
+			reqLog = reqLog.With("name", name)
 		}
 		defer func() {
 			attrs := []any{

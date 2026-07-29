@@ -37,6 +37,13 @@ import (
 //
 // Any disagreement is a single error code, -32020, mirroring the spec's
 // treatment of the same bug at the Streamable HTTP edge.
+//
+// What this is NOT is a schema validator. clientCapabilities is required on a
+// 2026-07-28 request, but it is mirrored into no header and named by no
+// subject token, so there is nothing here for it to disagree with — the
+// backend judges it, as it judges every other body field. Adding presence
+// checks for individual body fields here would make the gateway a second,
+// partial implementation of a schema the wire otherwise moves opaquely.
 
 // CheckError is an integrity failure with its JSON-RPC error code and
 // optional data payload.
@@ -98,7 +105,14 @@ func Check(in *wire.Inbound) *CheckError {
 		if bodyName == "" {
 			return mismatch("method %q requires a name/uri in params", msg.Method)
 		}
-		if hn := in.Header.Get(wire.HeaderName); hn != bodyName {
+		// Decode before comparing: a name that is not header-safe (a resource
+		// URI, a tool named in a non-Latin script) arrives base64-sentinel
+		// encoded, and a raw comparison would reject a conformant client.
+		hn, err := mcpspec.DecodeHeaderValue(in.Header.Get(wire.HeaderName))
+		if err != nil {
+			return mismatch("Mcp-Name header is malformed: %v", err)
+		}
+		if hn != bodyName {
 			return mismatch("Mcp-Name header %q does not match body name %q", hn, bodyName)
 		}
 	}
@@ -122,7 +136,11 @@ func Check(in *wire.Inbound) *CheckError {
 	if raw, ok := probe.Meta[mcpspec.MetaProtocolVersion]; ok {
 		_ = json.Unmarshal(raw, &bodyVer)
 	}
-	if hv := in.Header.Get(wire.HeaderProtocolVersion); hv != bodyVer {
+	hv, err := mcpspec.DecodeHeaderValue(in.Header.Get(wire.HeaderProtocolVersion))
+	if err != nil {
+		return mismatch("MCP-Protocol-Version header is malformed: %v", err)
+	}
+	if hv != bodyVer {
 		return mismatch("MCP-Protocol-Version header %q does not match body _meta %q", hv, bodyVer)
 	}
 	if !mcpspec.IsSupportedProtocolVersion(bodyVer) {
