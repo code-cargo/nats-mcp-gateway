@@ -239,14 +239,26 @@ func (c *httpConn) doWithAuthRetry(ctx context.Context, body []byte, msg *jsonrp
 // roundTripOnce performs one HTTP exchange. retried marks the reissue after a
 // header mismatch, so the recovery cannot recurse.
 func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.Message, retried bool) {
-	// Parsed once and threaded through: params can be megabytes, and the
-	// name is wanted by the Mcp-Name header, the mirrored parameter headers
-	// and the recovery below.
-	name := paramsName(msg)
+	// Parsed once and threaded through: params can be megabytes, and the name
+	// is wanted by the Mcp-Name header, the mirrored parameter headers and the
+	// recovery below. DecodeParams also walks the whole document to reject
+	// ambiguous keys, so re-decoding per consumer would multiply the one cost
+	// this comment exists to avoid.
+	params, err := mcpspec.DecodeParams(msg.Params)
+	if err != nil {
+		// Unreachable from the wire — pkg/proxy.Check decoded the same bytes
+		// before authorizing them — but this Conn is also driven directly by
+		// tests and by the legacy bridge, so it must not invent a name.
+		params = mcpspec.Params{}
+	}
+	name, _, err := params.Name(msg.Method)
+	if err != nil {
+		name = ""
+	}
 	// Captured before the request goes out, so the recovery can compare what
 	// this request actually carried against what it would carry now, and can
 	// tell a refresh that postdates it from one that merely finished later.
-	sent := c.paramHeadersFor(msg, name)
+	sent := c.paramHeadersFor(msg, params, name)
 	c.mu.Lock()
 	gen := c.refreshGen
 	c.mu.Unlock()
@@ -285,7 +297,7 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 		// drops at debug level. fail() logs it instead, which is the whole
 		// visibility a backend rejecting our cancellations will ever get.
 		if rpcErr, ok := decodeRPCError(data); ok && msg.Kind() == jsonrpc.KindRequest {
-			if c.retryWithParamHeaders(ctx, rpcErr, body, msg, name, sent, gen, retried) {
+			if c.retryWithParamHeaders(ctx, rpcErr, body, msg, params, name, sent, gen, retried) {
 				return
 			}
 			// Logged as well as delivered. The caller gets the RPC error, but a
@@ -334,7 +346,7 @@ func decodeRPCError(body []byte) (*jsonrpc.Message, bool) {
 //
 // This is why the gateway can stay schema-blind on the fast path — it learns
 // a schema only when a backend tells it that it needed one.
-func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Message, body []byte, msg *jsonrpc.Message, name string, sent map[string]string, gen uint64, retried bool) bool {
+func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Message, body []byte, msg *jsonrpc.Message, params mcpspec.Params, name string, sent map[string]string, gen uint64, retried bool) bool {
 	if retried || c.backend.Legacy || msg.Method != mcpspec.MethodToolsCall ||
 		rpcErr.Error == nil || rpcErr.Error.Code != mcpspec.ErrHeaderMismatch {
 		return false
@@ -358,7 +370,7 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 	// taken after it failed. On a cold conn a concurrent caller's refresh may
 	// already have landed by then, and a before/after snapshot would show no
 	// change even though this request went out with no headers at all.
-	now := c.paramHeadersFor(msg, name)
+	now := c.paramHeadersFor(msg, params, name)
 	if maps.Equal(sent, now) {
 		// The reissue would be byte-identical and earn the same rejection: the
 		// mismatch was about something mirroring cannot fix.
@@ -728,30 +740,30 @@ func (c *httpConn) probeToolsPage(ctx context.Context, cursor string) (string, e
 
 // paramHeadersFor renders the Mcp-Param-* headers for one request, if it is a
 // tools/call on a tool whose annotations we have already learned.
-func (c *httpConn) paramHeadersFor(msg *jsonrpc.Message, name string) map[string]string {
+func (c *httpConn) paramHeadersFor(msg *jsonrpc.Message, params mcpspec.Params, name string) map[string]string {
 	if msg.Kind() != jsonrpc.KindRequest || msg.Method != mcpspec.MethodToolsCall {
 		return nil
 	}
 	// Nothing learned yet means nothing to mirror, and on a backend that
-	// publishes no annotations that is every call. Check before parsing:
-	// tools/call arguments can be megabytes.
+	// publishes no annotations that is every call.
 	c.mu.Lock()
 	known := len(c.annotations)
 	c.mu.Unlock()
 	if known == 0 {
 		return nil
 	}
-	params := c.annotationsFor(name)
-	if len(params) == 0 {
+	annots := c.annotationsFor(name)
+	if len(annots) == 0 {
 		return nil
 	}
-	var p struct {
-		Arguments json.RawMessage `json:"arguments"`
-	}
-	if json.Unmarshal(msg.Params, &p) != nil {
+	// Raw, not a plain map index: reading "arguments" is what obliges the
+	// gateway to refuse an "ARGUMENTS" sibling that a case-folding backend
+	// would bind instead.
+	args, ok, err := params.Raw("arguments")
+	if err != nil || !ok {
 		return nil
 	}
-	headers, skipped := paramHeaders(params, p.Arguments)
+	headers, skipped := paramHeaders(annots, args)
 	if len(skipped) > 0 {
 		// The backend will reject the call for the missing header and the
 		// recovery cannot help — the schema is already known. Say so, or the
@@ -766,20 +778,4 @@ func (c *httpConn) annotationsFor(tool string) []headerParam {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.annotations[tool]
-}
-
-// paramsName extracts params.name / params.uri for the Mcp-Name header.
-func paramsName(msg *jsonrpc.Message) string {
-	var p struct {
-		Name string `json:"name"`
-		URI  string `json:"uri"`
-	}
-	_ = json.Unmarshal(msg.Params, &p)
-	switch msg.Method {
-	case mcpspec.MethodToolsCall, mcpspec.MethodPromptsGet:
-		return p.Name
-	case mcpspec.MethodResourcesRead:
-		return p.URI
-	}
-	return ""
 }

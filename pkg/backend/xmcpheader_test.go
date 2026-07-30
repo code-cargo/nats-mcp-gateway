@@ -189,6 +189,41 @@ func TestParamHeadersRejectsUnsafeIntegers(t *testing.T) {
 	assert.Equal(t, "9007199254740991", got["Mcp-Param-Ok"])
 }
 
+// TestParamHeadersRefusesCaseCollidingArguments covers the mirrored-header
+// end of the key-smuggling class. mcpspec.DecodeParams rejects duplicate keys
+// at every depth before a request is authorized, but it deliberately allows
+// case-colliding keys inside opaque tool arguments — so the refusal has to
+// happen here, where an argument is actually read into a header the backend
+// routes on. The gateway does not know whether the parser at the far end
+// folds case, so it declines to pick a value rather than assert one.
+func TestParamHeadersRefusesCaseCollidingArguments(t *testing.T) {
+	got, skipped := paramHeaders(
+		[]headerParam{{name: "Region", path: []string{"region"}}},
+		json.RawMessage(`{"region":"us-west1","REGION":"eu-west1"}`),
+	)
+	assert.NotContains(t, got, "Mcp-Param-Region",
+		"a value two parsers read differently must not become a header")
+	assert.Equal(t, []string{"Region"}, skipped,
+		"the backend will reject the call for the missing header; say why")
+
+	// Same rule partway down a nested path.
+	got, skipped = paramHeaders(
+		[]headerParam{{name: "Zone", path: []string{"target", "zone"}}},
+		json.RawMessage(`{"target":{"zone":"a"},"TARGET":{"zone":"b"}}`),
+	)
+	assert.NotContains(t, got, "Mcp-Param-Zone")
+	assert.Equal(t, []string{"Zone"}, skipped)
+
+	// An unrelated collision elsewhere in the arguments is not this
+	// parameter's problem: only the path being read has to be unambiguous.
+	got, skipped = paramHeaders(
+		[]headerParam{{name: "Region", path: []string{"region"}}},
+		json.RawMessage(`{"region":"us-west1","note":"a","NOTE":"b"}`),
+	)
+	assert.Equal(t, "us-west1", got["Mcp-Param-Region"])
+	assert.Empty(t, skipped)
+}
+
 func TestParseToolAnnotationsToleratesOrdinarySchemas(t *testing.T) {
 	// Each of these is a well-formed tool. Rejecting any of them would delete
 	// it from tools/list entirely, so a false positive here is far more

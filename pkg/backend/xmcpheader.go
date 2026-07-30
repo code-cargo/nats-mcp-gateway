@@ -268,12 +268,17 @@ func paramHeaders(params []headerParam, arguments json.RawMessage) (map[string]s
 
 	out := map[string]string{}
 	// skipped names a parameter that IS present but cannot be rendered — an
-	// integer past the safe range, a float where the schema said integer. The
-	// server will reject the call for the missing header, so this is worth
-	// reporting; a parameter that is simply absent is not.
+	// integer past the safe range, a float where the schema said integer, a
+	// key whose case-variant sibling makes it unreadable. The server will
+	// reject the call for the missing header, so this is worth reporting; a
+	// parameter that is simply absent is not.
 	var skipped []string
 	for _, p := range params {
-		v, ok := valueAtPath(args, p.path)
+		v, ok, err := valueAtPath(args, p.path)
+		if err != nil {
+			skipped = append(skipped, p.name)
+			continue
+		}
 		if !ok {
 			continue
 		}
@@ -290,21 +295,45 @@ func paramHeaders(params []headerParam, arguments json.RawMessage) (map[string]s
 	return out, skipped
 }
 
-func valueAtPath(node any, path []string) (any, bool) {
+// valueAtPath reads the argument at path. It reports (nil, false) for a value
+// that is absent, and an error for one that is present but cannot be read
+// unambiguously — the caller distinguishes the two, because only the second
+// is worth telling an operator about.
+//
+// Keys match exactly, and a sibling differing only by case is a refusal
+// rather than a choice: this value becomes an Mcp-Param-* header the backend
+// routes on, and the gateway does not know whether the parser at the far end
+// folds case. Duplicate keys need no check here — mcpspec.DecodeParams
+// rejected those at every depth before the request was authorized.
+func valueAtPath(node any, path []string) (any, bool, error) {
 	for _, key := range path {
 		obj, ok := node.(map[string]any)
 		if !ok {
-			return nil, false
+			return nil, false, nil
+		}
+		if err := caseUniqueAt(obj, key); err != nil {
+			return nil, false, err
 		}
 		node, ok = obj[key]
 		if !ok {
-			return nil, false
+			return nil, false, nil
 		}
 	}
 	if node == nil {
-		return nil, false // explicit null: the header is omitted
+		return nil, false, nil // explicit null: the header is omitted
 	}
-	return node, true
+	return node, true, nil
+}
+
+// caseUniqueAt reports an error if obj holds a key that differs from key only
+// by case, using the gateway's single definition of that relation.
+func caseUniqueAt(obj map[string]any, key string) error {
+	for other := range obj {
+		if other != key && mcpspec.EqualFoldKey(other, key) {
+			return fmt.Errorf("arguments contain both %q and %q", key, other)
+		}
+	}
+	return nil
 }
 
 // maxSafeInteger is JavaScript's Number.MAX_SAFE_INTEGER (2^53-1), the bound
