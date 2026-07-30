@@ -450,20 +450,34 @@ func TestIntegrityLeavesToolArgumentsAlone(t *testing.T) {
 func TestIntegrityAuthorizesTheBytesItForwards(t *testing.T) {
 	m := metaJSON()
 	bodies := []struct{ subject, method, hName, params string }{
-		{"mcp.v1.req.acme.u1.gh.tools.call.get_issue", "tools/call", "get_issue",
-			`{"name":"get_issue",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.tools.call.get_issue", "tools/call", "get_issue",
-			`{"name":"delete_repo","NAME":"get_issue",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.tools.call._", "tools/call", "_",
-			`{"name":"delete_repo","Name":"_",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.tools.call.b", "tools/call", "b",
-			`{"name":"a","name":"b",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.prompts.get.safe", "prompts/get", "safe",
-			`{"name":"safe",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.resources.read._", "resources/read", "file:///allowed",
-			`{"uri":"file:///etc/shadow","URI":"file:///allowed",` + m + `}`},
-		{"mcp.v1.req.acme.u1.gh.resources.read._", "resources/read", "file:///allowed",
-			`{"uri":"file:///allowed",` + m + `}`},
+		{
+			"mcp.v1.req.acme.u1.gh.tools.call.get_issue", "tools/call", "get_issue",
+			`{"name":"get_issue",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.tools.call.get_issue", "tools/call", "get_issue",
+			`{"name":"delete_repo","NAME":"get_issue",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.tools.call._", "tools/call", "_",
+			`{"name":"delete_repo","Name":"_",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.tools.call.b", "tools/call", "b",
+			`{"name":"a","name":"b",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.prompts.get.safe", "prompts/get", "safe",
+			`{"name":"safe",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.resources.read._", "resources/read", "file:///allowed",
+			`{"uri":"file:///etc/shadow","URI":"file:///allowed",` + m + `}`,
+		},
+		{
+			"mcp.v1.req.acme.u1.gh.resources.read._", "resources/read", "file:///allowed",
+			`{"uri":"file:///allowed",` + m + `}`,
+		},
 	}
 	for _, b := range bodies {
 		t.Run(b.params, func(t *testing.T) {

@@ -119,7 +119,8 @@ func TestCaseCollisionUsesFoldingNotLowercasing(t *testing.T) {
 func TestMetaAllowsThirdPartyCaseCollisions(t *testing.T) {
 	p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
 		`{"_meta":{%q:%q,"com.acme/trace":"x","com.acme/Trace":"y"}}`,
-		MetaProtocolVersion, ProtocolVersion)))
+		MetaProtocolVersion, ProtocolVersion,
+	)))
 	require.NoError(t, err)
 
 	ver, err := p.ProtocolVersion()
@@ -137,7 +138,8 @@ func TestMetaRejectsCollisionOnTheKeyItReads(t *testing.T) {
 	} {
 		p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
 			`{"_meta":{%q:%q,%q:"1999-01-01"}}`,
-			MetaProtocolVersion, ProtocolVersion, forged)))
+			MetaProtocolVersion, ProtocolVersion, forged,
+		)))
 		require.NoError(t, err)
 
 		_, err = p.ProtocolVersion()
@@ -243,7 +245,8 @@ func TestNameFieldCoversEveryNamedMethod(t *testing.T) {
 
 func TestProtocolVersion(t *testing.T) {
 	p, err := DecodeParams(json.RawMessage(
-		`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`))
+		`{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}`,
+	))
 	require.NoError(t, err)
 	ver, err := p.ProtocolVersion()
 	require.NoError(t, err)
@@ -258,7 +261,8 @@ func TestProtocolVersion(t *testing.T) {
 	assert.Error(t, err)
 
 	p, err = DecodeParams(json.RawMessage(
-		`{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728}}`))
+		`{"_meta":{"io.modelcontextprotocol/protocolVersion":20260728}}`,
+	))
 	require.NoError(t, err)
 	_, err = p.ProtocolVersion()
 	assert.Error(t, err)
