@@ -233,3 +233,61 @@ func TestShimInjectsMissingProtocolVersion(t *testing.T) {
 	require.NoError(t, json.Unmarshal(m.Result, &r))
 	assert.NotEmpty(t, r.Tools)
 }
+
+// TestShimRejectsAmbiguousParams covers the shim's refusal to guess.
+//
+// The shim builds the subject and the Mcp-Name header from params, and the
+// gateway then checks the body against exactly those. So a body the shim
+// cannot read unambiguously is one it must not publish: whichever reading it
+// picked would be a claim about a body that has no single meaning. Each case
+// here is answered locally, and nothing reaches the wire.
+//
+// -32600 rather than the -32020 the gateway answers the same
+// mcpspec.AmbiguousKeyError with: at this point no headers exist to disagree
+// with the body, so this is simply a request the shim cannot interpret.
+func TestShimRejectsAmbiguousParams(t *testing.T) {
+	meta := fmt.Sprintf(`"_meta":{%q:%q}`, mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion)
+	tests := []struct {
+		name   string
+		params string
+	}{
+		{"duplicate name key", `{"name":"a","name":"b",` + meta + `}`},
+		{"case-colliding name key", `{"name":"a","NAME":"b",` + meta + `}`},
+		{"duplicate key nested in arguments", `{"name":"echo","arguments":{"k":1,"k":2},` + meta + `}`},
+		{"name is not a string", `{"name":{"toString":"echo"},` + meta + `}`},
+		{"params is an array", `[]`},
+		{"colliding protocol version key in _meta", fmt.Sprintf(
+			`{"name":"echo","_meta":{%q:%q,"io.modelcontextprotocol/protocolversion":"1999-01-01"}}`,
+			mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// No gateway: if the shim published anything, the request would
+			// hang and time out rather than answer, which is the failure this
+			// test is looking for.
+			h := newHarness(t, false)
+			h.send(t, fmt.Sprintf(
+				`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":%s}`, tt.params))
+
+			line := h.next(t, 10*time.Second)
+			m, err := jsonrpc.Decode([]byte(line))
+			require.NoError(t, err)
+			require.NotNil(t, m.Error, "ambiguous params must be refused, got %s", line)
+			assert.Equal(t, jsonrpc.CodeInvalidRequest, m.Error.Code)
+			assert.JSONEq(t, `"1"`, string(m.ID), "the error must answer the caller's id")
+			assert.NotEmpty(t, m.Error.Message, "the message carries which key was ambiguous")
+		})
+	}
+}
+
+// TestShimAcceptsCaseCollisionsInsideToolArguments pins the other side of the
+// rule. Tool arguments are opaque caller data whose keys the shim never
+// reads, so two of them differing only by case is legal and must travel.
+func TestShimAcceptsCaseCollisionsInsideToolArguments(t *testing.T) {
+	h := newHarness(t, true)
+	h.send(t, req("1", "tools/call", `"name":"echo","arguments":{"Msg":"a","msg":"b"}`))
+	line := h.next(t, 10*time.Second)
+	m, err := jsonrpc.Decode([]byte(line))
+	require.NoError(t, err)
+	assert.Nil(t, m.Error, "opaque argument keys are none of the shim's business: %s", line)
+}
