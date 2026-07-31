@@ -339,11 +339,11 @@ func rewriteProgressToken(params json.RawMessage, muxToken string) (json.RawMess
 	if err != nil {
 		return nil, nil, false
 	}
-	orig, present := meta["progressToken"]
+	orig, present := meta[mcpspec.MetaProgressToken]
 	if !present {
 		return nil, nil, false
 	}
-	meta["progressToken"] = json.RawMessage(strconv.Quote(muxToken))
+	meta[mcpspec.MetaProgressToken] = json.RawMessage(strconv.Quote(muxToken))
 	metaRaw, err := marshalNoEscape(meta)
 	if err != nil {
 		return nil, nil, false

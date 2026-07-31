@@ -288,6 +288,16 @@ func TestIntegrityRejectsKeySmuggling(t *testing.T) {
 				mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion),
 		},
 		{
+			// progressToken is read and REWRITTEN in pkg/backend.Mux.Call, far
+			// past the point where a request can still be refused, and the
+			// rewrite leaves a case-variant sibling untouched. Caught here or
+			// not at all.
+			name:    "case-colliding progressToken inside _meta",
+			subject: callGetIssue, hMethod: "tools/call", hName: "get_issue",
+			params: fmt.Sprintf(`{"name":"get_issue","_meta":{%q:%q,"progressToken":"mine","ProgressToken":"gt7"}}`,
+				mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion),
+		},
+		{
 			name:    "duplicate protocol version inside _meta",
 			subject: listUnset, hMethod: "tools/list",
 			params: fmt.Sprintf(`{"_meta":{%q:%q,%q:"1999-01-01"}}`,

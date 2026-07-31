@@ -104,6 +104,13 @@ func Check(in *wire.Inbound) *CheckError {
 	if err != nil {
 		return badParams(err)
 	}
+	// _meta is an open extension bag, so only the keys the gateway acts on
+	// are held to the no-case-collision rule — and not all of them are read
+	// here. progressToken is read and rewritten later, in the backend mux,
+	// which is too late to refuse a request.
+	if err := params.CheckReadableMeta(); err != nil {
+		return badParams(err)
+	}
 
 	// Name: which body field is authoritative depends on the method.
 	bodyName, named, err := params.Name(msg.Method)

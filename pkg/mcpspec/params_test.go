@@ -256,6 +256,52 @@ func TestMetaRejectsCollisionOnTheKeyItReads(t *testing.T) {
 	}
 }
 
+// TestCheckReadableMetaCoversProgressToken guards a key the gateway reads in
+// ANOTHER package. pkg/backend.Mux.Call rewrites _meta.progressToken to a
+// mux-unique value so two concurrent callers cannot collide; that rewrite
+// replaces the exact key and leaves a case-variant sibling intact, so a
+// case-folding backend echoes the sibling back and the notification routes to
+// whoever registered that token. Declaring the key is what makes the rewrite
+// mean anything.
+func TestCheckReadableMetaCoversProgressToken(t *testing.T) {
+	for _, forged := range []string{"ProgressToken", "PROGRESSTOKEN", "progressToken"} {
+		p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
+			`{"name":"t","_meta":{%q:%q,%q:"gt7"}}`,
+			MetaProtocolVersion, ProtocolVersion, forged)))
+		require.NoError(t, err, "the collision is inside _meta, so the decode itself allows it")
+
+		err = p.CheckReadableMeta()
+		if forged == MetaProgressToken {
+			assert.NoError(t, err, "a single progressToken is ordinary")
+			continue
+		}
+		require.Error(t, err, "%q would be bound by a case-folding backend", forged)
+		var ambiguous *AmbiguousKeyError
+		assert.True(t, errors.As(err, &ambiguous))
+	}
+}
+
+// TestCheckReadableMetaLeavesUndeclaredKeysAlone is the counterpart: _meta is
+// an open extension bag, and a key the gateway never reads may be spelled two
+// ways without the request failing.
+func TestCheckReadableMetaLeavesUndeclaredKeysAlone(t *testing.T) {
+	p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
+		`{"name":"t","_meta":{%q:%q,"com.acme/trace":"x","com.acme/Trace":"y"}}`,
+		MetaProtocolVersion, ProtocolVersion)))
+	require.NoError(t, err)
+	assert.NoError(t, p.CheckReadableMeta())
+}
+
+// TestMetaKeysReadMatchesWhatIsRead is a tripwire, not a behavior test. The
+// reads it covers live in other packages, so nothing else notices when the
+// list and the readers drift apart.
+func TestMetaKeysReadMatchesWhatIsRead(t *testing.T) {
+	assert.Contains(t, metaKeysRead, MetaProtocolVersion, "read by pkg/proxy.Check")
+	assert.Contains(t, metaKeysRead, MetaProgressToken, "read and rewritten by pkg/backend.Mux.Call")
+	assert.NotContains(t, metaKeysRead, MetaSubscriptionID,
+		"subscriptionId appears only on backend-originated messages, which no caller controls")
+}
+
 // TestRawEnforcesCaseUniqueness covers the accessor pkg/backend reads
 // "arguments" through on its way to the Mcp-Param-* headers. Reaching for
 // raw bytes must not be a way around the rule.

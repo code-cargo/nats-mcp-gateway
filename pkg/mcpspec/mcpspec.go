@@ -96,6 +96,14 @@ const (
 	// response stream — the acknowledgment, each notification, and the
 	// graceful-closure response. Its value is the listen request's JSON-RPC id.
 	MetaSubscriptionID = "io.modelcontextprotocol/subscriptionId"
+	// MetaProgressToken opts a request into progress notifications. Not
+	// namespaced, unlike the keys above: it predates the reverse-DNS
+	// convention and the spec still spells it bare.
+	//
+	// The gateway does not merely read this one, it REWRITES it
+	// (pkg/backend.Mux.Call), so it is also named in params.go's list of
+	// _meta keys a request may not spell two ways.
+	MetaProgressToken = "progressToken"
 )
 
 // Result _meta keys. Added 2026-07-16, after this file's original

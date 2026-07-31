@@ -68,16 +68,23 @@ import (
 //
 //   - params itself: the whole object, because 2026-07-28 fixes its fields.
 //     Two keys there differing only by case are never both meant.
-//   - _meta, and tool arguments: only the key actually being read, checked
-//     against its siblings at the point of reading (Params.Raw, and
+//   - _meta, and tool arguments: only keys the gateway actually reads, held
+//     to the rule where they are read (Params.Raw, CheckReadableMeta, and
 //     pkg/backend.valueAtPath for arguments). Both are open extension bags —
 //     a third party's "com.acme/trace" and "com.acme/Trace" are two legal
 //     keys the gateway never looks at, and failing the request over them
 //     would reject conformant traffic to no one's benefit.
 //
 // Everything downstream of a successful DecodeParams may assume the document
-// has no duplicate key at any depth, and that no key it goes on to READ has a
-// case-colliding sibling.
+// has no duplicate key at any depth.
+//
+// Freedom from case collisions is narrower, and is NOT automatic. params has
+// it outright. Inside _meta and tool arguments it holds only for keys someone
+// DECLARED, so reading a new key out of either means declaring it — in
+// metaKeysRead for _meta, or along the walked path for arguments. An
+// undeclared read is not a compile error and not a test failure; it is a key
+// the gateway acts on and a backend may resolve differently, which is the
+// entire bug this file exists to prevent.
 
 // MetaField is the params key holding a request's _meta object.
 const MetaField = "_meta"
@@ -333,6 +340,40 @@ func (p Params) Name(method string) (name string, named bool, err error) {
 	}
 	name, err = p.String(field)
 	return name, true, err
+}
+
+// metaKeysRead are the request _meta keys this gateway acts on, and therefore
+// the ones a request may not spell two ways. Everything else in _meta is a
+// third party's business — see unambiguous.
+//
+// The list exists because the reads are NOT all in this package, so nothing
+// else would keep them together. Add a key here when the gateway starts
+// reading it, or CheckReadableMeta silently stops covering it.
+var metaKeysRead = []string{MetaProtocolVersion, MetaProgressToken}
+
+// CheckReadableMeta verifies that every _meta key the gateway acts on can be
+// read unambiguously — no sibling a case-folding parser would bind instead.
+//
+// protocolVersion is read by the integrity check, a few lines from here.
+// progressToken is read AND REWRITTEN much later, in pkg/backend.Mux.Call,
+// which swaps the caller's token for a mux-unique one precisely because two
+// concurrent callers may pick the same token. That rewrite replaces the exact
+// key and leaves a "ProgressToken" sibling untouched, so a case-folding
+// backend echoes the sibling back on its progress notifications — and the mux
+// routes those by token to whichever call registered it, which is another
+// caller sharing the tenant. Mux tokens are a counter, not a secret. Refusing
+// the collision here is what keeps the rewrite meaningful.
+func (p Params) CheckReadableMeta() error {
+	meta, err := p.Object(MetaField)
+	if err != nil {
+		return err
+	}
+	for _, key := range metaKeysRead {
+		if err := meta.unambiguous(key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ProtocolVersion reads params._meta[MetaProtocolVersion], "" when absent.
