@@ -93,32 +93,41 @@ func TestParseRejectsSameAsLoad(t *testing.T) {
 }
 
 // Forward-compat: a strict Parse rejects an unknown field (typo protection for
-// human-authored files), but ParseForwardCompatible ignores it — an older
+// human-authored files), but the machine-fed sources ignore it — an older
 // gateway must tolerate a config a newer controller emitted with fields it
 // doesn't know yet, rather than reject the whole config mid-rolling-upgrade.
-func TestParseForwardCompatibleIgnoresUnknownFields(t *testing.T) {
+func TestForwardCompatibleSourcesIgnoreUnknownFields(t *testing.T) {
 	raw := []byte(`{"servers":{"github":{"transport":"stdio","command":"gh-mcp","futureField":true}}}`)
 
 	_, err := Parse(raw)
 	require.Error(t, err, "strict Parse must reject unknown fields")
 	assert.Contains(t, err.Error(), "unknown field")
 
-	cfg, err := ParseForwardCompatible(raw)
-	require.NoError(t, err, "forward-compatible Parse must ignore unknown fields")
-	assert.Equal(t, []string{"github"}, cfg.ServerNames())
-	// Known fields still parse; the unknown one is simply dropped.
-	assert.Equal(t, "gh-mcp", cfg.Servers["github"].Command)
+	for name, parse := range map[string]func([]byte) (*Config, error){
+		"fetched": ParseFetched,
+		"inline":  ParseInline,
+	} {
+		cfg, err := parse(raw)
+		require.NoError(t, err, "%s: forward-compatible parse must ignore unknown fields", name)
+		assert.Equal(t, []string{"github"}, cfg.ServerNames(), name)
+		// Known fields still parse; the unknown one is simply dropped.
+		assert.Equal(t, "gh-mcp", cfg.Servers["github"].Command, name)
+	}
 }
 
-// ParseForwardCompatible still enforces validation — leniency is about
+// The forward-compatible sources still enforce validation — leniency is about
 // unknown fields, not about accepting invalid config.
-func TestParseForwardCompatibleStillValidates(t *testing.T) {
-	_, err := ParseForwardCompatible([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
+func TestForwardCompatibleSourcesStillValidate(t *testing.T) {
+	_, err := ParseFetched([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown transport")
 
-	_, err = ParseForwardCompatible([]byte(`{"servers":{"a__b":{"command":"x"}}}`))
+	_, err = ParseFetched([]byte(`{"servers":{"a__b":{"command":"x"}}}`))
 	require.Error(t, err, "reserved __ delimiter still rejected on the fetch path")
+
+	_, err = ParseInline([]byte(`{"servers":{"s":{"transport":"grpc"}}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unknown transport")
 }
 
 func TestAuthValidation(t *testing.T) {

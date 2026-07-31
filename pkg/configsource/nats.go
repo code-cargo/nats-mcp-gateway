@@ -31,8 +31,11 @@ import (
 // never at rest in a ConfigMap or KV bucket.
 //
 // Controller-side contract (the responder the platform provides):
-//   - Respond to RequestSubject with the config JSON that config.Parse
-//     accepts (the same schema the file source loads).
+//   - Respond to RequestSubject with the config JSON that config.ParseFetched
+//     accepts: the same schema the file source loads, but with credentials
+//     RESOLVED. ${VAR} is not expanded on this path and a reference in the
+//     reply is rejected, so the controller cannot make the gateway pod's own
+//     environment a second secret source.
 //   - Publish any message to EventSubject when the config changes.
 //
 // NATS permissions fence the control plane: only the controller's user may
@@ -82,10 +85,10 @@ func (s *NATS) fetch(ctx context.Context) (*config.Config, error) {
 	if svcErr := msg.Header.Get("Nats-Service-Error"); svcErr != "" {
 		return nil, fmt.Errorf("config responder error: %s", svcErr)
 	}
-	// Forward-compatible: an older gateway in a mixed fleet must tolerate a
-	// config the controller emitted with fields a newer build added, rather
-	// than reject the whole config during a rolling upgrade.
-	cfg, err := config.ParseForwardCompatible(msg.Data)
+	// Forward-compatible so an older gateway in a mixed fleet tolerates fields
+	// a newer build added, and unexpanded so the reply cannot reach into this
+	// pod's environment — the controller resolves secrets and sends values.
+	cfg, err := config.ParseFetched(msg.Data)
 	if err != nil {
 		return nil, fmt.Errorf("config from %q: %w", s.RequestSubject, err)
 	}

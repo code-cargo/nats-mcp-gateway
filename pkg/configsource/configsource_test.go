@@ -380,6 +380,37 @@ func TestNATSSourceRetriesUntilResponderUp(t *testing.T) {
 	}
 }
 
+// The controller holds the secrets and sends resolved values; the gateway pod's
+// own environment is not a second credential source for the documents it
+// fetches. Were it one, whoever can answer the config subject could name any
+// variable the pod happens to carry — its cloud role credentials, its NATS
+// password — and read it back out through a backend argument, environment
+// entry, or URL.
+func TestNATSSourceDoesNotExpandGatewayEnvironment(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET", "leak-me-not")
+	nc := runNATS(t)
+	sub, err := nc.Subscribe("cfg.request", func(m *nats.Msg) {
+		_ = m.Respond([]byte(`{"servers":{"gh":{"transport":"stdio","command":"cmd",` +
+			`"env":{"TOKEN":"${GATEWAY_SECRET}"}}}}`))
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	src := &NATS{
+		Conn:           nc,
+		RequestSubject: "cfg.request",
+		RequestTimeout: 200 * time.Millisecond,
+		BootTimeout:    time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	u := <-src.Watch(ctx)
+	require.Error(t, u.Err, "a fetched document reaching for the gateway's environment is refused")
+	assert.NotContains(t, u.Err.Error(), "leak-me-not", "and the refusal does not echo the value")
+	assert.Nil(t, u.Config)
+}
+
 func TestNATSSourceBootTimeoutFatal(t *testing.T) {
 	nc := runNATS(t)
 	src := &NATS{

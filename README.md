@@ -202,11 +202,24 @@ never share a process or a credential.
 }
 ```
 
-`protocol` defaults to `2025-11-25` (that is what exists in the wild).
+`protocol` defaults to `2025-11-25` (that is what exists in the wild). Set
+`max_payload: 8MB` on the NATS server: MCP results carry base64 blobs, and
+oversize messages fail with a legible `-32012` instead of a hang.
+
 `${VAR}` expands from the gateway's environment — the credential-injection
-point; clients never see backend secrets. Set `max_payload: 8MB` on the NATS
-server: MCP results carry base64 blobs, and oversize messages fail with a
-legible `-32012` instead of a hang.
+point; clients never see backend secrets. It applies to every string **value**
+in a document the operator authored (the file and inline sources; a *fetched*
+document is not expanded, see [Config
+sources](#config-sources--hot-reload)), and never to a key. Three rules keep a
+credential from being quietly mangled on its way to a backend:
+
+- An **undefined variable fails the load**, naming the field and the variable.
+  A typo'd `${GITHUB_TOKN}` that defaulted to empty would run the server with no
+  credential and surface hours later as an untraceable 401.
+- `${VAR}` is the **only** reference form, so a bare `$` is literal — `s$cret`
+  is the password you wrote, not `s`.
+- `$$` is a literal `$`, which is how a value containing `${` is written:
+  `$${TEMPLATE}` reaches the backend as `${TEMPLATE}`.
 
 ### Caching hints
 
@@ -464,10 +477,15 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
   `--config-refetch`): requests the config JSON over NATS and re-fetches when a
   change event is published (with a periodic re-fetch as the missed-event safety
   net). Secrets stay in the controller and ride only the authenticated NATS
-  connection — nothing at rest in a ConfigMap or KV bucket. **Controller
-  contract:** respond to the request subject with the same config JSON the file
-  source parses, and publish any message to the events subject on change; NATS
-  permissions fence both subjects to the controller.
+  connection — nothing at rest in a ConfigMap or KV bucket. A fetched document
+  is therefore **not** `${VAR}`-expanded, and a reference in one is rejected:
+  the controller resolves credentials itself, and expanding here would make the
+  gateway pod's own environment a second secret source that whoever answers the
+  subject could read back out through a backend argument, `env` entry, or URL.
+  **Controller contract:** respond to the request subject with the same config
+  JSON the file source parses (with values resolved, not `${VAR}` references),
+  and publish any message to the events subject on change; NATS permissions
+  fence both subjects to the controller.
 - **Inline** (`--config-json` / `NATSMCP_CONFIG_JSON`): the whole config
   document as a string, applied once and never reloaded — for pods with no file
   mount and no config responder (the scoped stdio deployment injects its one
