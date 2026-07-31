@@ -225,13 +225,14 @@ func foldKey(s string) string {
 func (p Params) checkCaseUnique() error {
 	folded := make(map[string]string, len(p))
 	for key := range p {
-		if prior, clash := folded[foldKey(key)]; clash {
+		canonical := foldKey(key)
+		if prior, clash := folded[canonical]; clash {
 			// Sorted so the message does not depend on Go's map iteration
 			// order, which would make the error text nondeterministic.
 			a, b := min(prior, key), max(prior, key)
 			return &AmbiguousKeyError{Key: b, Other: a}
 		}
-		folded[foldKey(key)] = key
+		folded[canonical] = key
 	}
 	return nil
 }

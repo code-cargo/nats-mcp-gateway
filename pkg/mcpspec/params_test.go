@@ -73,6 +73,72 @@ func TestDecodeParamsRejectsAmbiguousKeys(t *testing.T) {
 	}
 }
 
+// TestScanFrameSlotReuse guards a false-POSITIVE the scanner's frame
+// bookkeeping could reintroduce.
+//
+// scanUnambiguous pops a frame by reslicing and pushes the next one with
+// append, so a new object lands in the slot its previous sibling used. That
+// is safe only because the pushed composite literal zeroes the frame's key
+// set. Rewrite the push to mutate the reused slot in place — a natural-enough
+// optimization — and every one of these becomes a duplicate that is not
+// there, rejecting traffic the gateway has no quarrel with.
+//
+// Fuzzing covers this, but only in a run that sets -fuzztime; `go test`
+// replays the seed corpus alone, and no seed repeats a key across siblings.
+func TestScanFrameSlotReuse(t *testing.T) {
+	var promoted strings.Builder
+	promoted.WriteString(`{"big":{`)
+	for i := range smallObjectKeys + 9 {
+		if i > 0 {
+			promoted.WriteByte(',')
+		}
+		fmt.Fprintf(&promoted, `"k%d":1`, i)
+	}
+	promoted.WriteString(`},"next":{"k0":1,"k1":2}}`)
+
+	for _, input := range []string{
+		`{"xs":[{"k":1},{"k":2}]}`,
+		`{"xs":[{"k":1},{"k":2},{"k":3},{"k":4}]}`,
+		`{"a":{"k":1},"b":{"k":2}}`,
+		`{"deep":{"x":{"k":1}},"other":{"y":{"k":2}}}`,
+		// A sibling reusing the slot of an object that had PROMOTED to a map.
+		promoted.String(),
+	} {
+		_, err := DecodeParams(json.RawMessage(input))
+		assert.NoError(t, err, "sibling objects may repeat each other's keys: %s", input)
+	}
+}
+
+// TestScanFramePromotionBoundary guards the matching false-NEGATIVE.
+//
+// A frame compares up to smallObjectKeys keys by linear scan and then
+// promotes to a map, draining what it had already recorded. Lose that drain
+// and duplicates among the first smallObjectKeys keys of a large object stop
+// being detected — which is not a cosmetic failure but the authorization hole
+// this whole file exists to close, reopened silently.
+func TestScanFramePromotionBoundary(t *testing.T) {
+	// n distinct keys, then one more repeating the second: straddles the
+	// boundary as n crosses smallObjectKeys.
+	body := func(n int, extra string) string {
+		var sb strings.Builder
+		sb.WriteByte('{')
+		for i := range n {
+			fmt.Fprintf(&sb, `"k%d":%d,`, i, i)
+		}
+		fmt.Fprintf(&sb, "%q:99}", extra)
+		return sb.String()
+	}
+	for _, n := range []int{2, smallObjectKeys - 1, smallObjectKeys, smallObjectKeys + 1, smallObjectKeys + 24} {
+		_, err := DecodeParams(json.RawMessage(body(n, "k1")))
+		require.Error(t, err, "duplicate missed in a %d-key object", n)
+		var ambiguous *AmbiguousKeyError
+		assert.True(t, errors.As(err, &ambiguous))
+
+		_, err = DecodeParams(json.RawMessage(body(n, "unique")))
+		assert.NoError(t, err, "distinct keys flagged in a %d-key object", n)
+	}
+}
+
 // TestDecodeParamsLeavesNestedCaseCollisionsAlone pins the edge of the
 // case-uniqueness rule. Duplicate keys are rejected at every depth because no
 // parser agrees on them; case collisions are rejected only where the spec

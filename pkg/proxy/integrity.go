@@ -95,9 +95,11 @@ func Check(in *wire.Inbound) *CheckError {
 	}
 
 	// The body is forwarded verbatim, so it is read the way the backend will
-	// read it: exact keys, no duplicates, no case-colliding siblings. See
-	// pkg/mcpspec/params.go for why a tagged struct here was an authorization
-	// bypass rather than a stylistic choice.
+	// read it: exact keys, and no duplicate key at any depth. Keys differing
+	// only by case are refused across params, and — for _meta, read below —
+	// on the key actually being read. See pkg/mcpspec/params.go for why a
+	// tagged struct here was an authorization bypass rather than a stylistic
+	// choice.
 	params, err := mcpspec.DecodeParams(msg.Params)
 	if err != nil {
 		return badParams(err)

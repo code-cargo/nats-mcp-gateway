@@ -13,9 +13,17 @@
 //   limitations under the License.
 
 // Package mcpspec holds every constant copied from the MCP specification, in
-// one place. Verified against the FINAL 2026-07-28 revision (schema commit
+// one place, plus the one piece of behavior that is not a constant but must
+// not be reimplemented per caller: how a request's params are READ
+// (params.go). Verified against the FINAL 2026-07-28 revision (schema commit
 // f7e99af, the last before release): schema.ts plus the streamable-http,
 // subscriptions and caching pages. The draft window is closed.
+//
+// params.go lives here because reading a body is an authorization operation
+// for this gateway, not a convenience: the check and the backend must resolve
+// the same bytes to the same field, and every copy of that logic is a chance
+// for them to drift. It carries its own rationale — read it before changing
+// how a key is matched.
 //
 // A note for the next revision, because the last one taught it: this file was
 // written expecting to be "the entire re-verification surface", and it was
@@ -23,7 +31,8 @@
 // message SHAPES, not constants — serverInfo left DiscoverResult for result
 // _meta, and subscriptions/listen gained a closure envelope — and those live
 // in pkg/backend/legacy and pkg/shim. Centralizing the names does not
-// centralize the structures. Re-verify those two packages as well.
+// centralize the structures. Re-verify those two packages as well, and
+// params.go's NameField, which encodes which params field names a call.
 package mcpspec
 
 // Protocol versions.
