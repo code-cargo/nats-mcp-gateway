@@ -764,10 +764,10 @@ func (w *streamWriter) Msg(body []byte) error {
 	if w.done {
 		return fmt.Errorf("wire: stream already terminated")
 	}
-	if max := w.nc.MaxPayload(); int64(len(body)) > max {
+	if max := w.nc.MaxPayload(); int64(len(body))+msgOverhead > max {
 		return &Error{
 			Code:    ErrCodePayloadTooLarge,
-			Message: fmt.Sprintf("notification %d bytes exceeds NATS max_payload %d, dropped", len(body), max),
+			Message: fmt.Sprintf("notification %d bytes (+%d frame headers) exceeds NATS max_payload %d, dropped", len(body), msgOverhead, max),
 		}
 	}
 	return w.nc.PublishMsg(&nats.Msg{
@@ -799,8 +799,19 @@ func (w *streamWriter) ka() bool {
 	return true
 }
 
+// End's size test decides which of two futures this stream gets, so it has to
+// weigh what NATS weighs: the end frame's headers share the body's
+// max_payload budget. Judging the body alone accepted everything in the last
+// endOverhead bytes below the limit, and those bodies took the path below —
+// terminal flag set, then a Respond that never reached the wire. dispatch
+// then found the stream already terminated and sent nothing, so the caller
+// spent its whole inactivity window to be told ErrCodeStreamLost: the one
+// code that promises a retry will help, on a response that would be refused
+// identically every time. Counting the headers keeps those bodies in the
+// oversize branch, where claim-check can still deliver them and
+// ErrCodePayloadTooLarge can at least name why not.
 func (w *streamWriter) End(body []byte) error {
-	if max := w.nc.MaxPayload(); int64(len(body)) > max {
+	if max := w.nc.MaxPayload(); int64(len(body))+endOverhead > max {
 		// Claim-check: park the body and send only the reference — but only
 		// for callers that opted in (HeaderAcceptClaim), because a claimed
 		// end frame's empty body would read as "cancelled" to anyone else.
@@ -820,7 +831,7 @@ func (w *streamWriter) End(body []byte) error {
 			// Fall through: degrade to the legible oversize error, never a hang.
 		}
 		return w.Err(ErrCodePayloadTooLarge,
-			fmt.Sprintf("response %d bytes exceeds NATS max_payload %d", len(body), max),
+			fmt.Sprintf("response %d bytes (+%d frame headers) exceeds NATS max_payload %d", len(body), endOverhead, max),
 			map[string]int64{"size": int64(len(body)), "limit": max})
 	}
 	if !w.claim() {

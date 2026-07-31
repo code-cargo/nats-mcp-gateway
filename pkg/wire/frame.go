@@ -36,6 +36,8 @@ package wire
 import (
 	"fmt"
 
+	nats "github.com/nats-io/nats.go"
+
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
@@ -96,6 +98,27 @@ const (
 
 // Terminal reports whether the frame kind ends the stream.
 func (k FrameKind) Terminal() bool { return k == FrameEnd || k == FrameErr }
+
+// frameOverhead is what a frame's headers cost against max_payload. NATS
+// budgets a message as body + serialized headers and refuses the whole thing
+// (nats.go Conn.publish weighs len(data)+len(hdr)), so a size check that looks
+// only at the body waves through bodies the connection will reject — and a
+// rejected TERMINAL frame is a stream that ends in silence.
+//
+// Measured with nats.go's own serializer rather than reserved as a constant:
+// the failure this guards is a byte count that was a few dozen bytes
+// optimistic, and a hand-rolled replacement of "NATS/1.0\r\n" + one
+// "Key: Value\r\n" per value + "\r\n" would be one more place to be wrong by
+// the same handful of bytes. Msg.Size is subject+reply+headers+body, and only
+// the headers are set here — the other three are not charged anyway.
+func frameOverhead(h nats.Header) int64 { return int64((&nats.Msg{Header: h}).Size()) }
+
+// The two fixed frame shapes whose bodies are caller-sized, precomputed
+// because a notification stream pays this on every frame.
+var (
+	endOverhead = frameOverhead(nats.Header{HeaderFrame: []string{string(FrameEnd)}})
+	msgOverhead = frameOverhead(nats.Header{HeaderFrame: []string{string(FrameMsg)}})
+)
 
 // Frame is one message on a reply stream as surfaced to the client consumer.
 // Remote frames carry Body (opaque JSON-RPC bytes). Locally-detected failures
