@@ -143,31 +143,75 @@ func DecodeParams(raw json.RawMessage) (Params, error) {
 }
 
 // EqualFoldKey reports whether two JSON object keys are the same key to a
-// parser that folds case. It is the single definition of "differs only by
+// parser that ignores case. It is the single definition of "differs only by
 // case" this gateway uses — pkg/backend applies the same relation to the
 // arguments it mirrors into headers.
 //
-// Unicode simple folding, not lowercasing. The difference is not academic:
-// U+017F (ſ, long s) lowercases to itself but folds to "s", so a ToLower
-// comparison reads "argumentſ" as distinct from "arguments" while a
-// case-folding parser binds both to the same field.
-func EqualFoldKey(a, b string) bool { return strings.EqualFold(a, b) }
+// The relation has to be a SUPERSET of every rule a real backend might apply,
+// because the gateway does not know which parser is on the far end and a key
+// it considers distinct is a key it will forward. Two rules are in play and
+// neither contains the other:
+//
+//   - Unicode simple FOLDING, which Go's strings.EqualFold implements. U+017F
+//     (ſ, long s) folds to "s" but lowercases to itself, so folding catches
+//     "argumentſ" where a ToLower comparison does not.
+//   - Per-rune case MAPPING, which Java's equalsIgnoreCase and .NET's
+//     OrdinalIgnoreCase implement — and OrdinalIgnoreCase is what
+//     System.Text.Json uses under ASP.NET Core, the case-insensitive backend
+//     this whole file is written against. It catches the dotted/dotless I
+//     family, whose members have no shared fold orbit: a .NET backend binds
+//     "urı" to its uri property, and folding alone reads that as a distinct
+//     key.
+//
+// foldRune covers both. TestFoldCoversCaseMapping enumerates all of Unicode
+// to prove the exception table below is complete, so a Go release that moves
+// the tables fails the build rather than silently reopening the gap.
+func EqualFoldKey(a, b string) bool {
+	for _, ra := range a {
+		rb, size := utf8.DecodeRuneInString(b)
+		if size == 0 {
+			return false // b ran out first
+		}
+		if foldRune(ra) != foldRune(rb) {
+			return false
+		}
+		b = b[size:]
+	}
+	return b == ""
+}
 
-// foldKey canonicalizes a key for collision detection, mapping every rune to
-// the lowest member of its Unicode fold orbit. It exists so a set of keys can
-// be checked in one pass instead of pairwise, and it agrees with
-// EqualFoldKey exactly — TestFoldKeyAgreesWithEqualFold pins that.
+// caseMapExceptions holds the runes where per-rune ToUpper/ToLower equates
+// keys that simple folding keeps apart. Exhaustively, in Unicode 15.0.0, that
+// is the dotted/dotless I family and nothing else: U+0130 lowercases to "i"
+// and U+0131 uppercases to "I", but neither shares a fold orbit with either.
+// Both are pinned to "I", the fold-orbit minimum of the ASCII pair.
+var caseMapExceptions = map[rune]rune{
+	'İ': 'I', // LATIN CAPITAL LETTER I WITH DOT ABOVE
+	'ı': 'I', // LATIN SMALL LETTER DOTLESS I
+}
+
+// foldRune canonicalizes one rune: same output for two runes iff some real
+// parser would treat them as the same character.
+func foldRune(r rune) rune {
+	if c, exceptional := caseMapExceptions[r]; exceptional {
+		return c
+	}
+	lowest := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < lowest {
+			lowest = f
+		}
+	}
+	return lowest
+}
+
+// foldKey canonicalizes a whole key, so a set of keys can be checked in one
+// pass instead of pairwise. Equivalent to EqualFoldKey by construction.
 func foldKey(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for _, r := range s {
-		lowest := r
-		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
-			if f < lowest {
-				lowest = f
-			}
-		}
-		b.WriteRune(lowest)
+		b.WriteRune(foldRune(r))
 	}
 	return b.String()
 }

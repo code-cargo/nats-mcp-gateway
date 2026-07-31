@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -81,34 +83,73 @@ func TestDecodeParamsLeavesNestedCaseCollisionsAlone(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// TestFoldKeyAgreesWithEqualFold pins the two spellings of "differs only by
-// case" to one relation. They drifted once: checkCaseUnique folded with
-// strings.ToLower while pkg/backend used strings.EqualFold, and U+017F (ſ)
-// lowercases to itself but folds to "s" — so "argumentſ" read as a distinct
-// key here and as "arguments" to a case-folding backend, which is the exact
-// disagreement this file exists to prevent.
-func TestFoldKeyAgreesWithEqualFold(t *testing.T) {
-	keys := []string{
-		"name", "NAME", "NaMe", "uri", "URI", "_meta", "_META",
-		"arguments", "argumentſ", "ARGUMENTS", "cursor", "curſor",
-		"ß", "ẞ", "SS", "k", "K", "K", // U+212A KELVIN SIGN folds to k
-		"straße", "STRASSE", "", "a", "á", "Á", "日本語", "İ", "i",
-	}
-	for _, a := range keys {
-		for _, b := range keys {
-			assert.Equal(t, EqualFoldKey(a, b), foldKey(a) == foldKey(b),
-				"foldKey and EqualFoldKey disagree on %q vs %q", a, b)
+// TestFoldCoversCaseMapping is what licenses the hand-written
+// caseMapExceptions table. The gateway's key-collision rule has to be a
+// superset of every case-insensitive relation a backend might apply, and Go's
+// simple folding is not one: Java's equalsIgnoreCase and .NET's
+// OrdinalIgnoreCase compare per-rune ToUpper/ToLower, which equates runes
+// that folding keeps apart.
+//
+// Rather than trust a list someone assembled by hand, enumerate all of
+// Unicode: group every rune by its ToUpper and by its ToLower image, then
+// require every member of a group to share a foldRune. A Go release that
+// moves the case tables fails here instead of silently reopening the gap.
+func TestFoldCoversCaseMapping(t *testing.T) {
+	for _, mapFn := range []func(rune) rune{unicode.ToUpper, unicode.ToLower} {
+		groups := map[rune][]rune{}
+		for r := rune(0); r <= unicode.MaxRune; r++ {
+			if !utf8.ValidRune(r) {
+				continue
+			}
+			groups[mapFn(r)] = append(groups[mapFn(r)], r)
+		}
+		for _, members := range groups {
+			want := foldRune(members[0])
+			for _, m := range members[1:] {
+				require.Equal(t, want, foldRune(m),
+					"U+%04X %q and U+%04X %q are the same key to a ToUpper/ToLower "+
+						"comparison but fold apart", members[0], members[0], m, m)
+			}
 		}
 	}
 }
 
-// TestCaseCollisionUsesFoldingNotLowercasing is the params-level regression
-// for the same drift.
-func TestCaseCollisionUsesFoldingNotLowercasing(t *testing.T) {
-	_, err := DecodeParams(json.RawMessage(`{"arguments":{"region":"us"},"argumentſ":{"region":"eu"}}`))
-	require.Error(t, err)
-	var ambiguous *AmbiguousKeyError
-	assert.True(t, errors.As(err, &ambiguous))
+// TestEqualFoldKeyMatchesFoldKey keeps the pairwise and whole-key spellings
+// of the relation in step. They drifted once: checkCaseUnique used
+// strings.ToLower while pkg/backend used strings.EqualFold, and U+017F (ſ)
+// lowercases to itself but folds to "s".
+func TestEqualFoldKeyMatchesFoldKey(t *testing.T) {
+	keys := []string{
+		"name", "NAME", "NaMe", "uri", "URI", "urı", "urİ", "_meta", "_META",
+		"arguments", "argumentſ", "ARGUMENTS", "cursor", "curſor",
+		"ß", "ẞ", "SS", "k", "K", "K", // U+212A folds to k
+		"straße", "STRASSE", "", "a", "á", "Á", "日本語",
+		"İ", "ı", "i", "I", "ii", "i",
+	}
+	for _, a := range keys {
+		for _, b := range keys {
+			assert.Equal(t, foldKey(a) == foldKey(b), EqualFoldKey(a, b),
+				"EqualFoldKey and foldKey disagree on %q vs %q", a, b)
+		}
+	}
+}
+
+// TestCaseCollisionCoversBothRelations is the params-level regression. The
+// first pair is caught only by folding (ſ lowercases to itself); the rest
+// only by case mapping (the dotted/dotless I family shares no fold orbit).
+// A rule implementing either relation alone lets half of these through.
+func TestCaseCollisionCoversBothRelations(t *testing.T) {
+	for _, input := range []string{
+		`{"arguments":{"region":"us"},"argumentſ":{"region":"eu"}}`,
+		`{"uri":"file:///public/ok","urı":"file:///etc/shadow"}`,
+		`{"uri":"file:///public/ok","urİ":"file:///etc/shadow"}`,
+		`{"uri":"file:///public/ok","URI":"file:///etc/shadow"}`,
+	} {
+		_, err := DecodeParams(json.RawMessage(input))
+		require.Error(t, err, "input %s was accepted", input)
+		var ambiguous *AmbiguousKeyError
+		assert.True(t, errors.As(err, &ambiguous))
+	}
 }
 
 // TestMetaAllowsThirdPartyCaseCollisions is the counterpart rule. _meta is

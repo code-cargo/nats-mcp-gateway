@@ -326,6 +326,19 @@ func TestIntegrityRejectsKeySmuggling(t *testing.T) {
 			params: `{"name":"get_issue","arguments":{"region":"us"},"argumentſ":{"region":"eu"},` + m + `}`,
 		},
 		{
+			// The dotted/dotless I family shares no Unicode fold orbit, so a
+			// folding-only rule reads these as distinct keys while .NET's
+			// OrdinalIgnoreCase (the ASP.NET Core default) binds them to uri.
+			name:    "resource uri smuggled past folding with U+0131",
+			subject: readUnset, hMethod: "resources/read", hName: "file:///allowed",
+			params: `{"uri":"file:///allowed","ur\u0131":"file:///etc/shadow",` + m + `}`,
+		},
+		{
+			name:    "resource uri smuggled past folding with U+0130",
+			subject: readUnset, hMethod: "resources/read", hName: "file:///allowed",
+			params: `{"uri":"file:///allowed","ur\u0130":"file:///etc/shadow",` + m + `}`,
+		},
+		{
 			name:    "protocol version smuggled past lowercasing with U+017F",
 			subject: callGetIssue, hMethod: "tools/call", hName: "get_issue",
 			params: fmt.Sprintf(`{"name":"get_issue","_meta":{%q:%q,"io.modelcontextprotocol/protocolVerſion":"1999-01-01"}}`,

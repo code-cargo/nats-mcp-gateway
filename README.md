@@ -128,10 +128,14 @@ Two things make that real:
    subject NATS authorized, the mirrored headers, and the JSON-RPC body all
    agree, and rejects any disagreement with `-32020`. Without it a caller
    could publish a `delete_repo` body to a `get_issue` subject. The body is
-   forwarded verbatim, so it is read the way the backend will read it —
-   exact keys, no duplicates, no case-colliding siblings
-   (`pkg/mcpspec/params.go`). A check that parses the body differently from
-   the server executing it has verified nothing.
+   forwarded verbatim, so it is read the way the backend will read it: exact
+   keys, and no duplicate key at any depth. Keys differing only by case are
+   refused across `params`, whose field names the spec fixes — and, inside
+   the open extension bags `_meta` and tool `arguments`, on the specific key
+   being read rather than the whole object, since a third party's two keys
+   there are none of the gateway's business (`pkg/mcpspec/params.go`). A
+   check that parses the body differently from the server executing it has
+   verified nothing.
 2. **The tenant token is NATS-enforced**: a user cannot publish into another
    tenant's subjects, so the gateway trusts the tenant it parses from the
    subject. Backend processes are pooled per `(server, tenant, credentials)`

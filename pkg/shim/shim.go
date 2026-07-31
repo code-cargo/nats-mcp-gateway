@@ -127,6 +127,15 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 	// what the gateway will check this body against, so reading params any
 	// differently here only manufactures a -32020 one hop later. Params the
 	// shim cannot read unambiguously it must not guess at.
+	//
+	// Answered with -32600, not the -32020 the proxy answers the same
+	// AmbiguousKeyError with, and the difference is not an inconsistency:
+	// -32020 means "transport headers disagree with the body", and at this
+	// point there are no headers to disagree with — the shim is failing to
+	// read the params it would have built them FROM. To the client this is
+	// simply a request the shim cannot interpret. The two codes also never
+	// reach one observer: a body rejected here never travels, so no caller
+	// sees both answers to the same request.
 	p, err := mcpspec.DecodeParams(msg.Params)
 	if err != nil {
 		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest, err.Error())
