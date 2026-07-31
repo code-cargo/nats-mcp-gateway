@@ -20,6 +20,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"encoding/json"
 	"log/slog"
 	"sort"
@@ -43,6 +44,14 @@ type Reconciler struct {
 	// mu serializes Apply so concurrent reloads can't interleave a wire update
 	// with a pool eviction.
 	mu sync.Mutex
+
+	// bootNATS is the `nats` block of the FIRST applied revision — the settings
+	// the connection and wire server handed to New were built from; bootSeen
+	// separates "nothing applied yet" from "applied an empty block", which is
+	// what the fetch and inline sources always carry. Guarded by mu, like
+	// everything else Apply reads and writes.
+	bootNATS config.NATS
+	bootSeen bool
 }
 
 // New builds a Reconciler over a running wire server and pool. The pool's
@@ -57,6 +66,12 @@ func New(ws *wire.Server, pool *backend.Pool, log *slog.Logger) *Reconciler {
 // Current returns the last successfully-applied config, or nil before the
 // first Apply. The pool factory calls this to resolve a server's definition at
 // spawn time, so an evicted server always respawns from the newest config.
+//
+// Only the server set is authoritative here. The `nats` block is what the
+// newest revision SAID, not what this process is running — that is fixed at
+// boot, and a revision moving it is warned about and otherwise ignored (see
+// warnNATSDrift). Read the running connection and scope from the objects the
+// gateway was built with, never from here.
 func (r *Reconciler) Current() *config.Config {
 	return r.cur.Load()
 }
@@ -78,9 +93,16 @@ func (d Delta) Empty() bool {
 // are evicted), so a bad revision can never leave the gateway half-updated.
 // On success it evicts the pools of removed and changed servers and publishes
 // the new config as current.
+//
+// The server set is all that reconciles. A revision whose `nats` block has
+// moved away from the running gateway's is reported (see warnNATSDrift) and
+// otherwise ignored — that connection cannot be rebuilt underneath a serving
+// process.
 func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	r.warnNATSDrift(next)
 
 	prev := r.cur.Load()
 	d := diffServers(prev, next)
@@ -115,6 +137,81 @@ func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 	r.log.Info("config reloaded",
 		"added", d.Added, "removed", d.Removed, "changed", d.Changed)
 	return d, nil
+}
+
+// warnNATSDrift reports a `nats` block that has moved away from the one the
+// running gateway was built on. Apply cannot act on it: New is handed a live
+// connection and an already-serving wire server, so the URL, credentials,
+// subject prefixes and the tenant/user scope are fixed for the process's life.
+//
+// Silence is the hazard. The diff covers servers only, so an operator who edits
+// nats.tenant in the config file and reloads gets "config unchanged" from a
+// gateway that is still serving every tenant. The inline and fetch sources
+// refuse such a document outright; the file source cannot, because the servers
+// in that same document have to keep reloading — so it reports instead.
+//
+// Measured against the FIRST applied revision rather than the predecessor: the
+// divergence is from what is RUNNING, and a later unrelated edit must not make
+// an already-diverged block look settled. That costs no repetition in practice,
+// because sources emit on content change (see pkg/configsource), so this is one
+// line per edit rather than one per poll.
+func (r *Reconciler) warnNATSDrift(next *config.Config) {
+	if next == nil {
+		return // a nil revision is "every server removed"; it asserts nothing
+	}
+	if !r.bootSeen {
+		r.bootNATS, r.bootSeen = next.NATS, true
+		return
+	}
+	if next.NATS == r.bootNATS {
+		return
+	}
+	// Field names, never values: nats.url carries its password in the userinfo
+	// form, and this warning goes wherever the gateway's logs go.
+	r.log.Warn("the nats block changed but is fixed at boot; the live connection and wire scope are unchanged",
+		"fields", natsDriftFields(r.bootNATS, next.NATS),
+		"fix", "restart the gateway to apply it")
+}
+
+// natsDriftFields names the fields that differ, by their JSON names. Marshalled
+// rather than compared field by field for the reason serverEqual gives: a
+// hand-written list would rot as config.NATS grows, and this covers a field the
+// day it is added.
+func natsDriftFields(boot, next config.NATS) []string {
+	return driftFields(natsFields(boot), natsFields(next))
+}
+
+// driftFields compares two marshalled field maps over the UNION of their keys.
+// config.NATS is all plain-tagged strings today, so both sides always carry
+// every key — but a field tagged omitempty would drop out of whichever side it
+// is empty on, and iterating the boot side alone would then miss it in one
+// direction only. That direction is the dangerous one: booted with no tenant,
+// reloaded with one set is exactly the narrowing edit this warning exists to
+// name, and it would report an empty list.
+func driftFields(boot, next map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(boot))
+	for name, bv := range boot {
+		if !bytes.Equal(bv, next[name]) {
+			out = append(out, name)
+		}
+	}
+	for name := range next {
+		if _, ok := boot[name]; !ok {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func natsFields(n config.NATS) map[string]json.RawMessage {
+	b, err := json.Marshal(n)
+	if err != nil {
+		return nil // unreachable for a struct of strings; the warning still fires
+	}
+	var m map[string]json.RawMessage
+	_ = json.Unmarshal(b, &m)
+	return m
 }
 
 // diffServers compares two configs by server name and definition. A nil old

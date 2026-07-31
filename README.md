@@ -465,12 +465,14 @@ provenance is attested per release
 
 The **server set reloads at runtime** — add, remove, or re-credential a fronted
 MCP server without restarting the gateway. (The NATS connection, subject
-prefix, and queue group are fixed at boot; only servers reload.) Reloads are
-safe: a malformed revision is rejected and the last good config keeps serving,
-a removed server stops answering (clients get `-32011` and re-issue), and a
-changed server's pooled processes are evicted so the next call spawns from the
-new definition. In-flight calls on a removed/changed server fail retryably
-(`-32010`); unchanged servers are never disturbed.
+prefix, queue group, and scope are fixed at boot; only servers reload. Editing
+the file's `nats` block and reloading logs a warning naming the fields that
+moved — the running connection keeps the boot values until you restart.)
+Reloads are safe: a malformed revision is rejected and the last good config
+keeps serving, a removed server stops answering (clients get `-32011` and
+re-issue), and a changed server's pooled processes are evicted so the next call
+spawns from the new definition. In-flight calls on a removed/changed server
+fail retryably (`-32010`); unchanged servers are never disturbed.
 
 Config comes from a **source**, selected by flag:
 
