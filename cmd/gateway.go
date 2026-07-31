@@ -22,6 +22,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -344,6 +345,9 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 			}
 			boot.claimMaxBytes = cc.MaxBytes
 		}
+		if err := c.checkFileSourceFlags(boot); err != nil {
+			return bootParams{}, err
+		}
 		return boot, nil
 	}
 	// Fetch and inline sources: connection, prefix, queue group and scope come
@@ -429,6 +433,106 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 		boot.inline = cfg
 	}
 	return boot, nil
+}
+
+// Defaults for the fetch/inline-only flags, mirrored from cli.go's `default:`
+// tags. They are what the check below rests on, because kong cannot say whether
+// a value came from the operator: Context.Reset() parses the tag through
+// Value.Parse, which marks the value Set either way, so on a bare
+// `gateway --config` every defaulted flag already reports Set. Only the VALUE
+// separates them. TestFileSourceGuardAgainstKongDefaults pins these to the
+// tags, so a changed default fails a test instead of every file-source boot.
+const (
+	defaultNatsURL       = nats.DefaultURL
+	defaultSubjectPrefix = wire.DefaultPrefix
+	defaultClaimMaxAge   = 5 * time.Minute
+	defaultClaimMaxBytes = 1 << 30
+)
+
+// checkFileSourceFlags rejects a fetch/inline-only setting that the file source
+// is about to drop, unless the document already carries that same value.
+//
+// This is the inline `nats` block rejection arriving from the other direction.
+// The per-user pod recipe injects scope as NATSMCP_SCOPE_TENANT and
+// NATSMCP_SCOPE_USER, and env in a pod spec never reads the --help string that
+// says "(fetch + inline sources)": mount a file whose nats block omits the
+// scope and the gateway boots UNSCOPED — it binds {prefix}.req.*.*.{server}.>
+// and serves every tenant using this pod's per-user credentials. A dropped
+// NATSMCP_NATS_URL falls back to loopback and a dropped --inbox-prefix leaves
+// the identity fencing off, both without a word in the log. A deployment that
+// asks to be scoped can never silently serve everyone.
+//
+// Only a CONFLICT fails. A value the document already carries drops nothing,
+// and NATSMCP_NATS_URL, NATSMCP_SUBJECT_PREFIX and NATSMCP_INBOX_PREFIX are
+// shared with the shim and call commands, so one exported value per deployment
+// is ordinary; refusing to boot over it would break working fleets to correct a
+// no-op — the trade config.validate() already declined to make for
+// discoverTtlMs.
+//
+// --config-events-subject and --config-refetch are deliberately absent: they
+// steer the fetch source's own polling, the job --reload-interval does for this
+// source, and nothing about the connection, the scope or the served subjects
+// rides on them.
+func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
+	var dropped []string
+	// flag and env are how the operator supplied the value; field is the
+	// document key that governs instead. inDoc is what that key resolved to,
+	// which is the whole point of the message: it names the value in force.
+	check := func(flag, env, field string, conflict bool, got, inDoc any) {
+		if !conflict {
+			return
+		}
+		dropped = append(dropped, fmt.Sprintf("--%s=%s (%s) but %s=%s",
+			flag, settingValue(got), env, field, settingValue(inDoc)))
+	}
+	check("nats-url", "NATSMCP_NATS_URL", "nats.url",
+		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url)
+	check("nats-creds", "NATSMCP_NATS_CREDS", "nats.credsFile",
+		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile)
+	check("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
+		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != boot.prefix,
+		c.SubjectPrefix, boot.prefix)
+	check("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
+		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
+	check("queue-group", "NATSMCP_QUEUE_GROUP", "nats.queueGroup",
+		c.QueueGroup != "" && c.QueueGroup != boot.queueGroup, c.QueueGroup, boot.queueGroup)
+	check("scope-tenant", "NATSMCP_SCOPE_TENANT", "nats.tenant",
+		c.ScopeTenant != "" && c.ScopeTenant != boot.tenant, c.ScopeTenant, boot.tenant)
+	check("scope-user", "NATSMCP_SCOPE_USER", "nats.user",
+		c.ScopeUser != "" && c.ScopeUser != boot.user, c.ScopeUser, boot.user)
+	check("pool-max-concurrent", "NATSMCP_POOL_MAX_CONCURRENT", "pool.maxConcurrent",
+		c.PoolMaxConcurrent != 0 && c.PoolMaxConcurrent != boot.pool.MaxConcurrent,
+		c.PoolMaxConcurrent, boot.pool.MaxConcurrent)
+	check("pool-max-procs-per-tenant", "NATSMCP_POOL_MAX_PROCS_PER_TENANT", "pool.maxProcsPerTenant",
+		c.PoolMaxProcsPerTenant != 0 && c.PoolMaxProcsPerTenant != boot.pool.MaxProcsPerTenant,
+		c.PoolMaxProcsPerTenant, boot.pool.MaxProcsPerTenant)
+	check("pool-idle-ttl", "NATSMCP_POOL_IDLE_TTL", "pool.idleTtl",
+		c.PoolIdleTTL != 0 && c.PoolIdleTTL != boot.pool.IdleTTL, c.PoolIdleTTL, boot.pool.IdleTTL)
+	check("pool-max-lifetime", "NATSMCP_POOL_MAX_LIFETIME", "pool.maxLifetime",
+		c.PoolMaxLifetime != 0 && c.PoolMaxLifetime != boot.pool.MaxLifetime, c.PoolMaxLifetime, boot.pool.MaxLifetime)
+	check("claim-check", "NATSMCP_CLAIM_CHECK", "claimCheck",
+		c.ClaimCheck && !boot.claimCheck, c.ClaimCheck, boot.claimCheck)
+	check("claim-max-age", "NATSMCP_CLAIM_MAX_AGE", "claimCheck.maxAge",
+		c.ClaimMaxAge != 0 && c.ClaimMaxAge != defaultClaimMaxAge && c.ClaimMaxAge != boot.claimMaxAge,
+		c.ClaimMaxAge, boot.claimMaxAge)
+	check("claim-max-bytes", "NATSMCP_CLAIM_MAX_BYTES", "claimCheck.maxBytes",
+		c.ClaimMaxBytes != 0 && c.ClaimMaxBytes != defaultClaimMaxBytes && c.ClaimMaxBytes != boot.claimMaxBytes,
+		c.ClaimMaxBytes, boot.claimMaxBytes)
+
+	if len(dropped) == 0 {
+		return nil
+	}
+	return fmt.Errorf("config: %s: %s — the file source takes its connection, scope, pool and claim-check settings from this document; set them there, or drop the flag and its env var (only --config-subject and --config-json read them)",
+		c.Config, strings.Join(dropped, "; "))
+}
+
+// settingValue renders a setting for that error, quoting strings so an empty
+// document field reads as "" rather than as nothing at all.
+func settingValue(v any) string {
+	if s, ok := v.(string); ok {
+		return fmt.Sprintf("%q", s)
+	}
+	return fmt.Sprint(v)
 }
 
 // buildSource constructs the config source and, for the file source, a SIGHUP

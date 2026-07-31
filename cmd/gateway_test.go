@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alecthomas/kong"
 	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
@@ -488,6 +489,188 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
 	require.NoError(t, err)
 	assert.Empty(t, boot.inboxPrefix)
+}
+
+func writeConfig(t *testing.T, doc string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "gateway.json")
+	require.NoError(t, os.WriteFile(path, []byte(doc), 0o600))
+	return path
+}
+
+// The fetch/inline-only flags never reach the file source — it reads its
+// connection, scope, pool and claim-check settings from the document — so a
+// supplied one that the document contradicts must fail the boot. This is the
+// inline `nats` block hazard arriving from the other direction: the per-user
+// pod recipe injects NATSMCP_SCOPE_TENANT/NATSMCP_SCOPE_USER as env, and with a
+// mounted file that carries no matching nats block the pod would boot UNSCOPED,
+// bind {prefix}.req.*.*.{server}.>, and serve every tenant using its own
+// per-user credentials.
+func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		doc  string
+		cmd  GatewayCmd
+		want []string
+	}{
+		{
+			name: "scope injected as env, document unscoped",
+			doc:  `{"servers":{}}`,
+			cmd:  GatewayCmd{ScopeTenant: "acme", ScopeUser: "u_9f3a"},
+			want: []string{
+				`--scope-tenant="acme"`, "NATSMCP_SCOPE_TENANT", `nats.tenant=""`,
+				`--scope-user="u_9f3a"`, "NATSMCP_SCOPE_USER", `nats.user=""`,
+			},
+		},
+		{
+			name: "scope disagreeing with the document",
+			doc:  `{"nats":{"tenant":"other"},"servers":{}}`,
+			cmd:  GatewayCmd{ScopeTenant: "acme"},
+			want: []string{`--scope-tenant="acme"`, `nats.tenant="other"`},
+		},
+		{
+			name: "url dropped for the loopback fallback",
+			doc:  `{"servers":{}}`,
+			cmd:  GatewayCmd{NatsURL: "nats://prod:4222", NatsCreds: "/run/gw.creds"},
+			want: []string{
+				`--nats-url="nats://prod:4222"`, `nats.url="nats://127.0.0.1:4222"`,
+				`--nats-creds="/run/gw.creds"`, `nats.credsFile=""`,
+			},
+		},
+		{
+			name: "identity fencing quietly not applied",
+			doc:  `{"servers":{}}`,
+			cmd:  GatewayCmd{InboxPrefix: "_INBOX_acme.u_9f3a", QueueGroup: "mcpgw.acme"},
+			want: []string{
+				`--inbox-prefix="_INBOX_acme.u_9f3a"`, `nats.inboxPrefix=""`,
+				`--queue-group="mcpgw.acme"`, `nats.queueGroup=""`,
+			},
+		},
+		{
+			name: "wire prefix disagreeing with the document",
+			doc:  `{"nats":{"subjectPrefix":"acme.mcp"},"servers":{}}`,
+			cmd:  GatewayCmd{SubjectPrefix: "other.mcp"},
+			want: []string{`--subject-prefix="other.mcp"`, `nats.subjectPrefix="acme.mcp"`},
+		},
+		{
+			name: "pool limits",
+			doc:  `{"pool":{"maxProcsPerTenant":16},"servers":{}}`,
+			cmd: GatewayCmd{
+				PoolMaxConcurrent: 7, PoolMaxProcsPerTenant: 64,
+				PoolIdleTTL: 30 * time.Minute, PoolMaxLifetime: 24 * time.Hour,
+			},
+			want: []string{
+				"--pool-max-concurrent=7", "pool.maxConcurrent=0",
+				"--pool-max-procs-per-tenant=64", "pool.maxProcsPerTenant=16",
+				"--pool-idle-ttl=30m0s", "--pool-max-lifetime=24h0m0s",
+			},
+		},
+		{
+			name: "claim-check enabled by flag, absent from the document",
+			doc:  `{"servers":{}}`,
+			cmd:  GatewayCmd{ClaimCheck: true, ClaimMaxAge: 9 * time.Minute, ClaimMaxBytes: 5},
+			want: []string{
+				"--claim-check=true", "claimCheck=false",
+				"--claim-max-age=9m0s", "claimCheck.maxAge=0s",
+				"--claim-max-bytes=5", "claimCheck.maxBytes=0",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.cmd
+			c.Config = writeConfig(t, tc.doc)
+			_, err := c.bootParams(sourceFile)
+			require.Error(t, err)
+			for _, want := range tc.want {
+				assert.Contains(t, err.Error(), want)
+			}
+		})
+	}
+}
+
+// Only a CONFLICT fails. A value the document already carries drops nothing,
+// and NATSMCP_NATS_URL, NATSMCP_SUBJECT_PREFIX and NATSMCP_INBOX_PREFIX are
+// shared with the shim and call commands — one exported value per deployment is
+// ordinary, and refusing to boot over it would break working fleets to correct
+// a no-op.
+func TestBootParamsFileSourceAcceptsAgreeingFlags(t *testing.T) {
+	path := writeConfig(t, `{
+		"nats":{"url":"nats://prod:4222","credsFile":"/run/gw.creds","subjectPrefix":"acme.mcp",
+		        "inboxPrefix":"_INBOX_acme.u_9f3a","queueGroup":"mcpgw.acme","tenant":"acme","user":"u_9f3a"},
+		"pool":{"maxProcsPerTenant":64},
+		"claimCheck":{"maxAge":"9m","maxBytes":5},
+		"servers":{}}`)
+
+	boot, err := (&GatewayCmd{
+		Config:  path,
+		NatsURL: "nats://prod:4222", NatsCreds: "/run/gw.creds", SubjectPrefix: "acme.mcp",
+		InboxPrefix: "_INBOX_acme.u_9f3a", QueueGroup: "mcpgw.acme",
+		ScopeTenant: "acme", ScopeUser: "u_9f3a", PoolMaxProcsPerTenant: 64,
+		ClaimCheck: true, ClaimMaxAge: 9 * time.Minute, ClaimMaxBytes: 5,
+	}).bootParams(sourceFile)
+	require.NoError(t, err)
+	assert.Equal(t, "acme", boot.tenant)
+	assert.Equal(t, "u_9f3a", boot.user)
+
+	// Nothing supplied: the document governs, exactly as it always has.
+	boot, err = (&GatewayCmd{Config: path}).bootParams(sourceFile)
+	require.NoError(t, err)
+	assert.Equal(t, "acme", boot.tenant)
+	assert.Equal(t, "nats://prod:4222", boot.url)
+	assert.Equal(t, "_INBOX_acme.u_9f3a", boot.inboxPrefix)
+}
+
+// clearNATSMCPEnv unsets every NATSMCP_* variable for the duration of the test,
+// so the developer's shell cannot decide whether a defaults-only parse passes.
+func clearNATSMCPEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		name, value, _ := strings.Cut(kv, "=")
+		if !strings.HasPrefix(name, "NATSMCP_") {
+			continue
+		}
+		require.NoError(t, os.Unsetenv(name))
+		t.Cleanup(func() { _ = os.Setenv(name, value) })
+	}
+}
+
+// Against the REAL grammar, because the guard has to tell an operator's value
+// from kong's own default and kong itself cannot: Context.Reset() parses the
+// `default:` tag through Value.Parse, which marks the value Set whether or not
+// anything was supplied, so every defaulted flag reports Set on a bare
+// `gateway --config` and only the default VALUE distinguishes them. This pins
+// that comparison to the tags — a changed default fails here rather than
+// erroring every file-source boot — and drives the guard down the path the
+// hazard actually takes: scope arriving as pod env, never as an argv the
+// operator could see was ignored.
+func TestFileSourceGuardAgainstKongDefaults(t *testing.T) {
+	clearNATSMCPEnv(t)
+	path := writeConfig(t, `{"servers":{}}`)
+
+	parse := func(t *testing.T) *GatewayCmd {
+		t.Helper()
+		var cli CLI
+		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, err)
+		_, err = parser.Parse([]string{"gateway", "--config", path})
+		require.NoError(t, err)
+		return &cli.Gateway
+	}
+
+	// Defaults only: the ordinary file-source boot, which must survive.
+	boot, err := parse(t).bootParams(sourceFile)
+	require.NoError(t, err)
+	assert.Equal(t, nats.DefaultURL, boot.url)
+	assert.Empty(t, boot.tenant)
+
+	// The reported failure: scope injected as env, mounted file with no nats
+	// block. Before the guard this booted unscoped, serving every tenant.
+	t.Setenv("NATSMCP_SCOPE_TENANT", "acme")
+	t.Setenv("NATSMCP_SCOPE_USER", "u_9f3a")
+	_, err = parse(t).bootParams(sourceFile)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "NATSMCP_SCOPE_TENANT")
+	assert.Contains(t, err.Error(), "nats.tenant")
 }
 
 // A custom inbox prefix must cover EVERY request/reply this process issues —
