@@ -22,6 +22,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,98 @@ func TestExecFailureIncludesStderr(t *testing.T) {
 	_, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not authorized")
+}
+
+// startResolve runs one Exec.Resolve in the background, so a test can act on
+// the helper — cancel it, watch for it — while the resolve is in flight.
+func startResolve(ctx context.Context, r *Exec) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(ctx, "acme", "u1", "srv")
+		done <- err
+	}()
+	return done
+}
+
+// awaitResolve fails the test if the resolve has not finished within d. The
+// hangs these tests provoke are unbounded, so waiting on the channel directly
+// would stall the whole package until the go test panic timeout instead of
+// naming the invariant that broke.
+func awaitResolve(t *testing.T, done <-chan error, d time.Duration, what string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		t.Fatalf("Exec.Resolve did not return within %s: %s", d, what)
+		return nil
+	}
+}
+
+func TestExecCancellationKillsTheWholeHelperTree(t *testing.T) {
+	// Wrapper-script helpers fork, the same shape StdioBackend deals with in
+	// npx/uvx. Killing the helper alone leaves that child running and still
+	// holding the write end of stdout, so Wait sits on a pipe that will never
+	// reach EOF and no remaining deadline can rescue it — all under
+	// CachedResolver's per-key mutex, which no context can interrupt. The
+	// (tenant, user, server) key is then wedged for the life of the gateway:
+	// later requests for it park on the lock forever instead of failing and
+	// backing off. Cancelling here is the helper's own Timeout expiring on a
+	// slower clock; os/exec runs the identical path for both.
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sh -c 'echo > "$READY"; sleep 60' &
+sleep 60
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startResolve(ctx, r)
+
+	// The child writes this itself, so its existence proves a forked process
+	// is running and holding stdout — without it the assertions below would
+	// hold trivially on a helper that never forked at all.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(ready)
+		return err == nil
+	}, 30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
+
+	cancel()
+	start := time.Now()
+	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"),
+		"a cancelled helper must fail, not hang")
+	// Returning only once the grace period is up means the child kept stdout
+	// open through the kill and the pipes had to be closed out from under it,
+	// which is the fallback working, not the group kill.
+	assert.Less(t, time.Since(start), helperWaitDelay,
+		"cancellation reached the helper alone, not its process group")
+}
+
+func TestExecReturnsWhenAChildOutlivesTheHelper(t *testing.T) {
+	// Here the helper prints its credentials and exits cleanly, so nothing
+	// ever cancels the command and its timeout is irrelevant — but a child it
+	// left behind still holds stdout open. os/exec stops watching the context
+	// the moment the process is reaped, so the read that follows is bounded by
+	// WaitDelay alone: without one, Resolve never returns at all, and no
+	// configured timeout changes that.
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sleep 60 &
+echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
+`), 0o755))
+
+	// A generous timeout, to show it is not what ends the wait.
+	r := &Exec{Command: script, Timeout: time.Minute}
+	err := awaitResolve(t, startResolve(context.Background(), r), 30*time.Second,
+		"a child of the exited helper still holds stdout")
+	// Abandoning the credentials is deliberate. A helper that hands our stdout
+	// to a process outliving it has broken its side of the contract, and a
+	// resolve that fails feeds the backoff and reaches the caller as -32014,
+	// where one that blocks forever reaches nobody.
+	require.ErrorIs(t, err, exec.ErrWaitDelay)
 }
 
 func TestFile(t *testing.T) {

@@ -21,8 +21,16 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
+
+// helperWaitDelay bounds how long Resolve waits for the helper's stdout to
+// close after the helper itself is gone. Nothing should still hold that pipe
+// once the process it belongs to has exited or been killed, so this is a
+// grace period and not a budget — the same role terminateGrace plays in
+// StdioBackend, and the same length.
+const helperWaitDelay = 3 * time.Second
 
 // Exec is the universal adapter: it runs a credential-helper command per
 // (tenant, user, server) and parses the credJSON it prints —
@@ -38,7 +46,8 @@ type Exec struct {
 	// — the same hygiene as StdioBackend): it gets PATH and HOME, the
 	// identity variables NATSMCP_CRED_{TENANT,USER,SERVER}, and these.
 	Env map[string]string
-	// Timeout bounds one helper run (default 30s).
+	// Timeout bounds one helper run (default 30s), plus helperWaitDelay when
+	// something the helper spawned is still holding its stdout open.
 	Timeout time.Duration
 }
 
@@ -52,6 +61,27 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
+	// The subprocess discipline StdioBackend uses, for the same reason:
+	// helpers are wrapper scripts that fork. New process group so the timeout
+	// reaches the children (killing the helper alone leaves them running and
+	// holding stdout); WaitDelay so a pipe a child still holds cannot outlast
+	// the timeout anyway. Both matter more here than there — this wait is
+	// taken under CachedResolver's per-key mutex, which no context can
+	// interrupt, so an unbounded one wedges that (tenant, user, server) for
+	// the life of the gateway instead of failing and backing off.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		// Negative pid = the process group created above. ESRCH means it is
+		// already gone, which os/exec reads as "nothing was interrupted" —
+		// the answer that keeps a helper finishing a hair before the deadline
+		// from being reported as cancelled.
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		return err
+	}
+	cmd.WaitDelay = helperWaitDelay
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
@@ -67,6 +97,13 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("cred: helper %s: %w: %s", e.Command, err, bytes.TrimSpace(exitErr.Stderr))
+		}
+		if errors.Is(err, exec.ErrWaitDelay) {
+			// The helper exited but left something holding stdout, so the read
+			// was cut short and what we captured may be a prefix. Say which
+			// helper habit caused it: os/exec's own wording names the mechanism
+			// and gives an operator nothing to fix.
+			return nil, fmt.Errorf("cred: helper %s left a process holding its stdout open: %w", e.Command, err)
 		}
 		return nil, fmt.Errorf("cred: helper %s: %w", e.Command, err)
 	}
