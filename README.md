@@ -495,7 +495,16 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
   **Controller contract:** respond to the request subject with the same config
   JSON the file source parses (with values resolved, not `${VAR}` references),
   and publish any message to the events subject on change; NATS permissions
-  fence both subjects to the controller.
+  fence both subjects to the controller. The reply must carry **no `nats`
+  block** — the connection it arrives on is already open, so nothing in one can
+  be acted on, and a controller that emits `{"nats":{"tenant":"acme"},…}`
+  believing it scoped the fleet would leave every pod serving every tenant. A
+  reply carrying one is refused like any other unusable revision, which means
+  it depends on whether the pod is already serving: a running gateway keeps its
+  last good config and converges once the controller stops sending the block,
+  while a pod that has never served retries for the two-minute boot window and
+  then exits — so a controller emitting one from the start fails the rollout
+  rather than serving the wrong scope.
 - **Inline** (`--config-json` / `NATSMCP_CONFIG_JSON`): the whole config
   document as a string, applied once and never reloaded — for pods with no file
   mount and no config responder (the scoped stdio deployment injects its one
