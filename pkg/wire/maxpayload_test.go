@@ -17,6 +17,8 @@ package wire
 import (
 	"bytes"
 	"context"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,6 +97,33 @@ func TestRequestAtPayloadBoundaryIsTypedTooLarge(t *testing.T) {
 	require.ErrorAs(t, err, &werr,
 		"callers switch on the code, so an untyped publish failure is a miscategorized one")
 	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
+}
+
+func TestOversizeHandlerErrorStillTerminates(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	// An err frame spends max_payload on the message twice, so two thirds of
+	// the limit is already more than the whole frame can hold.
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return errors.New(strings.Repeat("e", boundaryMaxPayload*2/3))
+	})
+
+	const inactivity = 3 * time.Second
+	start := time.Now()
+	s, err := client(t, nc, inactivity).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.Nil(t, frames[0].Err, "the gateway must still be able to report its own failure")
+	m, err := jsonrpc.Decode(frames[0].Body)
+	require.NoError(t, err)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, jsonrpc.CodeInternalError, m.Error.Code)
+	assert.Contains(t, m.Error.Message, "error message dropped")
+	assert.Equal(t, `"1"`, m.IDKey(), "the id is what the caller correlates on; it survives")
+	assert.Less(t, time.Since(start), inactivity,
+		"the failure must be reported, not waited out on the inactivity deadline")
 }
 
 func TestNotificationAtPayloadBoundaryIsTypedTooLarge(t *testing.T) {

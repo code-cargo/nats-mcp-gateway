@@ -852,7 +852,33 @@ func (w *streamWriter) errWithID(id []byte, code int, message string, data any) 
 	body, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, data))
 	if err != nil {
 		body = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"error encoding failed"}}`)
+	} else if max := w.nc.MaxPayload(); int64(len(body))+errOverhead(code, message) > max {
+		// This frame is the last thing the stream can say, and it carries the
+		// message twice — in the body and in micro's error header — so a
+		// handler error over about half of max_payload (a backend quoting the
+		// request back at us) would cost the caller the report as well as the
+		// response, and leave them waiting out the inactivity window for an
+		// ErrCodeStreamLost that invites a retry into the same wall. Nothing
+		// smaller follows a terminal frame, so spend the message to keep it.
+		// The id stays: the shim writes this body through to its client
+		// verbatim, which correlates on that id and nothing else.
+		message = fmt.Sprintf("error message dropped: %d bytes does not fit NATS max_payload %d", len(message), max)
+		if fitted, ferr := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, nil)); ferr == nil {
+			body = fitted
+		}
 	}
 	return w.req.Error(strconv.Itoa(code), message, body,
 		micro.WithHeaders(micro.Headers{HeaderFrame: []string{string(FrameErr)}}))
+}
+
+// errOverhead is the header cost of an err frame. Unlike end and msg, whose
+// headers are fixed, micro's Request.Error copies the message into
+// Nats-Service-Error — so this frame's headers grow with what it is
+// reporting, and the message is charged to max_payload twice over.
+func errOverhead(code int, message string) int64 {
+	return frameOverhead(nats.Header{
+		HeaderFrame:           []string{string(FrameErr)},
+		micro.ErrorHeader:     []string{message},
+		micro.ErrorCodeHeader: []string{strconv.Itoa(code)},
+	})
 }
