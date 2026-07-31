@@ -244,15 +244,24 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 	// recovery below. DecodeParams also walks the whole document to reject
 	// ambiguous keys, so re-decoding per consumer would multiply the one cost
 	// this comment exists to avoid.
+	//
+	// Both failures below send the request onward with no Mcp-Name, which a
+	// conformant server answers with its own -32020. That is the right
+	// direction to fail, but it is opaque from the far side, so say what
+	// happened here — the same reason paramHeadersFor logs its skips.
 	params, err := mcpspec.DecodeParams(msg.Params)
 	if err != nil {
 		// Unreachable from the wire — pkg/proxy.Check decoded the same bytes
 		// before authorizing them — but this Conn is also driven directly by
 		// tests and by the legacy bridge, so it must not invent a name.
+		c.log.Warn("params could not be read; sending without Mcp-Name",
+			"method", msg.Method, "err", err)
 		params = mcpspec.Params{}
 	}
 	name, _, err := params.Name(msg.Method)
 	if err != nil {
+		c.log.Warn("params name could not be read; sending without Mcp-Name",
+			"method", msg.Method, "err", err)
 		name = ""
 	}
 	// Captured before the request goes out, so the recovery can compare what
@@ -758,9 +767,16 @@ func (c *httpConn) paramHeadersFor(msg *jsonrpc.Message, params mcpspec.Params, 
 	}
 	// Raw, not a plain map index: reading "arguments" is what obliges the
 	// gateway to refuse an "ARGUMENTS" sibling that a case-folding backend
-	// would bind instead.
+	// would bind instead. In practice DecodeParams already refused it — every
+	// top-level key is checked there — so this is the rule stated where it is
+	// relied on rather than a second line of defense.
 	args, ok, err := params.Raw("arguments")
-	if err != nil || !ok {
+	if err != nil {
+		c.log.Warn("tool arguments cannot be read; mirroring no headers",
+			"tool", name, "err", err)
+		return nil
+	}
+	if !ok {
 		return nil
 	}
 	headers, skipped := paramHeaders(annots, args)

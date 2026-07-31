@@ -646,3 +646,70 @@ func (s *staleTokenSource) Invalidate() {
 	defer s.mu.Unlock()
 	s.fresh = true
 }
+
+// TestUnreadableParamsSendNoName pins the fallback in roundTripOnce.
+//
+// A body whose params cannot be read unambiguously is unreachable from the
+// wire — pkg/proxy.Check decoded the same bytes before authorizing them — but
+// this Conn is also driven directly by the legacy bridge and by tests, so the
+// behavior has to be defined rather than incidental. The gateway must not
+// invent a name: it sends the request with no Mcp-Name and lets the server
+// answer, which a conformant one does with its own -32020. Guessing either
+// reading would put a name on the wire that nothing verified.
+func TestUnreadableParamsSendNoName(t *testing.T) {
+	var sawName string
+	var sawNameHeader bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawName, sawNameHeader = r.Header.Get(mcpspec.HeaderName), r.Header.Values(mcpspec.HeaderName) != nil
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
+			msg.ID, mcpspec.ErrHeaderMismatch, "Mcp-Name missing", nil))
+		_, _ = w.Write(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// Two readings, "a" and "b", and the gateway is entitled to neither.
+	resp, err := m.Call(context.Background(), jsonrpc.NewRequest(
+		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":"a","name":"b"}`)), nil)
+	require.NoError(t, err)
+
+	assert.False(t, sawNameHeader, "an unreadable name must not be guessed at, got %q", sawName)
+	require.NotNil(t, resp.Error)
+	assert.Equal(t, mcpspec.ErrHeaderMismatch, resp.Error.Code,
+		"the server's own rejection must reach the caller unchanged")
+}
+
+// TestNonStringNameSendsNoName is the same rule for a name that is present
+// but is not a string: "" is what an ABSENT name decodes to, so reading one
+// as the other would send a request claiming to name nothing.
+func TestNonStringNameSendsNoName(t *testing.T) {
+	var sawNameHeader bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawNameHeader = r.Header.Values(mcpspec.HeaderName) != nil
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, json.RawMessage(`{}`)))
+		_, _ = w.Write(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	_, err = m.Call(context.Background(), jsonrpc.NewRequest(
+		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":{"toString":"echo"}}`)), nil)
+	require.NoError(t, err)
+	assert.False(t, sawNameHeader, "a non-string name must not become an empty one")
+}

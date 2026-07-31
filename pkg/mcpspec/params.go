@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -59,7 +60,9 @@ import (
 // under ASP.NET Core, so on such a backend {"name":"get_issue","NAME":"del"}
 // executes del while an exact-key gateway happily authorizes get_issue. The
 // gateway cannot know which parser is on the far end, so it refuses keys that
-// differ only by case — Unicode folding, not lowercasing, since ſ folds to s.
+// differ only by case, under a relation wide enough to cover every rule a real
+// backend applies — see EqualFoldKey, which is neither plain lowercasing nor
+// plain folding.
 //
 // How widely that refusal applies depends on who owns the field names:
 //
@@ -366,21 +369,13 @@ func (p Params) ProtocolVersion() (string, error) {
 // scanValueTokens in the tests is the readable Token()-based statement of the
 // same rule, and FuzzScanUnambiguous holds the two to identical verdicts.
 func scanUnambiguous(raw []byte) error {
-	// One frame per open container, innermost last. A nil keys map marks an
-	// array, where strings are values and repetition is legal.
-	type frame struct {
-		keys      map[string]struct{}
-		expectKey bool
-	}
-	var stack []frame
-	top := func() *frame {
-		if len(stack) == 0 {
-			return nil
-		}
-		return &stack[len(stack)-1]
-	}
+	var stack []scanFrame
 
 	for i := 0; i < len(raw); {
+		var top *scanFrame
+		if n := len(stack); n > 0 {
+			top = &stack[n-1]
+		}
 		switch c := raw[i]; c {
 		case ' ', '\t', '\n', '\r':
 			i++
@@ -388,40 +383,43 @@ func scanUnambiguous(raw []byte) error {
 			if len(stack) >= MaxParamsDepth {
 				return ErrParamsTooDeep
 			}
-			f := frame{expectKey: c == '{'}
-			if c == '{' {
-				f.keys = map[string]struct{}{}
-			}
-			stack = append(stack, f)
+			stack = append(stack, scanFrame{isObject: c == '{', expectKey: c == '{'})
 			i++
 		case '}', ']':
-			if len(stack) == 0 {
+			if top == nil {
 				return ErrParamsNotObject
 			}
 			stack = stack[:len(stack)-1]
 			i++
 		case ',':
-			if f := top(); f != nil && f.keys != nil {
-				f.expectKey = true
+			if top != nil && top.isObject {
+				top.expectKey = true
 			}
 			i++
 		case ':':
-			if f := top(); f != nil {
-				f.expectKey = false
+			if top != nil {
+				top.expectKey = false
 			}
 			i++
 		case '"':
-			key, next, err := scanString(raw, i)
+			// Find the end first and decode only if this string is a KEY.
+			// Most strings in a body are values — every field of every record
+			// in a tool-call argument array — and materializing those just to
+			// discard them was most of what this pass allocated.
+			end, exact, err := scanStringEnd(raw, i)
 			if err != nil {
 				return err
 			}
-			if f := top(); f != nil && f.keys != nil && f.expectKey {
-				if _, dup := f.keys[key]; dup {
-					return &AmbiguousKeyError{Key: key, Other: key}
+			if top != nil && top.isObject && top.expectKey {
+				key, err := decodeStringSpan(raw, i, end, exact)
+				if err != nil {
+					return err
 				}
-				f.keys[key] = struct{}{}
+				if err := top.addKey(key); err != nil {
+					return err
+				}
 			}
-			i = next
+			i = end
 		default:
 			// A number, true, false or null. Nothing inside one can be a key,
 			// and its VALUE is never read here, so step over it without
@@ -442,6 +440,53 @@ func scanUnambiguous(raw []byte) error {
 	return nil
 }
 
+// smallObjectKeys is the size below which a frame compares keys by linear
+// scan instead of hashing them into a map.
+//
+// The scan holds one frame per OPEN container, so an array of 50k small
+// records opens and closes 50k of them. A map each cost more than the rest of
+// the pass put together — ~10x the payload in allocations, on the path a
+// caller reaches before any authorization happens. Real JSON objects are
+// small and this bound is generous; beyond it the map's O(1) wins and the
+// frame promotes.
+const smallObjectKeys = 16
+
+// scanFrame tracks one open container: which keys its object has already
+// named, and whether the next string is a key or a value.
+type scanFrame struct {
+	isObject  bool
+	expectKey bool
+	// Exactly one of these is in use. keys is nil until the object outgrows
+	// smallObjectKeys, at which point small is drained into it and abandoned.
+	small []string
+	keys  map[string]struct{}
+}
+
+// addKey records key, reporting an error if the object already named it.
+func (f *scanFrame) addKey(key string) error {
+	if f.keys != nil {
+		if _, dup := f.keys[key]; dup {
+			return &AmbiguousKeyError{Key: key, Other: key}
+		}
+		f.keys[key] = struct{}{}
+		return nil
+	}
+	if slices.Contains(f.small, key) {
+		return &AmbiguousKeyError{Key: key, Other: key}
+	}
+	if len(f.small) < smallObjectKeys {
+		f.small = append(f.small, key)
+		return nil
+	}
+	f.keys = make(map[string]struct{}, len(f.small)*2)
+	for _, prior := range f.small {
+		f.keys[prior] = struct{}{}
+	}
+	f.keys[key] = struct{}{}
+	f.small = nil
+	return nil
+}
+
 func isJSONStructural(c byte) bool {
 	switch c {
 	case '{', '}', '[', ']', ',', ':', '"', ' ', '\t', '\n', '\r':
@@ -450,18 +495,14 @@ func isJSONStructural(c byte) bool {
 	return false
 }
 
-// scanString reads the JSON string starting at raw[i] (which must be the
-// opening quote) and returns its DECODED value and the index just past the
-// closing quote.
+// scanStringEnd locates the end of the JSON string starting at raw[i] (which
+// must be the opening quote). It returns the index just past the closing
+// quote, and whether the span between the quotes is already the string's
+// exact value — true when it holds no escape and is valid UTF-8.
 //
-// Decoded, not raw, because two keys can be distinct byte strings and the
-// same key to a parser. `"a"` and `"a"` is the obvious pair. The one a
-// fuzzer finds is invalid UTF-8: encoding/json substitutes U+FFFD for every
-// unreadable byte, so `{"\xf0":1,"\x80":2}` is two keys here and one key to
-// a Go backend — ambiguity by exactly the definition this scan exists to
-// reject. Both cases route through json.Unmarshal so the answer is the
-// decoder's own, not a second guess at its rules.
-func scanString(raw []byte, i int) (string, int, error) {
+// Splitting this from the decode is what lets the scan skip over string
+// VALUES without allocating: only a key ever needs its text.
+func scanStringEnd(raw []byte, i int) (end int, exact bool, err error) {
 	escaped := false
 	for j := i + 1; j < len(raw); j++ {
 		switch raw[j] {
@@ -469,15 +510,28 @@ func scanString(raw []byte, i int) (string, int, error) {
 			escaped = true
 			j++ // the escaped byte cannot end the string
 		case '"':
-			if !escaped && utf8.Valid(raw[i+1:j]) {
-				return string(raw[i+1 : j]), j + 1, nil
-			}
-			var s string
-			if err := json.Unmarshal(raw[i:j+1], &s); err != nil {
-				return "", 0, ErrParamsNotObject
-			}
-			return s, j + 1, nil
+			return j + 1, !escaped && utf8.Valid(raw[i+1:j]), nil
 		}
 	}
-	return "", 0, ErrParamsNotObject // unterminated
+	return 0, false, ErrParamsNotObject // unterminated
+}
+
+// decodeStringSpan returns the value of the JSON string occupying raw[i:end].
+//
+// Decoded, not raw, because two keys can be distinct byte strings and the
+// same key to a parser. `"a"` and `"\u0061"` is the obvious pair. The one a
+// fuzzer finds is invalid UTF-8: encoding/json substitutes U+FFFD for every
+// unreadable byte, so `{"\xf0":1,"\x80":2}` is two keys here and one key to
+// a Go backend — ambiguity by exactly the definition this scan exists to
+// reject. Anything but the exact case routes through json.Unmarshal, so the
+// answer is the decoder's own rather than a second guess at its rules.
+func decodeStringSpan(raw []byte, i, end int, exact bool) (string, error) {
+	if exact {
+		return string(raw[i+1 : end-1]), nil
+	}
+	var s string
+	if err := json.Unmarshal(raw[i:end], &s); err != nil {
+		return "", ErrParamsNotObject
+	}
+	return s, nil
 }
