@@ -820,3 +820,47 @@ func (s *staleTokenSource) Invalidate() {
 	defer s.mu.Unlock()
 	s.fresh = true
 }
+
+// TestBackendErrorDoesNotEchoTheURLsSecrets covers what a transport error
+// carries to the caller.
+//
+// net/http quotes the request URL into every transport error, the proxy
+// forwards a backend's JSON-RPC error verbatim, and a backend URL is a
+// documented place to expand a secret into. So "connection refused" — which
+// any caller can provoke against an unreachable backend — was enough to read
+// an api_key out of the query string. Go redacts userinfo passwords and
+// nothing else.
+func TestBackendErrorDoesNotEchoTheURLsSecrets(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1:1/mcp?api_key=SUPERSECRET",
+		"http://127.0.0.1:1/mcp?a=1&token=SUPERSECRET#frag",
+		"http://user:SUPERSECRET@127.0.0.1:1/mcp",
+		"http://127.0.0.1:1/mcp?api_key=SUPERSECRET&x=2",
+	} {
+		b := &HTTPBackend{URL: raw}
+		conn, err := b.Connect(context.Background())
+		require.NoError(t, err)
+		m := NewMux(conn, nil)
+		resp, err := m.Call(context.Background(),
+			jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Error)
+		assert.NotContains(t, resp.Error.Message, "SUPERSECRET", "url %q leaked to the caller", raw)
+		assert.Contains(t, resp.Error.Message, "127.0.0.1:1",
+			"the host must survive: which backend failed is the whole content of the error")
+		_ = m.Close()
+	}
+}
+
+func TestScrubURLsKeepsErrorsDiagnosable(t *testing.T) {
+	cases := map[string]string{
+		`Post "http://h/mcp?k=s": refused`: `Post "http://h/mcp?[redacted]": refused`,
+		`Post "http://u:p@h/mcp": refused`: `Post "http://h/mcp": refused`,
+		`Post "http://h/mcp": refused`:     `Post "http://h/mcp": refused`,
+		`dial tcp 1.2.3.4:80: no route`:    `dial tcp 1.2.3.4:80: no route`,
+		`Get "https://h/a/b#frag" failed`:  `Get "https://h/a/b" failed`,
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, scrubURLs(in), "input %q", in)
+	}
+}

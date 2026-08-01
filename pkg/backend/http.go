@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -501,11 +503,53 @@ func (c *httpConn) deliver(m *jsonrpc.Message) {
 // fail synthesizes an error response for a request whose HTTP exchange
 // failed, so the mux's caller gets an answer instead of a timeout.
 func (c *httpConn) fail(msg *jsonrpc.Message, detail string) {
+	// The operator gets the detail intact; the caller gets it with any URL
+	// stripped of what a URL can carry. net/http quotes the request URL into
+	// every transport error, the proxy forwards a backend's JSON-RPC error
+	// verbatim, and a backend URL is a documented place to expand a secret
+	// into — "http://host/mcp?api_key=${KEY}" reaches the caller in full on
+	// nothing more than a connection refused. Go redacts userinfo passwords
+	// and nothing else.
 	c.log.Warn("http backend error", "method", msg.Method, "detail", detail)
 	if msg.Kind() != jsonrpc.KindRequest {
 		return
 	}
-	c.deliver(jsonrpc.NewErrorResponse(msg.ID, jsonrpc.CodeInternalError, detail, nil))
+	c.deliver(jsonrpc.NewErrorResponse(msg.ID, jsonrpc.CodeInternalError, scrubURLs(detail), nil))
+}
+
+// urlInText matches a URL embedded in free-form error text.
+var urlInText = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'` + "`" + `]+`)
+
+// scrubURLs removes the credential-bearing parts of every URL in s, keeping
+// enough for the failure to stay diagnosable: the scheme, host and path say
+// which backend could not be reached, which is the whole content of a
+// transport error. Userinfo and query string are what a secret is expanded
+// into, and neither tells the caller anything it is owed.
+func scrubURLs(s string) string {
+	return urlInText.ReplaceAllStringFunc(s, func(raw string) string {
+		// Trailing punctuation belongs to the sentence, not the URL.
+		trailer := ""
+		for len(raw) > 0 && strings.ContainsRune(`.,;:)]}"'`, rune(raw[len(raw)-1])) {
+			trailer, raw = raw[len(raw)-1:]+trailer, raw[:len(raw)-1]
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			// Unparseable is exactly when a secret is most likely to be in
+			// there, so keep only up to the authority.
+			if i := strings.Index(raw, "://"); i >= 0 {
+				if j := strings.IndexAny(raw[i+3:], "/?#"); j >= 0 {
+					return raw[:i+3+j] + "/[redacted]" + trailer
+				}
+			}
+			return "[redacted url]" + trailer
+		}
+		u.User = nil
+		if u.RawQuery != "" {
+			u.RawQuery = "[redacted]"
+		}
+		u.Fragment = ""
+		return u.String() + trailer
+	})
 }
 
 func (c *httpConn) Close() error {
