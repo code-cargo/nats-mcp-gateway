@@ -617,3 +617,27 @@ func TestQueueGroupDefaults(t *testing.T) {
 	s = serve(t, nc, ServerConfig{Tenant: "acme", User: "u1", QueueGroup: "custom"}, nil)
 	assert.Equal(t, "custom", s.queueGroup, "an explicit group is always respected")
 }
+
+// TestNewClientRejectsAnUnusableSubjectPrefix closes the gap between the two
+// prefixes a client carries.
+//
+// --inbox-prefix is validated by every caller; --subject-prefix was not, and
+// BuildSubject checks every token EXCEPT the prefix it pastes in. A trailing
+// dot or a wildcard therefore built a subject nothing serves, and the caller
+// was told -32011 — "no gateway is serving this server" — about a fleet that
+// is serving it fine. Validating in NewClient rather than in each subcommand
+// means a future caller cannot forget it.
+func TestNewClientRejectsAnUnusableSubjectPrefix(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
+		_, err := NewClient(nc, ClientConfig{Prefix: prefix, Tenant: "acme"})
+		assert.Error(t, err, "prefix %q builds subjects nothing can serve", prefix)
+	}
+	// The ordinary cases still work, including the empty prefix that means
+	// "use DefaultPrefix".
+	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
+		c, err := NewClient(nc, ClientConfig{Prefix: prefix, Tenant: "acme"})
+		require.NoError(t, err, "prefix %q is legitimate", prefix)
+		require.NotNil(t, c)
+	}
+}
