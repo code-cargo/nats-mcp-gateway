@@ -34,6 +34,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
+	"syscall"
 )
 
 func ctxT(t *testing.T) context.Context {
@@ -661,4 +662,56 @@ func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	assert.LessOrEqual(t, inner.count(), 6, "unchanged ExpiresAt must refresh at fixed cadence, not accelerate")
+}
+
+// TestCancelDoesNotSignalAReapedPid guards the pid the cancel is aimed at.
+//
+// Cmd.Wait reaps the child before it reads the cancel result, so Cancel runs
+// after the pid is free often enough to matter. The pid is also a process
+// GROUP id here, so a signal aimed at a freed one is a SIGKILL delivered to
+// whatever now holds that pgid. os.Process is what refuses to signal a reaped
+// pid — it marks the process done before Wait4 for exactly this reason — and a
+// raw syscall.Kill consults nothing.
+//
+// Asserted through os.Process rather than by racing a real helper: the test
+// that a signal is not sent is a test about a window too narrow to hit
+// reliably, and the property that closes it is "the leader is killed through
+// os.Process".
+func TestCancelDoesNotSignalAReapedPid(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, cmd.Start())
+	pgid := cmd.Process.Pid
+	require.NoError(t, cmd.Wait(), "the child is now reaped and its pid is free")
+
+	// A live group standing in for whatever recycled that pid. A raw
+	// syscall.Kill(-pgid) would take it; os.Process.Kill will not.
+	assert.ErrorIs(t, cmd.Process.Kill(), os.ErrProcessDone,
+		"os.Process must refuse to signal a pid it has already reaped")
+	_ = pgid
+}
+
+// TestExecCancelStillKillsTheGroupWhenTheHelperIsLive is the other half: the
+// guard must not have cost the group kill it was protecting.
+func TestExecCancelStillKillsTheGroupWhenTheHelperIsLive(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sh -c 'echo > "$READY"; sleep 60' &
+sleep 60
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startResolve(ctx, r)
+	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil },
+		30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
+
+	cancel()
+	start := time.Now()
+	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"))
+	assert.Less(t, time.Since(start), helperWaitDelay,
+		"the group kill must still reach the child, not fall back to the grace period")
 }

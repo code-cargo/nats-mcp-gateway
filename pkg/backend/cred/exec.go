@@ -71,15 +71,31 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	// the life of the gateway instead of failing and backing off.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
-		// Negative pid = the process group created above. ESRCH means it is
-		// already gone, which os/exec reads as "nothing was interrupted" —
-		// the answer that keeps a helper finishing a hair before the deadline
-		// from being reported as cancelled.
-		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
+		// The leader goes through os.Process, not syscall.Kill, because
+		// os.Process refuses to signal a pid it has already reaped — it sets
+		// statusDone before Wait4 for exactly that reason, and on Linux with
+		// pidfd it cannot be fooled by reuse at all. Cmd.Wait reaps before it
+		// reads the cancel result, so this runs after the reap often enough to
+		// matter, and the pid being signalled is a process GROUP id: aimed at
+		// a freed one it is a SIGKILL delivered to whatever now holds that
+		// pgid, which on this host is as likely as not another backend's
+		// subprocess tree.
+		//
+		// ErrProcessDone here means the helper finished a hair before the
+		// deadline, which os/exec reads as "nothing was interrupted" — the
+		// answer that keeps such a helper from being reported as cancelled.
+		if err := cmd.Process.Kill(); err != nil {
+			return err
 		}
-		return err
+		// The leader answered to a signal a moment ago, so its pid is still
+		// ours and so is the group named by it. Anything it forked is what
+		// this reaches; anything that outlives the group is what WaitDelay
+		// below bounds.
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
+			!errors.Is(err, syscall.ESRCH) {
+			return err
+		}
+		return nil
 	}
 	cmd.WaitDelay = helperWaitDelay
 	cmd.Env = []string{
