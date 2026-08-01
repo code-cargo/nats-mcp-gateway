@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -125,12 +126,59 @@ var credInURL = regexp.MustCompile(`(://[^:/@]*:)[^@]*?(@)`)
 // The error still unwraps, so callers matching on nats.ErrNoServers and friends
 // are unaffected.
 func connectFailure(raw string, err error) error {
+	msg := fmt.Sprintf("connect NATS %s: %v", redactNATSURL(raw), err)
+	// The literal secrets first, then the pattern. connectFailure is handed
+	// the raw URL, so it already HOLDS what needs removing and does not have
+	// to re-derive the rules redactNATSURL applies — a second, textual
+	// derivation kept reaching a different answer than the first, and the
+	// weaker of the two was the one covering the half we do not format. It
+	// missed a colon-less userinfo entirely (nats.go reads that as an auth
+	// token, so it IS the credential) and stopped at the first @ of a
+	// password rather than the last.
+	//
+	// Both renderings, because a *url.Error quotes its input: a tab in a
+	// token arrives as \t, and searching for the raw byte would miss it.
+	//
+	// Order matters. Scrubbing after the pattern would search for text the
+	// pattern has already rewritten.
+	for _, secret := range urlSecrets(raw) {
+		msg = strings.ReplaceAll(msg, secret, redacted)
+		if quoted := strconv.Quote(secret); len(quoted) > 2 {
+			msg = strings.ReplaceAll(msg, quoted[1:len(quoted)-1], redacted)
+		}
+	}
 	return &connectError{
-		msg: credInURL.ReplaceAllString(
-			fmt.Sprintf("connect NATS %s: %v", redactNATSURL(raw), err), "${1}"+redacted+"${2}",
-		),
+		msg: credInURL.ReplaceAllString(msg, "${1}"+redacted+"${2}"),
 		err: err,
 	}
+}
+
+// urlSecrets returns the credential in each element of a NATS URL list, by the
+// same two rules redactNATSURL uses: userinfo ends at the LAST "@" before the
+// host, and a userinfo with no colon is itself the secret, because nats.go
+// reads a passwordless userinfo as an auth token.
+func urlSecrets(raw string) []string {
+	var out []string
+	for _, u := range strings.Split(raw, ",") {
+		if n := strings.Index(u, "://"); n >= 0 {
+			u = u[n+3:]
+		}
+		at := strings.LastIndex(u, "@")
+		if at < 0 {
+			continue
+		}
+		userinfo := u[:at]
+		if _, pass, ok := strings.Cut(userinfo, ":"); ok {
+			if pass != "" {
+				out = append(out, pass)
+			}
+			continue
+		}
+		if userinfo != "" {
+			out = append(out, userinfo)
+		}
+	}
+	return out
 }
 
 type connectError struct {

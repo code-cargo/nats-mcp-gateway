@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -131,18 +132,39 @@ func TestConnectFailureRedactsThroughTheWrappedError(t *testing.T) {
 		"nats://gw:s3c r3t@127.0.0.1:14222",
 		"nats://gw:p%ss@127.0.0.1:14222",
 		"nats://gw:s3cr3t@[::1:14222",
+		// This one used to pass for the wrong reason: it PARSES, so
+		// nats.Connect never returns a *url.Error and the raw string never
+		// entered the message. The bracket is what puts it on the leaking
+		// path, which is where the @-in-password rule actually matters —
+		// userinfo ends at the LAST @, and a scrubber that stops at the first
+		// leaves the tail behind.
+		"nats://gw:s3c@r3t@[::1:14222",
 		"nats://gw:s3c@r3t@127.0.0.1:14222",
 		"nats://gw:pw1@a:4222,nats://gw:pw2@b:4222",
+		// No colon in the userinfo: nats.go reads the whole thing as an auth
+		// token, so the "username" IS the credential. A pattern requiring a
+		// colon never matches these, and an ordinary opaque token behind a
+		// mistyped bracket or a stray space in the host is enough.
+		"nats://S3CR3TTOKEN@[::1:14222",
+		"nats://S3CR3TTOKEN@ho st:14222",
+		"nats://tok%S3CR3T@127.0.0.1:14222",
 	} {
 		err := runGateway(
 			&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: raw},
 			&Globals{LogLevel: "error"}, "0.0.0",
 		)
 		require.Error(t, err)
-		for _, secret := range []string{"s3c r3t", "p%ss", "s3cr3t", "s3c@r3t", "pw1", "pw2"} {
+		for _, secret := range []string{
+			"s3c r3t", "p%ss", "s3cr3t", "s3c@r3t", "r3t", "pw1", "pw2",
+			"S3CR3TTOKEN", "S3CR3T",
+		} {
 			assert.NotContains(t, err.Error(), secret,
 				"password reached the error for %q", raw)
 		}
-		assert.Contains(t, err.Error(), "gw:", "the username must survive: it is a diagnosis")
+		// A username survives only when there IS one. A colon-less userinfo
+		// is entirely the credential, so nothing of it may remain.
+		if strings.Contains(raw, "gw:") {
+			assert.Contains(t, err.Error(), "gw:", "the username must survive: it is a diagnosis")
+		}
 	}
 }
