@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -224,6 +225,82 @@ func TestNoGateway(t *testing.T) {
 	require.NotNil(t, frames[0].Err)
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 	assert.Less(t, time.Since(start), 2*time.Second, "no-responders must fail fast, not wait out inactivity")
+}
+
+// Every request hangs a cancellable child off its caller's context, and only
+// Stream.Close, a permission violation or a failed publish ever released it —
+// never the normal terminal frame. A caller that outlives its requests (the
+// shim runs one context for the whole process and issues every request under
+// it) therefore accumulated one cancelCtx per completed request, forever.
+func TestCompletedRequestReleasesItsCallerContext(t *testing.T) {
+	nc := runNATS(t, nil)
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	caller := &countingCtx{done: make(chan struct{})}
+	c := client(t, nc, 5*time.Second)
+	for i := 0; i < 20; i++ {
+		s, err := c.Do(caller, testRequest("1", "tools/call"))
+		require.NoError(t, err)
+		frames := collect(t, s)
+		require.Len(t, frames, 1)
+		require.Equal(t, FrameEnd, frames[0].Kind)
+	}
+	require.Positive(t, caller.peak(), "the requests must have registered on the caller's context at all")
+
+	// The release lands just behind the frame channel's close, so let the last
+	// request's goroutine finish unwinding.
+	assert.Eventually(t, caller.empty, 2*time.Second, 10*time.Millisecond,
+		"completed requests are still registered on the caller's context")
+}
+
+// countingCtx is a cancellable context that counts what is registered against
+// it. context keeps its own child registry unexported, but it hands
+// registration to a parent that implements AfterFunc — so a parent that does
+// gets to watch the wire register a request and, once fixed, release it. The
+// context is never actually cancelled: outliving its requests is the point.
+type countingCtx struct {
+	done chan struct{}
+
+	mu   sync.Mutex
+	live int
+	seen int
+}
+
+func (c *countingCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c *countingCtx) Done() <-chan struct{}       { return c.done }
+func (c *countingCtx) Err() error                  { return nil }
+func (c *countingCtx) Value(any) any               { return nil }
+
+func (c *countingCtx) AfterFunc(func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.live++
+	c.seen++
+	released := false
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if released {
+			return false
+		}
+		released = true
+		c.live--
+		return true
+	}
+}
+
+func (c *countingCtx) empty() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.live == 0
+}
+
+func (c *countingCtx) peak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
 }
 
 func TestOversizeRequestFailsBeforePublish(t *testing.T) {

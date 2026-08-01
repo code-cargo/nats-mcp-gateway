@@ -278,6 +278,12 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	frames := make(chan Frame)
 	s := &Stream{C: frames, reply: reply, nc: c.nc, stop: func() { stop(nil) }}
 	go func() {
+		// streamCtx is a child of the CALLER's context, which typically
+		// outlives the request by a long way — the shim runs one context for
+		// the whole process. Releasing it here is what stops a completed
+		// request from staying registered on that parent for good; Close and
+		// the failure paths reach the same cancel, and it is idempotent.
+		defer stop(nil)
 		defer unregister()
 		c.pump(streamCtx, sub, frames)
 	}()
