@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,6 +281,83 @@ func TestDrainTerminatesLiveStreams(t *testing.T) {
 	require.NotNil(t, m.Error)
 	assert.Equal(t, ErrCodeStreamLost, m.Error.Code)
 	assert.Contains(t, m.Error.Message, "draining")
+}
+
+// Shutdown must never report a completed drain while the gateway is still
+// taking work on. micro stops an endpoint with Subscription.Drain, which
+// returns as soon as the UNSUB is buffered — the request published a moment
+// earlier is still delivered to the handler afterwards. A drain that returns
+// in that window leaves the caller with no terminal frame at all once the
+// process exits, costing it the whole inactivity window.
+func TestShutdownDoesNotAbandonRequestsItAccepts(t *testing.T) {
+	nc := runNATS(t, nil)
+
+	var running atomic.Int32
+	var drainReturned, lateStart atomic.Bool
+	srv := serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		if drainReturned.Load() {
+			lateStart.Store(true)
+		}
+		running.Add(1)
+		defer running.Add(-1)
+		// Long enough that a handler picked up before the drain finished is
+		// unmistakably still running when Shutdown returns.
+		time.Sleep(200 * time.Millisecond)
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	// Inactivity far beyond collect's own fatal timeout: a caller left without
+	// a terminal frame fails the test rather than quietly waiting it out.
+	s, err := client(t, nc, 30*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+
+	// No handshake with the handler first: the request is on the wire but not
+	// yet dispatched, which is precisely the window Shutdown has to cover.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = srv.Shutdown(shutdownCtx)
+	drainReturned.Store(true)
+	stillRunning := running.Load()
+	require.NoError(t, err)
+	assert.Zero(t, stillRunning, "Shutdown reported a completed drain with a handler still running")
+
+	// A dispatch landing after the drain is the same failure seen from the
+	// other side — nothing is left to wait for it.
+	time.Sleep(500 * time.Millisecond)
+	assert.False(t, lateStart.Load(), "a request was dispatched after Shutdown reported a completed drain")
+
+	// Whichever side of the drain it fell on, the caller gets a terminal frame.
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	assert.True(t, frames[0].Kind.Terminal())
+}
+
+// Once the drain has stopped waiting for new work, a request micro still
+// delivers is answered rather than dropped: the caller re-issues against
+// another replica instead of spending its whole inactivity window on a reply
+// that is never coming.
+func TestDrainedGatewayRefusesRatherThanGoingSilent(t *testing.T) {
+	nc := runNATS(t, nil)
+	srv := serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		t.Error("a drained gateway must not take on a handler")
+		return nil
+	})
+	// Marked without stopping the services, so the request still routes and
+	// the refusal is unambiguously what answers it.
+	srv.drainMu.Lock()
+	srv.draining = true
+	srv.drainMu.Unlock()
+
+	s, err := client(t, nc, 30*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	m, err := jsonrpc.Decode(frames[0].Body)
+	require.NoError(t, err)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, ErrCodeStreamLost, m.Error.Code)
+	assert.JSONEq(t, `"1"`, string(m.ID), "the refusal must echo the id so the client can fail that request")
 }
 
 func TestBadWireVersionRejected(t *testing.T) {

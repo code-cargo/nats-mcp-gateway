@@ -119,7 +119,17 @@ type Server struct {
 
 	base   context.Context
 	cancel context.CancelCauseFunc
-	wg     sync.WaitGroup
+
+	// Requests keep arriving after stopAllServices returns: micro stops an
+	// endpoint with Subscription.Drain, which only buffers the UNSUB. drainMu
+	// fuses "has the drain given up on new work?" and "reserve a slot in wg"
+	// into one decision, so once Shutdown starts waiting the counter can only
+	// fall. Without it an Add can land on a zero counter concurrently with
+	// Wait — the misuse sync.WaitGroup documents, and the exact window in
+	// which Shutdown reports a clean drain while a handler is still running.
+	drainMu  sync.Mutex
+	draining bool
+	wg       sync.WaitGroup
 }
 
 // Serve starts the wire server with the given initial server set. Each
@@ -251,9 +261,14 @@ func (s *Server) stopAllServices() error {
 
 // Shutdown drains: stop accepting requests on every server, terminate every
 // live stream with ErrCodeStreamLost so clients re-issue immediately, then
-// wait for handlers up to ctx's deadline.
+// wait for handlers up to ctx's deadline. A request micro hands over after
+// that wait is armed is refused with the same ErrCodeStreamLost — silence
+// would cost its caller the full inactivity window.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.stopAllServices()
+	s.drainMu.Lock()
+	s.draining = true
+	s.drainMu.Unlock()
 	s.cancel(errDraining)
 	done := make(chan struct{})
 	go func() {
@@ -271,7 +286,10 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // dispatch runs one request. It owns envelope decoding, the control-subject
 // subscription, the keepalive ticker, and the exactly-one-terminal guarantee.
 func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
-	s.wg.Add(1)
+	if !s.beginRequest() {
+		s.refuseDrained(req)
+		return
+	}
 	go func() {
 		defer s.wg.Done()
 
@@ -336,6 +354,32 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 			_ = w.Err(jsonrpc.CodeInternalError, "handler returned no response", nil)
 		}
 	}()
+}
+
+// beginRequest reserves the request's slot in the drain WaitGroup, reporting
+// false once Shutdown has stopped waiting for new work.
+func (s *Server) beginRequest() bool {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	if s.draining {
+		return false
+	}
+	s.wg.Add(1)
+	return true
+}
+
+// refuseDrained answers a request delivered after the drain gave up on it.
+// ErrCodeStreamLost is the same "re-issue" signal a request caught in flight
+// gets, and it reaches another replica in the time silence would have spent
+// waiting out the caller's inactivity window.
+func (s *Server) refuseDrained(req micro.Request) {
+	w := &streamWriter{nc: s.nc, req: req}
+	// Best effort on the id: a body that will not decode has none to echo,
+	// and re-issuing is the answer either way.
+	if msg, err := jsonrpc.Decode(req.Data()); err == nil {
+		w.id = msg.ID
+	}
+	_ = w.Err(ErrCodeStreamLost, "gateway draining, re-issue the request", nil)
 }
 
 func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWriter) {
