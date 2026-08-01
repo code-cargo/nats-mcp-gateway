@@ -269,9 +269,12 @@ type countingCtx struct {
 }
 
 func (c *countingCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
-func (c *countingCtx) Done() <-chan struct{}       { return c.done }
-func (c *countingCtx) Err() error                  { return nil }
-func (c *countingCtx) Value(any) any               { return nil }
+
+func (c *countingCtx) Done() <-chan struct{} { return c.done }
+
+func (c *countingCtx) Err() error { return nil }
+
+func (c *countingCtx) Value(any) any { return nil }
 
 func (c *countingCtx) AfterFunc(func()) func() bool {
 	c.mu.Lock()
