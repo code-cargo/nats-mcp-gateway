@@ -85,6 +85,18 @@ type Client struct {
 }
 
 // NewClient wraps an established NATS connection.
+//
+// It installs an async error handler on that connection, which is the only
+// channel NATS reports a permission violation on, and there is no way to take
+// one back off — SetErrorHandler replaces, and a client in the middle of a
+// chain cannot unlink itself. So a connection is meant to host a small fixed
+// number of clients; the CLIs create exactly one. A caller that churns clients
+// over one long-lived connection adds a link per client and keeps every one of
+// them reachable for as long as the connection lives.
+//
+// For the same reason, concurrent NewClient calls on ONE connection are not
+// safe: the previous handler is read straight off nc.Opts while another call
+// may be writing it. Sequential calls are fine.
 func NewClient(nc *nats.Conn, cfg ClientConfig) (*Client, error) {
 	// The prefix is validated here rather than by each caller because
 	// BuildSubject checks every other token and pastes this one in unchecked:
@@ -311,6 +323,7 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	if c.claims != nil {
 		msg.Header.Set(HeaderAcceptClaim, "1")
 	}
+
 	if err := c.nc.PublishMsg(msg); err != nil {
 		unregister()
 		stop(nil)
