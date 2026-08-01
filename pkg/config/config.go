@@ -237,7 +237,8 @@ func requireHTTPS(server, field, raw string, allowPlaintext bool) error {
 		}
 		return fmt.Errorf(
 			"server %q: %s %q sends credentials in cleartext; use https, or set allowPlaintext if something outside the gateway encrypts this hop (a service mesh sidecar, a tunnel)",
-			server, field, raw)
+			server, field, raw,
+		)
 	default:
 		return fmt.Errorf("server %q: %s %q must be https (or http to loopback)", server, field, raw)
 	}
