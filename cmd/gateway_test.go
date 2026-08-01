@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -904,6 +905,25 @@ func TestBuildBackendRejectsGenerationMismatch(t *testing.T) {
 	key.CredVersion = gen2
 	_, err = buildBackend(key, config.Server{Command: "true"}, resolver, testLogger())
 	require.NoError(t, err)
+}
+
+// The factory's own resolve is a second conduit for the same material: its
+// error becomes the pool's error, which the proxy hands the caller as -32010
+// with the text intact.
+func TestBuildBackendDoesNotEchoTheResolverDetail(t *testing.T) {
+	const detail = "helper stderr: no grant for /var/run/secrets/acme/u1.jwt (token AKIAWOULDBEBAD)"
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(context.Context, string, string, string) (*cred.Credentials, error) {
+			return nil, cred.Terminal(errors.New(detail))
+		},
+	), 0)
+
+	key := backend.Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 7}
+	_, err := buildBackend(key, config.Server{Command: "true"}, resolver, testLogger())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "u1.jwt", "the resolver's error text must not travel to the caller")
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD")
+	assert.Contains(t, err.Error(), "gateway ref ")
 }
 
 // A server removed from config must not leave its resolver (and cached
