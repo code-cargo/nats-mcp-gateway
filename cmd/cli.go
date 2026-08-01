@@ -68,7 +68,7 @@ type GatewayCmd struct {
 	ConfigEventsSubject string        `help:"NATS subject that signals a config change (fetch source)." default:"mcp.v1.cfg.changed" env:"NATSMCP_CONFIG_EVENTS_SUBJECT"`
 	ConfigRefetch       time.Duration `help:"Fetch source: periodic re-fetch as the missed-event safety net." default:"60s" env:"NATSMCP_CONFIG_REFETCH"`
 	NatsURL             string        `help:"NATS URL (fetch + inline sources)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS"`
+	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS,NATSMCP_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch + inline sources)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix         string        `help:"Custom NATS inbox prefix for this process's own request/reply (fetch + inline sources; the file source uses nats.inboxPrefix). A scoped instance should set it so its identity can be granted a narrow inbox instead of _INBOX.>." env:"NATSMCP_INBOX_PREFIX"`
 	QueueGroup          string        `help:"Wire queue group (fetch + inline sources; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
@@ -103,7 +103,7 @@ func (c *GatewayCmd) Run(g *Globals) error {
 type ShimCmd struct {
 	Server        string `help:"Name of the MCP server to front." required:"" env:"NATSMCP_SERVER"`
 	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS,NATSMCP_NATS_CREDS"`
 	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
 	User          string `help:"User subject token for attribution ('_' if unset). Must match the token this caller's NATS creds are scoped to under per-user auth." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
@@ -126,7 +126,7 @@ type CallCmd struct {
 	Method        string `help:"MCP method (e.g. tools/list)." required:""`
 	Params        string `help:"JSON params." default:"{}"`
 	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS,NATSMCP_NATS_CREDS"`
 	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
 	User          string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
