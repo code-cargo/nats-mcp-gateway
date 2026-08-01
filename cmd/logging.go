@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -104,3 +105,37 @@ func NewLogger(g *Globals) (*slog.Logger, error) {
 	}
 	return slog.New(handler), nil
 }
+
+// credInURL masks the password in any "scheme://user:password@" sequence,
+// wherever it appears in a longer string. Non-greedy to the first "@", which
+// a password may not contain unescaped and a host never does.
+var credInURL = regexp.MustCompile(`(://[^:/@]*:)[^@]*?(@)`)
+
+// connectFailure renders a NATS connect error with the credential gone from
+// BOTH halves of the message.
+//
+// Redacting only the URL we interpolate is not enough. When url.Parse fails
+// inside nats.Connect the *url.Error it returns prints the raw string it could
+// not parse, and %w renders that verbatim — so a password malformed enough to
+// break parsing, which is the likeliest kind to be mistyped, arrives in the log
+// beside the copy we just hid. The scrub therefore runs over the whole rendered
+// message and does not depend on the URL parsing, for the same reason
+// redactNATSURL is textual.
+//
+// The error still unwraps, so callers matching on nats.ErrNoServers and friends
+// are unaffected.
+func connectFailure(raw string, err error) error {
+	return &connectError{
+		msg: credInURL.ReplaceAllString(
+			fmt.Sprintf("connect NATS %s: %v", redactNATSURL(raw), err), "${1}"+redacted+"${2}"),
+		err: err,
+	}
+}
+
+type connectError struct {
+	msg string
+	err error
+}
+
+func (e *connectError) Error() string { return e.msg }
+func (e *connectError) Unwrap() error { return e.err }

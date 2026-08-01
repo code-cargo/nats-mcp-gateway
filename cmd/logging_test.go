@@ -116,3 +116,32 @@ func TestNewLoggerAcceptsKnownLevelsAndFormats(t *testing.T) {
 		assert.IsType(t, tc.want, lg.Handler(), tc.format)
 	}
 }
+
+// TestConnectFailureRedactsThroughTheWrappedError covers the half of the
+// message we do not format.
+//
+// Redacting the URL we interpolate leaves nats.Connect free to return a
+// *url.Error, which prints the raw string it could not parse — so a password
+// malformed enough to break url.Parse, the likeliest kind to be mistyped,
+// arrived in the log beside the copy we had just hidden. Each password below
+// breaks parsing in a different place, and the last one is an ordinary
+// password behind a mistyped IPv6 bracket.
+func TestConnectFailureRedactsThroughTheWrappedError(t *testing.T) {
+	for _, raw := range []string{
+		"nats://gw:s3c r3t@127.0.0.1:14222",
+		"nats://gw:p%ss@127.0.0.1:14222",
+		"nats://gw:s3cr3t@[::1:14222",
+		"nats://gw:s3c@r3t@127.0.0.1:14222",
+		"nats://gw:pw1@a:4222,nats://gw:pw2@b:4222",
+	} {
+		err := runGateway(
+			&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: raw},
+			&Globals{LogLevel: "error"}, "0.0.0")
+		require.Error(t, err)
+		for _, secret := range []string{"s3c r3t", "p%ss", "s3cr3t", "s3c@r3t", "pw1", "pw2"} {
+			assert.NotContains(t, err.Error(), secret,
+				"password reached the error for %q", raw)
+		}
+		assert.Contains(t, err.Error(), "gw:", "the username must survive: it is a diagnosis")
+	}
+}

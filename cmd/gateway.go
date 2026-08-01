@@ -173,7 +173,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}
 	nc, err := nats.Connect(boot.url, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", redactNATSURL(boot.url), err)
+		return connectFailure(boot.url, err)
 	}
 	defer nc.Close()
 
