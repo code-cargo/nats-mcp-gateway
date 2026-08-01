@@ -122,9 +122,6 @@ type Server struct {
 	wg     sync.WaitGroup
 }
 
-// Serve starts the wire server with the given initial server set. Each
-// request runs in its own goroutine; per-backend concurrency limits belong to
-// the backend pool, not the wire.
 // DefaultQueueGroup is the group a gateway joins when none is configured.
 //
 // A scoped instance defaults to its OWN group: NATS dedupes queue subscribers
@@ -146,6 +143,9 @@ func DefaultQueueGroup(tenant, user string) string {
 	return "mcpgw"
 }
 
+// Serve starts the wire server with the given initial server set. Each
+// request runs in its own goroutine; per-backend concurrency limits belong to
+// the backend pool, not the wire.
 func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	if cfg.QueueGroup == "" {
 		cfg.QueueGroup = DefaultQueueGroup(cfg.Tenant, cfg.User)

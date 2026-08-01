@@ -1169,6 +1169,18 @@ func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
 			},
 		},
 		{
+			// A pool flag <= 0 is not a request for a smaller pool: fill()
+			// substitutes the default for it, so it asks for exactly what the
+			// silent document already gets. The guard reads > 0 rather than
+			// != 0 for that reason, and nothing else pins the difference.
+			"pool sizes given as zero and negative",
+			`{"servers":{}}`,
+			GatewayCmd{
+				PoolMaxConcurrent: -1, PoolMaxProcsPerTenant: 0,
+				PoolIdleTTL: -time.Second, PoolMaxLifetime: 0,
+			},
+		},
+		{
 			// Read only when claim-check is on, so with no block they are inert.
 			"claim sizing with claim-check absent from the document",
 			`{"servers":{}}`,
