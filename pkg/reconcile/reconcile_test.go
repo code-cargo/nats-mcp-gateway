@@ -134,8 +134,10 @@ type logCapture struct {
 }
 
 func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
-func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler       { return c }
-func (c *logCapture) WithGroup(string) slog.Handler            { return c }
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *logCapture) WithGroup(string) slog.Handler { return c }
 
 func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
 	c.mu.Lock()
