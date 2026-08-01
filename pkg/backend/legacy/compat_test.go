@@ -23,6 +23,7 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -557,6 +558,95 @@ func TestListChangedReachesEverySubscriber(t *testing.T) {
 		got[string(p.Meta[mcpspec.MetaSubscriptionID])] = true
 	}
 	assert.Equal(t, want, got)
+}
+
+// handshakePinger is a 2025-11-25 server that pings inside the handshake
+// window and blocks on the answer — it sends its InitializeResult only once
+// the ping has been responded to. Sending a ping there is legal: 2025-11-25
+// says a server SHOULD NOT send requests before the initialize response, and
+// names ping and logging as the exceptions.
+type handshakePinger struct {
+	initSeen chan struct{}
+	answered chan struct{}
+	once     sync.Once
+	step     int
+
+	mu        sync.Mutex
+	pingReply *jsonrpc.Message
+}
+
+func (c *handshakePinger) Write(_ context.Context, msg *jsonrpc.Message) error {
+	switch {
+	case msg.Kind() == jsonrpc.KindRequest && msg.Method == mcpspec.MethodInitialize:
+		close(c.initSeen)
+	case msg.Kind() == jsonrpc.KindResponse:
+		c.mu.Lock()
+		c.pingReply = msg
+		c.mu.Unlock()
+		c.once.Do(func() { close(c.answered) })
+	}
+	return nil
+}
+
+// Read is only ever called from the handshake's own goroutine, so step needs
+// no guarding.
+func (c *handshakePinger) Read(ctx context.Context) (*jsonrpc.Message, error) {
+	c.step++
+	switch c.step {
+	case 1:
+		select {
+		case <-c.initSeen:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return jsonrpc.NewRequest("srv-ping", mcpspec.MethodPing, nil), nil
+	case 2:
+		select {
+		case <-c.answered:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		result, _ := json.Marshal(map[string]any{
+			"protocolVersion": mcpspec.LegacyProtocolVersion,
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "pinger"},
+		})
+		return jsonrpc.NewResponse(json.RawMessage(`"natsmcp-init"`), result), nil
+	default:
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+}
+
+func (c *handshakePinger) Close() error { return nil }
+
+// The mux answers a server-initiated request with -32601 so the subprocess is
+// never left blocking on a response that cannot come — but the mux does not
+// exist until the handshake has finished. Inside the handshake window the loop
+// skipped anything that was not the InitializeResult, so a server waiting on
+// its own request waited out the 30s handshake timeout and the whole
+// connection failed. The README promises the -32601 without qualifying it.
+func TestHandshakeAnswersServerInitiatedRequests(t *testing.T) {
+	c := &handshakePinger{
+		initSeen: make(chan struct{}),
+		answered: make(chan struct{}),
+	}
+	// Well under handshakeTimeout: a swallowed request has to fail this test
+	// promptly rather than sit out the real 30s.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	init, err := handshake(ctx, c)
+	require.NoError(t, err, "the handshake never answered the server's ping")
+	require.NotNil(t, init)
+	assert.Contains(t, string(init.Capabilities), "tools")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.NotNil(t, c.pingReply, "the server-initiated request went unanswered")
+	assert.JSONEq(t, `"srv-ping"`, string(c.pingReply.ID), "the answer must echo the server's id")
+	require.NotNil(t, c.pingReply.Error)
+	assert.Equal(t, jsonrpc.CodeMethodNotFound, c.pingReply.Error.Code)
 }
 
 // failingConn is a backend.Conn whose writes always fail.

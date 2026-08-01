@@ -121,6 +121,18 @@ func handshake(ctx context.Context, c backend.Conn) (*initResult, error) {
 		if err != nil {
 			return nil, err
 		}
+		if msg.Kind() == jsonrpc.KindRequest {
+			// The mux answers these, but it is not running yet — and a server
+			// blocking on a response nobody will send never gets to its
+			// InitializeResult, so the handshake sits out its full timeout and
+			// takes the whole connection with it. 2025-11-25 permits a ping
+			// here even from a conformant server.
+			if err := c.Write(ctx, jsonrpc.NewErrorResponse(msg.ID, jsonrpc.CodeMethodNotFound,
+				"server-initiated requests are not supported by this gateway", nil)); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if msg.Kind() != jsonrpc.KindResponse || msg.IDKey() != req.IDKey() {
 			continue // stray notifications before the response are legal
 		}
