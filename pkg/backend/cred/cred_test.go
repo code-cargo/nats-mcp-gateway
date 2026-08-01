@@ -282,6 +282,53 @@ func TestOAuthRefreshRotation(t *testing.T) {
 	assert.Equal(t, "refresh-2", string(rotated), "a rotated refresh token must be persisted")
 }
 
+func TestFileTokenStoreReplacesAtomically(t *testing.T) {
+	// A refresh token is the one credential the gateway cannot re-derive: lose
+	// it and the user goes back through consent. Truncate-then-write leaves a
+	// window in which the file holds neither the old token nor the new one,
+	// and anything landing inside that window — a crash, a full disk, a second
+	// writer — leaves it holding nothing at all.
+	//
+	// The token here is deliberately large, because that is what makes the
+	// window wide enough to catch from another goroutine in a test. Real ones
+	// are smaller and the window is narrower, not absent; a process that dies
+	// inside it loses the token whatever its size.
+	dir := t.TempDir()
+	store := &FileTokenStore{Path: filepath.Join(dir, "{user}.refresh")}
+	tokens := []string{strings.Repeat("a", 64<<10), strings.Repeat("b", 64<<10)}
+	require.NoError(t, store.Save("acme", "u1", "srv", tokens[0]))
+
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			assert.NoError(t, store.Save("acme", "u1", "srv", tokens[i%2]))
+		}
+	}()
+
+	for range 3000 {
+		got, err := store.Load("acme", "u1", "srv")
+		require.NoError(t, err, "the token file must never be missing")
+		require.Contains(t, tokens, got,
+			"a reader must see one whole token or the other, never a half-written file")
+	}
+	close(stop)
+	writer.Wait()
+
+	// And nothing left behind: the replacement is one file, not a growing
+	// litter of partial ones beside it.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "the write must not leave temporary files in the token directory")
+}
+
 func TestNATSResolver(t *testing.T) {
 	nc, _ := natstest.Run(t, nil)
 
