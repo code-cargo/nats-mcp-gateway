@@ -529,6 +529,33 @@ func TestCachedNegativeCacheAndInvalidate(t *testing.T) {
 	assert.Equal(t, 2, inner.count())
 }
 
+func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {
+	// A backend that rejects a credential the source keeps re-issuing (wrong
+	// audience, revoked upstream, clock skew) drives Invalidate on every
+	// request. The generation keys the backend pool, so advancing it for
+	// material that did not change spawns a second backend identical to the
+	// one it supersedes — once per request, until the tenant's cap is spent.
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": "Bearer constant"},
+			ExpiresAt: time.Now().Add(time.Hour),
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, gen1, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	for range 5 {
+		c.Invalidate("t", "u", "s")
+		_, gen, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+		require.NoError(t, err)
+		assert.Equal(t, gen1, gen,
+			"re-resolving the same material after a 401 must not mint a new generation")
+	}
+	assert.Equal(t, 6, inner.count(), "each invalidation must still re-resolve")
+}
+
 func TestFailBackoffCaps(t *testing.T) {
 	assert.Equal(t, failBackoffBase, failBackoff(1))
 	assert.Equal(t, 2*failBackoffBase, failBackoff(2))

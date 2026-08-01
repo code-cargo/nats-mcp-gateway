@@ -86,6 +86,12 @@ type cacheEntry struct {
 	gen        int
 	refreshAt  time.Time // when refresh-ahead should begin
 	refreshing bool
+	// gone holds what Invalidate dropped, kept for one comparison. Without it
+	// the next resolve sees no previous material and advances the generation
+	// unconditionally — so a backend that keeps rejecting a credential the
+	// source keeps re-issuing gets a brand-new pool key, and a brand-new
+	// backend, on every request.
+	gone *Credentials
 	// epoch counts every mutation of creds (store or Invalidate). A
 	// background refresh captures it at launch and discards its result if
 	// the entry moved on — otherwise a slow refresh completing after a
@@ -210,10 +216,13 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 		return fmt.Errorf("cred: source returned credentials already expired at %s", creds.ExpiresAt.Format(time.RFC3339))
 	}
 	prev := e.creds
+	if prev == nil {
+		prev = e.gone
+	}
 	if prev == nil || !maps.Equal(prev.Headers, creds.Headers) || !maps.Equal(prev.Env, creds.Env) {
 		e.gen = int(globalGen.Add(1))
 	}
-	e.creds = creds
+	e.creds, e.gone = creds, nil
 	e.epoch++
 	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
 	if !creds.ExpiresAt.IsZero() {
@@ -236,7 +245,9 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 
 // Invalidate drops the cached credentials for one key so the next Resolve
 // refetches immediately (any failure backoff is cleared too). Used when a
-// backend rejects the credentials mid-life (HTTP 401).
+// backend rejects the credentials mid-life (HTTP 401). The dropped material
+// is remembered, unused, until the next resolve decides whether the
+// generation moved.
 func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	c.mu.Lock()
 	e := c.entries[cacheKey{tenant, user, server}]
@@ -245,6 +256,9 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 		return
 	}
 	e.mu.Lock()
+	if e.creds != nil {
+		e.gone = e.creds
+	}
 	e.creds = nil
 	e.retryAt = time.Time{}
 	e.epoch++ // any in-flight refresh launched before this is now stale

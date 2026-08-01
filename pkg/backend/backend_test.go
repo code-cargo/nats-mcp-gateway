@@ -284,6 +284,42 @@ func TestPoolTenantQuota(t *testing.T) {
 	release()
 }
 
+// A new credential generation supersedes the entries keyed on the old one.
+// Leaving them to the 5m IdleTTL is what turns a backend that keeps rejecting
+// a caller's credentials into a tenant-wide outage: every request keys a
+// fresh entry, the superseded ones count toward MaxProcsPerTenant, and once
+// they fill it every OTHER server of that tenant is refused too.
+func TestNewGenerationRetiresTheEntryItSupersedes(t *testing.T) {
+	p := NewPool(PoolConfig{MaxProcsPerTenant: 2, IdleTTL: time.Hour}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+	firstMux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	release()
+
+	for gen := 2; gen <= 8; gen++ {
+		k := key
+		k.CredVersion = gen
+		_, release, err := p.Get(context.Background(), k)
+		require.NoError(t, err, "generation %d must still get a backend", gen)
+		release()
+	}
+
+	p.mu.Lock()
+	live := len(p.entries)
+	p.mu.Unlock()
+	assert.Equal(t, 1, live, "only the newest generation may hold a pool entry")
+
+	require.Eventually(t, firstMux.Dead, 10*time.Second, 10*time.Millisecond,
+		"the superseded backend must be closed, not merely unmapped")
+
+	// An unrelated server for the same tenant must still fit under the cap.
+	_, release, err = p.Get(context.Background(), Key{Server: "other", Tenant: "acme"})
+	require.NoError(t, err, "one server's credential churn must not lock out the tenant")
+	release()
+}
+
 func TestPoolCircuitBreaker(t *testing.T) {
 	badFactory := func(key Key) (Backend, error) {
 		return &StdioBackend{Command: "/nonexistent/binary-xyz"}, nil

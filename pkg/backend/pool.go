@@ -156,6 +156,7 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 // Get returns the live Mux for the key, creating it if needed, and reserves
 // one concurrency slot. The caller MUST call release when its call finishes.
 func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
+	var superseded []*Mux
 	p.mu.Lock()
 	e := p.entries[key]
 	// Past-deadline entries are replaced here, not only by the reaper: its
@@ -229,6 +230,7 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 				sem:      make(chan struct{}, p.cfg.MaxConcurrent),
 			}
 			p.entries[key] = e
+			superseded = p.retireSupersededLocked(key)
 		}
 	}
 	e.lastUsed = time.Now()
@@ -236,6 +238,12 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	sem := e.sem
 	mux := e.mux
 	p.mu.Unlock()
+	for _, m := range superseded {
+		// Off the request path: closing a stdio backend escalates through
+		// SIGTERM to SIGKILL and can take seconds, and the caller waiting on
+		// this Get has nothing to do with the credentials that rotated.
+		go func(m *Mux) { _ = m.Close() }(m)
+	}
 
 	select {
 	case sem <- struct{}{}:
@@ -274,6 +282,35 @@ func (p *Pool) recordFailure(key Key) {
 		p.log.Warn("backend circuit opened", "server", key.Server, "tenant", key.Tenant,
 			"fails", br.fails, "cooldown", p.cfg.BreakerCooldown)
 	}
+}
+
+// retireSupersededLocked unmaps the idle entries a newly-keyed credential
+// generation supersedes, returning their muxes to close (p.mu held). Nothing
+// will ever be dispatched to them again: the proxy resolves before it keys,
+// so every later request for this (server, tenant, credset) carries at least
+// this generation. Waiting for the IdleTTL to notice would leave them
+// counting against MaxProcsPerTenant for five minutes — which is how a
+// backend that rejects one caller's credentials on every request becomes a
+// refusal for every OTHER server the tenant has.
+//
+// Busy entries are left alone: their in-flight calls were authorized under
+// the credentials they hold, and the reaper collects them once drained.
+func (p *Pool) retireSupersededLocked(key Key) []*Mux {
+	var victims []*Mux
+	for k, e := range p.entries {
+		if k.Server != key.Server || k.Tenant != key.Tenant || k.CredSet != key.CredSet {
+			continue
+		}
+		// Generations are globally monotonic, so "older" is exactly "lower" —
+		// and a Get that raced in with a stale generation must not be read as
+		// superseding the newer entry already serving.
+		if k.CredVersion >= key.CredVersion || e.busyLocked() {
+			continue
+		}
+		victims = append(victims, e.mux)
+		delete(p.entries, k)
+	}
+	return victims
 }
 
 func (p *Pool) tenantCountLocked(tenant string) int {
