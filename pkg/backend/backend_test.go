@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -318,6 +319,75 @@ func TestNewGenerationRetiresTheEntryItSupersedes(t *testing.T) {
 	_, release, err = p.Get(context.Background(), Key{Server: "other", Tenant: "acme"})
 	require.NoError(t, err, "one server's credential churn must not lock out the tenant")
 	release()
+}
+
+// gatedBackend holds Connect open until released, so every racing Get sits
+// inside the window between the tenant check and the insert at the same time.
+// Connect really does take that long in production — it spawns an npx or uvx
+// subprocess — so this is the normal shape of the race, not a contrived one.
+type gatedBackend struct {
+	Backend
+	arrived *atomic.Int32
+	gate    <-chan struct{}
+}
+
+func (b *gatedBackend) Connect(ctx context.Context) (Conn, error) {
+	b.arrived.Add(1)
+	<-b.gate
+	return b.Backend.Connect(ctx)
+}
+
+// MaxProcsPerTenant is the guard against a tenant's fan-out OOMing the host,
+// so it has to hold against the fan-out itself. Per-user stdio servers make
+// concurrent Gets on distinct keys for one tenant the normal traffic shape.
+func TestTenantQuotaHoldsAgainstConcurrentGets(t *testing.T) {
+	const (
+		limit = 2
+		burst = 8
+	)
+	var arrived, refused atomic.Int32
+	gate := make(chan struct{})
+	p := NewPool(PoolConfig{MaxProcsPerTenant: limit}, func(Key) (Backend, error) {
+		return &gatedBackend{Backend: fakeBackend(nil), arrived: &arrived, gate: gate}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+
+	var wg sync.WaitGroup
+	releases := make(chan func(), burst)
+	for i := range burst {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, release, err := p.Get(context.Background(), Key{
+				Server: fmt.Sprintf("s%d", i), Tenant: "acme",
+			})
+			if err != nil {
+				refused.Add(1)
+				return
+			}
+			releases <- release
+		}(i)
+	}
+
+	// Everyone has either been refused or is holding at the gate: the whole
+	// burst is now past the check, which is the state the quota has to survive.
+	require.Eventually(t, func() bool {
+		return arrived.Load()+refused.Load() == burst
+	}, 10*time.Second, time.Millisecond, "the burst never settled")
+	close(gate)
+	wg.Wait()
+	close(releases)
+	for release := range releases {
+		release()
+	}
+
+	assert.LessOrEqual(t, arrived.Load(), int32(limit),
+		"the tenant cap must be spent before the spawns happen, not counted after")
+	p.mu.Lock()
+	live := p.tenantCountLocked("acme")
+	p.mu.Unlock()
+	assert.LessOrEqual(t, live, limit, "a burst must not leave the tenant over its cap")
+	assert.Positive(t, burst-int(refused.Load()), "the cap must not refuse everything either")
 }
 
 func TestPoolCircuitBreaker(t *testing.T) {

@@ -101,6 +101,12 @@ type Pool struct {
 	mu      sync.Mutex
 	entries map[Key]*entry
 	broken  map[Key]*breaker
+	// pending counts spawns a tenant has been admitted for but has not yet
+	// inserted. The lock is dropped for the whole of Connect, so without this
+	// the cap is only ever compared against backends that already finished
+	// starting — and a burst wide enough to matter is entirely in flight by
+	// then.
+	pending map[string]int
 	// orphans are past-deadline entries replaced by Get while they still had
 	// in-flight calls: the calls run to completion and the reaper closes the
 	// mux once they drain. Closing immediately would kill live work for an
@@ -147,6 +153,7 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 		log:     log,
 		entries: make(map[Key]*entry),
 		broken:  make(map[Key]*breaker),
+		pending: make(map[string]int),
 		stop:    make(chan struct{}),
 	}
 	go p.reapLoop()
@@ -184,19 +191,27 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 			return nil, nil, fmt.Errorf("backend: tenant %q at max live backends (%d)",
 				key.Tenant, p.cfg.MaxProcsPerTenant)
 		}
+		// Claim the slot while we still hold the lock. The spawn below is the
+		// resource the cap is about, and it begins here, not when the entry
+		// lands in the map.
+		p.pending[key.Tenant]++
 		p.mu.Unlock()
 
 		// Connect outside the lock: spawning can take seconds.
 		b, err := p.factory(key)
 		if err != nil {
+			p.releasePending(key.Tenant)
 			return nil, nil, err
 		}
 		conn, err := b.Connect(ctx)
 		if err != nil {
 			p.recordFailure(key)
+			p.releasePending(key.Tenant)
 			return nil, nil, err
 		}
 		p.mu.Lock()
+		// The entry counts for itself from here, whichever branch below wins.
+		p.releasePendingLocked(key.Tenant)
 		delete(p.broken, key)
 		// Lost the race with another Get? Keep ours anyway under its key —
 		// simplest correct behavior; the reaper collects extras.
@@ -313,6 +328,20 @@ func (p *Pool) retireSupersededLocked(key Key) []*Mux {
 	return victims
 }
 
+func (p *Pool) releasePending(tenant string) {
+	p.mu.Lock()
+	p.releasePendingLocked(tenant)
+	p.mu.Unlock()
+}
+
+func (p *Pool) releasePendingLocked(tenant string) {
+	if n := p.pending[tenant] - 1; n > 0 {
+		p.pending[tenant] = n
+	} else {
+		delete(p.pending, tenant)
+	}
+}
+
 func (p *Pool) tenantCountLocked(tenant string) int {
 	n := 0
 	for k, e := range p.entries {
@@ -327,7 +356,10 @@ func (p *Pool) tenantCountLocked(tenant string) int {
 			n++
 		}
 	}
-	return n
+	// Reserved slots are subprocesses being spawned right now; not counting
+	// them lets a burst of concurrent Gets on distinct keys all pass the check
+	// and all spawn, overshooting the cap by the width of the burst.
+	return n + p.pending[tenant]
 }
 
 func (p *Pool) reapLoop() {
