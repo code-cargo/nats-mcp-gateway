@@ -21,6 +21,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"sync"
 	"time"
 
@@ -154,9 +155,29 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 	if err != nil {
 		return nil, fmt.Errorf("wire: claim bucket: %w", err)
 	}
-	body, err := obs.GetBytes(ctx, id) // digest-verified by the client library
+	// Streamed under a limit rather than GetBytes'd: how much this process
+	// will hold is its own call, never the producer's. claimMaxBody is
+	// enforced gateway-side in streamWriter.End, but an end frame only carries
+	// a reference — anything able to write the tenant bucket and reach the
+	// caller's inbox could point it at an object of any size, and GetBytes
+	// would io.ReadAll however much that was.
+	r, err := obs.Get(ctx, id)
 	if err != nil {
 		return nil, fmt.Errorf("wire: claim fetch: %w", err)
+	}
+	defer func() { _ = r.Close() }()
+
+	// The declared size saves downloading a body that is already too big, but
+	// it is the producer's own number: the LimitReader is the real bound.
+	if info, ierr := r.Info(); ierr == nil && info.Size > claimMaxBody {
+		return nil, fmt.Errorf("wire: claim of %d bytes exceeds the %d byte limit", info.Size, claimMaxBody)
+	}
+	body, err := io.ReadAll(io.LimitReader(r, claimMaxBody+1)) // digest-verified by the client library
+	if err != nil {
+		return nil, fmt.Errorf("wire: claim fetch: %w", err)
+	}
+	if len(body) > claimMaxBody {
+		return nil, fmt.Errorf("wire: claim exceeds the %d byte limit", claimMaxBody)
 	}
 	// Eager cleanup; TTL is the backstop when this is denied or we die here.
 	_ = obs.Delete(ctx, id)
