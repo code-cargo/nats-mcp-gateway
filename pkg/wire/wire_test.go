@@ -704,3 +704,63 @@ func TestReplyToASystemSubjectIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(resp.Data), `"result"`)
 }
+
+// TestWildcardReplyDoesNotKillTheConnection covers the other half of the
+// caller-controlled reply subject.
+//
+// dispatch subscribes to reply+ctlSuffix. A reply of ">" or "a.>" builds an
+// invalid SUBSCRIBE subject, the server answers -ERR 'Invalid Subject', and
+// nats.go treats an unrecognised -ERR as fatal and closes the connection
+// permanently — MaxReconnects(-1) does not apply and nothing installs a
+// ClosedHandler. One publish from a caller holding one narrow grant would take
+// the replica off the air with no trace but silence.
+func TestWildcardReplyDoesNotKillTheConnection(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	// Only the forms a client can actually put on the wire: nats.go refuses a
+	// reply containing whitespace before it sends. The rest are covered by
+	// TestUsableReplySubject.
+	for _, reply := range []string{">", "a.>", "_INBOX.>", "a.*.b", "a..b", "*"} {
+		require.NoError(t, nc.PublishMsg(&nats.Msg{
+			Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+			Reply:   reply,
+			Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+			Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+		}), "publish with reply %q", reply)
+		require.NoError(t, nc.Flush())
+	}
+
+	// The gateway must still be serving: that is the whole claim.
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}, 5*time.Second)
+	require.NoError(t, err, "the gateway's connection died on a caller's reply subject")
+	assert.Contains(t, string(resp.Data), `"result"`)
+}
+
+func TestUsableReplySubject(t *testing.T) {
+	for _, ok := range []string{
+		"_INBOX.abc123", "_INBOX_acme_u_9f3a.xyz", "my.custom.inbox.1", "a",
+	} {
+		assert.True(t, usableReplySubject(ok), "legitimate inbox %q must be served", ok)
+	}
+	for _, bad := range []string{
+		"", "$JS.API.STREAM.DELETE.x", "$SYS.REQ.SERVER.PING",
+		">", "*", "a.>", "a.*.b", "a..b", ".a", "a.", "a b.c", "a\tb",
+	} {
+		assert.False(t, usableReplySubject(bad), "unusable reply %q must be refused", bad)
+	}
+}

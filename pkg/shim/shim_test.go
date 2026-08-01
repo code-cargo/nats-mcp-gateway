@@ -273,7 +273,12 @@ func TestReadLineSkipsOnlyTheOversizeLine(t *testing.T) {
 		}
 	}
 
-	lines, drops, err := read("a\n" + strings.Repeat("x", max+1) + "\nb\n")
+	// The oversize line must be longer than the READER'S BUFFER, not merely
+	// longer than the cap: ReadSlice only returns ErrBufferFull when the line
+	// outruns the buffer, and that refill loop is the only path an oversize
+	// line takes in production, where the cap is 16MiB and the buffer 64KiB.
+	// A line that fits the buffer exercises none of the draining.
+	lines, drops, err := read("a\n" + strings.Repeat("x", 40) + "\nb\n")
 	assert.Equal(t, io.EOF, err)
 	assert.Equal(t, []string{"a", "b"}, lines, "the lines around an oversize one are untouched")
 	assert.Equal(t, 1, drops)

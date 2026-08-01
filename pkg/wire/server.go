@@ -314,7 +314,7 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		// whole class. It does not close a reply-to aimed at another CLIENT's
 		// inbox; only per-user inbox prefixes do, which is a deployment
 		// control the README now spells out.
-		if reply := req.Reply(); reply == "" || strings.HasPrefix(reply, "$") {
+		if reply := req.Reply(); !usableReplySubject(reply) {
 			// slog.Default rather than a configured logger: wire.Server has
 			// none, and a security refusal that leaves no trace is worse than
 			// one logged somewhere an operator has to go looking for.
@@ -402,7 +402,54 @@ func (s *Server) beginRequest() bool {
 // ErrCodeStreamLost is the same "re-issue" signal a request caught in flight
 // gets, and it reaches another replica in the time silence would have spent
 // waiting out the caller's inactivity window.
+// usableReplySubject reports whether a caller-supplied reply-to is something
+// this gateway may publish and subscribe to on that caller's behalf.
+//
+// Two separate hazards, both reachable from one narrow publish grant, because
+// NATS permission-checks the subject a client publishes TO and never the
+// reply-to — that is checked against whoever answers, which is us.
+//
+// A privileged subject makes the gateway a publish proxy for its own rights.
+// With claim-check on, our identity carries JetStream rights,
+// $JS.API.STREAM.DELETE.<stream> takes no request body, and the keepalive is
+// an empty-bodied frame emitted unprompted: together, another tenant's claim
+// bucket deleted by a caller who cannot publish to that subject themselves.
+//
+// A subject that is not a valid LITERAL takes the whole replica down. dispatch
+// subscribes to reply+ctlSuffix, so a reply of ">" or "a.>" builds an invalid
+// subscribe subject, the server answers -ERR 'Invalid Subject', and nats.go
+// treats an unrecognised -ERR as fatal and closes the connection for good —
+// MaxReconnects(-1) does not apply, and nothing here installs a ClosedHandler.
+// One publish and the replica is silently off the air.
+//
+// So: a non-empty literal subject, no wildcards, no empty tokens, no
+// whitespace, and not in the server's own $ namespace. Deliberately not a
+// check that it looks like an inbox — a deployment may configure any inbox
+// prefix, and guessing at that would refuse working clients. What is left
+// unreachable by this is a subject an account MAPPING aliases onto something
+// privileged under an ordinary-looking name, which no syntactic test can see
+// and only the gateway's own NATS grant can bound.
+func usableReplySubject(reply string) bool {
+	if reply == "" || strings.HasPrefix(reply, "$") {
+		return false
+	}
+	for _, tok := range strings.Split(reply, ".") {
+		if tok == "" || tok == "*" || tok == ">" {
+			return false
+		}
+		if strings.ContainsAny(tok, "*> \t\r\n") {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *Server) refuseDrained(req micro.Request) {
+	// Same rule as dispatch: this publishes to the caller's chosen subject
+	// too, and a drain is not a reason to stop checking where.
+	if !usableReplySubject(req.Reply()) {
+		return
+	}
 	w := &streamWriter{nc: s.nc, req: req}
 	// Best effort on the id: a body that will not decode has none to echo,
 	// and re-issuing is the answer either way.
