@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -105,6 +106,37 @@ func TestFailedConnectLeavesNothingBehind(t *testing.T) {
 	entries, readErr := os.ReadDir(tmp)
 	require.NoError(t, readErr)
 	assert.Empty(t, entries, "the workdir outlived the failed connect")
+}
+
+// Close escalates to a process-GROUP kill, addressed by the leader's pid.
+// Once that leader has been reaped the pid belongs to the kernel again, and
+// signalling it then can reach a group that has nothing to do with us. The
+// race cannot be closed from Go — the pid is freed inside os/exec's Wait, and
+// nothing tells us so until Wait returns — but the branch where we already
+// know the process is gone can be, and it is the branch the escalation
+// reaches when a subprocess dies right as the grace period expires.
+//
+// The victim here stands in for whatever inherited the recycled pid.
+func TestSignalGroupSkipsAProcessAlreadyKnownDead(t *testing.T) {
+	victim := exec.Command("/bin/sleep", "30")
+	victim.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, victim.Start())
+	reaped := make(chan struct{})
+	go func() { _ = victim.Wait(); close(reaped) }()
+	t.Cleanup(func() {
+		_ = syscall.Kill(-victim.Process.Pid, syscall.SIGKILL)
+		<-reaped
+	})
+
+	c := &stdioConn{cmd: victim, dead: make(chan struct{})}
+	close(c.dead) // waitLoop has seen the exit: this pid is no longer ours
+	c.signalGroup(syscall.SIGKILL)
+
+	select {
+	case <-reaped:
+		t.Fatal("signalGroup killed a process group its own subprocess no longer owned")
+	case <-time.After(250 * time.Millisecond):
+	}
 }
 
 func TestMuxConcurrentCallsCorrelate(t *testing.T) {

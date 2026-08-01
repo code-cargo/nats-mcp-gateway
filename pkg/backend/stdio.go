@@ -297,8 +297,19 @@ func (c *stdioConn) waitDead(d time.Duration) bool {
 }
 
 // signalGroup signals the whole process group so grandchildren die too.
+//
+// The group is addressed by the leader's pid, and a pid stops being ours the
+// moment the kernel reaps it — after which this call can reach a group
+// belonging to something else entirely. Close only escalates to here when the
+// process was still alive a grace period ago, so the exposure is a subprocess
+// exiting just as that period expires; declining once the exit is known keeps
+// the signal in that window from being sent at all.
+//
+// It narrows the race rather than closing it. Closing it would need the pid
+// held against reuse until we are done with it, and the reap happens inside
+// os/exec's Wait, which tells us nothing until it returns.
 func (c *stdioConn) signalGroup(sig syscall.Signal) {
-	if c.cmd.Process == nil {
+	if c.cmd.Process == nil || c.Dead() {
 		return
 	}
 	// Negative pid = the process group created by Setpgid.
