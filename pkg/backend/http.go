@@ -81,8 +81,10 @@ func (b *HTTPBackend) Connect(ctx context.Context) (Conn, error) {
 		client:  client,
 		log:     log,
 		inbox:   make(chan *jsonrpc.Message, 64),
-		done:    make(chan struct{}),
 	}
+	// The conn's life as a context, because every exchange has to be scoped
+	// inside it and a channel cannot be a context's parent.
+	c.connCtx, c.connCancel = context.WithCancel(context.Background())
 	return c, nil
 }
 
@@ -116,15 +118,16 @@ type httpConn struct {
 	// ever held briefly: this one is held across a network round trip.
 	refreshMu sync.Mutex
 
-	done      chan struct{}
-	closeOnce sync.Once
+	connCtx    context.Context
+	connCancel context.CancelFunc
+	closeOnce  sync.Once
 }
 
 func (c *httpConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
 	select {
 	case m := <-c.inbox:
 		return m, nil
-	case <-c.done:
+	case <-c.connCtx.Done():
 		// Drain anything already queued before reporting closed.
 		select {
 		case m := <-c.inbox:
@@ -138,10 +141,8 @@ func (c *httpConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
 }
 
 func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
-	select {
-	case <-c.done:
+	if c.connCtx.Err() != nil {
 		return ErrConnDead
-	default:
 	}
 	body, err := jsonrpc.Encode(msg)
 	if err != nil {
@@ -152,12 +153,45 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	// background so Write keeps the Conn contract (non-blocking beyond the
 	// POST itself). The request is (re)built inside so the single 401 retry
 	// gets a fresh body reader and freshly-resolved headers.
+	exchange, done := c.exchangeContext(ctx, msg)
 	c.inflight.Add(1)
 	go func() {
 		defer c.inflight.Done()
-		c.roundTripOnce(context.WithoutCancel(ctx), body, msg, false)
+		defer done()
+		c.roundTripOnce(exchange, body, msg, false)
 	}()
 	return nil
+}
+
+// notificationExchangeTimeout bounds a notification's POST. Nothing is
+// waiting for one — the mux sends notifications/cancelled after its caller is
+// already gone, so inheriting that caller's context would abort the message
+// on its way out — and a notification cannot stream, so a fixed bound costs it
+// nothing.
+const notificationExchangeTimeout = 30 * time.Second
+
+// exchangeContext scopes one exchange, which outlives Write by design.
+//
+// A request's exchange lives exactly as long as the caller waiting for it. An
+// SSE stream answering subscriptions/listen may legitimately run for hours,
+// and the only thing that says whether it still should is whether anyone is
+// still reading it; a wall-clock cap could not tell the two apart. A
+// notification has no such caller and takes the fixed bound above instead.
+//
+// Either way the conn's own life is the ceiling. Without it a backend that
+// accepts the POST and answers nothing holds a goroutine and a socket past
+// every teardown the gateway has — the client has no Timeout, so eviction,
+// recycling and Shutdown all returned while the exchange ran on.
+func (c *httpConn) exchangeContext(ctx context.Context, msg *jsonrpc.Message) (context.Context, func()) {
+	var out context.Context
+	var cancel context.CancelFunc
+	if msg.Kind() == jsonrpc.KindRequest {
+		out, cancel = context.WithCancel(ctx)
+	} else {
+		out, cancel = context.WithTimeout(context.WithoutCancel(ctx), notificationExchangeTimeout)
+	}
+	stop := context.AfterFunc(c.connCtx, cancel)
+	return out, func() { stop(); cancel() }
 }
 
 // newRequest builds one POST with the static headers, the token source's
@@ -252,7 +286,13 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 	c.mu.Unlock()
 	resp, err := c.doWithAuthRetry(ctx, body, msg, name, sent)
 	if err != nil {
-		c.fail(msg, err.Error())
+		// A failure the exchange's own context caused needs no answer: either
+		// the caller stopped waiting, or the conn is closing and the mux is
+		// already failing every call on it. Synthesizing one would log a
+		// backend error for a teardown and deliver a response nobody can route.
+		if ctx.Err() == nil {
+			c.fail(msg, err.Error())
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -307,12 +347,14 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 	case strings.HasPrefix(ct, "application/json"):
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
-			c.fail(msg, fmt.Sprintf("reading response: %v", err))
+			if ctx.Err() == nil {
+				c.fail(msg, fmt.Sprintf("reading response: %v", err))
+			}
 			return
 		}
 		c.deliverBytes(data, msg)
 	case strings.HasPrefix(ct, "text/event-stream"):
-		c.pumpSSE(resp.Body, msg)
+		c.pumpSSE(ctx, resp.Body, msg)
 	default:
 		c.fail(msg, fmt.Sprintf("unexpected content-type %q", ct))
 	}
@@ -371,12 +413,12 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 }
 
 // pumpSSE delivers each SSE data payload as a message.
-func (c *httpConn) pumpSSE(body io.Reader, req *jsonrpc.Message) {
+func (c *httpConn) pumpSSE(ctx context.Context, body io.Reader, req *jsonrpc.Message) {
 	err := scanSSE(body, func(data []byte) bool {
 		c.deliverBytes(data, req)
 		return true
 	})
-	if err != nil {
+	if err != nil && ctx.Err() == nil {
 		// An oversize or unreadable event truncates the payload, which then
 		// fails to decode and is dropped. Without this the request simply
 		// never gets an answer and the caller waits out its whole context —
@@ -448,7 +490,7 @@ func (c *httpConn) deliverBytes(data []byte, req *jsonrpc.Message) {
 func (c *httpConn) deliver(m *jsonrpc.Message) {
 	select {
 	case c.inbox <- m:
-	case <-c.done:
+	case <-c.connCtx.Done():
 	}
 }
 
@@ -464,6 +506,11 @@ func (c *httpConn) fail(msg *jsonrpc.Message, detail string) {
 
 func (c *httpConn) Close() error {
 	c.closeOnce.Do(func() {
+		// Ends every exchange before anything else: the DELETE below is a
+		// courtesy call, and a request wedged against this backend must not be
+		// what decides whether it goes out.
+		c.connCancel()
+
 		c.mu.Lock()
 		sid := c.sessionID
 		c.mu.Unlock()
@@ -490,9 +537,33 @@ func (c *httpConn) Close() error {
 				}
 			}
 		}
-		close(c.done)
+
+		// Cancelled is not the same as finished: an exchange still inside
+		// io.ReadAll holds its socket until it returns. Close is what the pool
+		// calls to reclaim a backend, so it must not report one reclaimed
+		// while its requests are still on the wire — the same grace the stdio
+		// backend gives a subprocess to die.
+		if !c.awaitInflight(terminateGrace) {
+			c.log.Warn("http backend closed with exchanges still in flight",
+				"grace", terminateGrace)
+		}
 	})
 	return nil
+}
+
+// awaitInflight reports whether every exchange finished within d.
+func (c *httpConn) awaitInflight(d time.Duration) bool {
+	drained := make(chan struct{})
+	go func() {
+		c.inflight.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // annotationProbeID is the JSON-RPC id of the out-of-band tools/list the
@@ -632,11 +703,12 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 		return nil
 	}
 
-	// The probe needs its own deadline. The conn's http.Client has no timeout
-	// (response streams are long-lived by design) and roundTrip runs under an
-	// uncancellable context, so a backend that accepts this POST and never
-	// answers would hold refreshMu for the life of the process — and every
-	// later recovery attempt behind it.
+	// The probe needs its own deadline on top of the exchange's. The conn's
+	// http.Client has no timeout (response streams are long-lived by design),
+	// and the caller whose context this inherits may have none either, so a
+	// backend that accepts this POST and never answers would hold refreshMu
+	// for as long as that caller waits — and every later recovery attempt
+	// behind it.
 	ctx, cancel := context.WithTimeout(ctx, annotationProbeTimeout)
 	defer cancel()
 

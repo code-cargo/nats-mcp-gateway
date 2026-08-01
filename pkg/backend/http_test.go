@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -554,6 +555,103 @@ func TestFailedRefreshDoesNotSuppressALaterOne(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, resp.Error, "the recovery must run after an earlier probe failed")
 	assert.Equal(t, int32(2), listCalls.Load())
+}
+
+func TestCloseEndsInFlightExchanges(t *testing.T) {
+	// A backend that accepts the POST and answers nothing is the shape that
+	// costs the gateway a goroutine and a socket per call: the client carries
+	// no Timeout (SSE streams are long-lived by design) and the exchange runs
+	// detached from the caller, so nothing on this side ever ends it. Close,
+	// EvictServer and Shutdown all returned while it ran on, which is what
+	// makes the leak unbounded rather than merely slow.
+	var arrived atomic.Int32
+	var abandoned atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// net/http only starts watching for a client disconnect once the
+		// request body has been consumed, so a handler that ignores it never
+		// learns its caller is gone.
+		_, _ = io.Copy(io.Discard, r.Body)
+		arrived.Add(1)
+		select {
+		case <-r.Context().Done():
+			abandoned.Add(1)
+		case <-release:
+		}
+	}))
+	// LIFO: the wedged handlers are released before the server is closed, so a
+	// regression fails this test instead of hanging its cleanup.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+
+	// One of each: a request, whose exchange is tied to the caller waiting for
+	// it, and a notification, which has no caller to be tied to.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewNotification(mcpspec.NotifCancelled, json.RawMessage(`{"requestId":"x"}`))))
+	require.Eventually(t, func() bool { return arrived.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
+		"the backend never received both exchanges")
+
+	require.NoError(t, conn.Close())
+
+	// Close returned, so nothing is still holding a socket on this conn's
+	// behalf — the WaitGroup it maintains is finally waited on somewhere.
+	drained := make(chan struct{})
+	go func() { c.inflight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close returned while its exchanges were still running")
+	}
+
+	assert.Eventually(t, func() bool { return abandoned.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
+		"closing the conn must reach the backend as a disconnect, not leave the requests parked on it")
+}
+
+func TestCallerCancellationEndsItsExchange(t *testing.T) {
+	// The other end of the same leak: the conn stays open and healthy, so
+	// nothing closes it, and the caller that provoked the exchange gives up.
+	// Its POST has no deadline of its own, so without the caller's context it
+	// runs until the pool eventually recycles the whole conn — while later
+	// requests keep arriving and keep the conn from ever being idle enough to
+	// recycle.
+	var abandoned atomic.Bool
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(arrived)
+		select {
+		case <-r.Context().Done():
+			abandoned.Store(true)
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the backend was never called")
+	}
+
+	cancel()
+	assert.Eventually(t, abandoned.Load, 10*time.Second, 10*time.Millisecond,
+		"a request nobody is waiting for must not stay on the wire")
 }
 
 func TestScanSSEJoinsDataLinesWithNewline(t *testing.T) {
