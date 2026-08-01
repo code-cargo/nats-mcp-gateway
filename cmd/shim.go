@@ -27,7 +27,10 @@ import (
 )
 
 func runShim(c *ShimCmd, g *Globals) error {
-	log := NewLogger(g) // stderr only: stdout is the MCP pipe
+	log, err := NewLogger(g) // stderr only: stdout is the MCP pipe
+	if err != nil {
+		return err
+	}
 
 	opts := []nats.Option{
 		nats.Name("natsmcp-shim-" + c.Server),

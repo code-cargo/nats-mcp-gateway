@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -23,9 +24,21 @@ import (
 // NewLogger builds the process logger. It always writes to stderr: in the
 // shim, stdout is the MCP stdio pipe and a single stray log line there
 // corrupts the protocol stream.
-func NewLogger(g *Globals) *slog.Logger {
+//
+// An unrecognized level or format fails the boot instead of falling back, the
+// same way the config loader rejects rather than defaults. Falling back is
+// worst exactly when it happens: "--log-level=verbose" used to mean info, so
+// the operator raising verbosity to chase a production problem got the output
+// they already had and no hint that the flag had been dropped.
+//
+// Matching stays case-insensitive, and empty still means the default — both
+// have always worked, and tightening them here would fail boots over settings
+// that were never wrong.
+func NewLogger(g *Globals) (*slog.Logger, error) {
 	var level slog.Level
 	switch strings.ToLower(g.LogLevel) {
+	case "", "info":
+		level = slog.LevelInfo
 	case "debug":
 		level = slog.LevelDebug
 	case "warn":
@@ -33,15 +46,18 @@ func NewLogger(g *Globals) *slog.Logger {
 	case "error":
 		level = slog.LevelError
 	default:
-		level = slog.LevelInfo
+		return nil, fmt.Errorf("--log-level %q is not one of debug, info, warn, error", g.LogLevel)
 	}
 
 	opts := &slog.HandlerOptions{Level: level}
 	var handler slog.Handler
-	if strings.EqualFold(g.LogFormat, "json") {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
-	} else {
+	switch strings.ToLower(g.LogFormat) {
+	case "", "text":
 		handler = slog.NewTextHandler(os.Stderr, opts)
+	case "json":
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	default:
+		return nil, fmt.Errorf("--log-format %q is not one of text, json", g.LogFormat)
 	}
-	return slog.New(handler)
+	return slog.New(handler), nil
 }

@@ -136,7 +136,10 @@ func poolFromConfig(p config.Pool) backend.PoolConfig {
 }
 
 func runGateway(c *GatewayCmd, g *Globals, version string) error {
-	log := NewLogger(g)
+	log, err := NewLogger(g)
+	if err != nil {
+		return err
+	}
 
 	kind, err := c.selectSource()
 	if err != nil {
