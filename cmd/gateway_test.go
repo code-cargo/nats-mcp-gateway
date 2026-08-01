@@ -1152,7 +1152,8 @@ func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
 	}{
 		{
 			"queue group pinned to what an unscoped gateway computes",
-			`{"servers":{}}`, GatewayCmd{QueueGroup: "mcpgw"},
+			`{"servers":{}}`,
+			GatewayCmd{QueueGroup: "mcpgw"},
 		},
 		{
 			"queue group pinned to what a scoped gateway computes",
@@ -1162,8 +1163,10 @@ func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
 		{
 			"pool sizes pinned to the pool's own defaults",
 			`{"servers":{}}`,
-			GatewayCmd{PoolMaxConcurrent: 32, PoolMaxProcsPerTenant: 16,
-				PoolIdleTTL: 5 * time.Minute, PoolMaxLifetime: time.Hour},
+			GatewayCmd{
+				PoolMaxConcurrent: 32, PoolMaxProcsPerTenant: 16,
+				PoolIdleTTL: 5 * time.Minute, PoolMaxLifetime: time.Hour,
+			},
 		},
 		{
 			// Read only when claim-check is on, so with no block they are inert.
