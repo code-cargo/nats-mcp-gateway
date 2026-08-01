@@ -445,8 +445,57 @@ func isCancellation(data, id []byte) bool {
 	if json.Unmarshal(m.Params, &p) != nil || len(p.RequestID) == 0 {
 		return false
 	}
-	return bytes.Equal(bytes.TrimSpace(p.RequestID), bytes.TrimSpace(id))
+	return sameRequestID(p.RequestID, id)
 }
+
+// sameRequestID reports whether two JSON-RPC ids denote the same request.
+//
+// Byte equality is not enough, because the two ids reaching this point did not
+// come out of the same encoder. A native client's request body is forwarded
+// VERBATIM, so its id is whatever that client wrote; the cancellation naming
+// it is re-encoded by Go somewhere along the way, and encoding/json escapes
+// <, > and & to \u003c, \u003e and \u0026 by default. An id carrying any of
+// them — a URL, an HTML fragment, anything a client derived from user text —
+// therefore arrives spelled two ways, and comparing the bytes drops the
+// cancellation. The request then runs to completion after the client asked it
+// to stop, which is the failure the ctl guard exists to prevent, reached from
+// the other side.
+//
+// Comparing the decoded values also settles 1 vs 1.0 vs 1e0 the way a reader
+// expects, since json.Number keeps the literal and two spellings of one number
+// are not the same id under JSON-RPC's "the client chose this string" rule.
+func sameRequestID(a, b []byte) bool {
+	if bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b)) {
+		return true
+	}
+	da, err := decodeID(a)
+	if err != nil {
+		return false
+	}
+	db, err := decodeID(b)
+	if err != nil {
+		return false
+	}
+	return da == db
+}
+
+func decodeID(raw []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber() // a number's literal is its identity; float64 would round
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	switch v.(type) {
+	case string, json.Number:
+		return v, nil
+	}
+	// JSON-RPC 2.0 allows only a string or a number as an id; anything else
+	// cannot name a request and must not match one.
+	return nil, errNotAnID
+}
+
+var errNotAnID = errors.New("wire: id is neither a string nor a number")
 
 // beginRequest reserves the request's slot in the drain WaitGroup, reporting
 // false once Shutdown has stopped waiting for new work.

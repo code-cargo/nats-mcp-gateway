@@ -33,6 +33,7 @@ import (
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 // runNATS starts an embedded nats-server on a random port.
@@ -988,4 +989,41 @@ func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
 		require.NoError(t, srv.Shutdown(ctx))
 		cancel()
 	}
+}
+
+// TestCancellationSurvivesADifferentEncoder covers the asymmetry the ctl
+// guard is exposed to: the two ids it compares did not come out of the same
+// encoder.
+//
+// A native client's request body is forwarded verbatim, so its id is whatever
+// that client wrote. The cancellation naming it is re-encoded by Go, and
+// encoding/json escapes <, > and & by default — so an id derived from a URL or
+// any user text arrives spelled two ways and a byte comparison drops the
+// cancellation. The request then runs on after the client asked it to stop,
+// which is the ctl guard's own failure mode reached from the other side.
+//
+// Both hand-built, deliberately: a test that encodes both sides the same way
+// cannot see this, which is why the existing ones do not.
+func TestCancellationSurvivesADifferentEncoder(t *testing.T) {
+	cancelBody := func(id string) []byte {
+		params, err := json.Marshal(map[string]any{"requestId": id})
+		require.NoError(t, err)
+		body, err := jsonrpc.Encode(jsonrpc.NewNotification(mcpspec.NotifCancelled, params))
+		require.NoError(t, err)
+		return body
+	}
+	for _, id := range []string{"a<b", "a>b", "a&b", "https://x/?a=1&b=2", "plain-1"} {
+		verbatim, err := json.Marshal(id)
+		require.NoError(t, err)
+		// What a client that does not HTML-escape would actually put on the wire.
+		literal := []byte(`"` + id + `"`)
+		assert.True(t, isCancellation(cancelBody(id), verbatim), "same encoder, id %q", id)
+		assert.True(t, isCancellation(cancelBody(id), literal), "different encoder, id %q", id)
+	}
+	// Still refuses a cancellation naming a different request.
+	assert.False(t, isCancellation(cancelBody("other"), []byte(`"a<b"`)))
+	// Numbers keep their literal: two spellings are two ids.
+	assert.True(t, isCancellation(cancelBody("1"), []byte(`"1"`)))
+	assert.False(t, isCancellation(cancelBody("1"), []byte(`1`)),
+		"a string id and a number id are different ids")
 }
