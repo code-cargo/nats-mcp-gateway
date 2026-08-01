@@ -185,6 +185,97 @@ func TestCancelViaCtl(t *testing.T) {
 	assert.Empty(t, frames[0].Body, "cancelled request ends with an empty body: no response exists")
 }
 
+// The control subject is an ordinary NATS subject sitting under the caller's
+// reply inbox, so the gateway has to check what lands on it. Cancelling on any
+// message at all means a stray publish, a probe, or a cancellation meant for
+// some other request ends a live call — and a cancelled request terminates
+// with the empty end frame that tells the caller no response exists, so the
+// request simply vanishes rather than failing.
+func TestCtlIgnoresAnythingButAMatchingCancellation(t *testing.T) {
+	nc := runNATS(t, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cancelled := make(chan bool, 1)
+	// Keepalives parked far away so the reply subject carries only what this
+	// test is asserting about.
+	serve(t, nc, ServerConfig{KeepAlive: time.Hour}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+			cancelled <- true
+			return nil
+		case <-release:
+			cancelled <- false
+			return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{"ok":true}}`))
+		}
+	})
+
+	// Hand-built so the test knows the reply inbox the control subject hangs
+	// off; the client derives it internally.
+	reply := nc.NewRespInbox()
+	sub, err := nc.SubscribeSync(reply)
+	require.NoError(t, err)
+	subj, err := BuildSubject("", "acme", "_", "test", "tools/call", "")
+	require.NoError(t, err)
+	require.NoError(t, nc.PublishMsg(&nats.Msg{
+		Subject: subj,
+		Reply:   reply,
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{}}`),
+		Header: nats.Header{
+			HeaderWire:   []string{WireVersion},
+			HeaderMethod: []string{"tools/call"},
+		},
+	}))
+	<-started
+
+	for _, body := range []string{
+		``,
+		`not json at all`,
+		`{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"a-different-request"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`,
+		`{"jsonrpc":"2.0","id":"1","method":"notifications/cancelled","params":{"requestId":"1"}}`,
+	} {
+		require.NoError(t, nc.Publish(reply+ctlSuffix, []byte(body)))
+	}
+	require.NoError(t, nc.Flush())
+	// The control callback runs on its own delivery goroutine, so give it room
+	// to have acted before the handler is allowed to finish on its own.
+	time.Sleep(250 * time.Millisecond)
+	close(release)
+
+	assert.False(t, <-cancelled, "a non-cancellation on the control subject cancelled the request")
+	msg, err := sub.NextMsg(5 * time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, string(FrameEnd), msg.Header.Get(HeaderFrame))
+	assert.Contains(t, string(msg.Data), `"ok":true`, "the request must complete normally")
+}
+
+func TestIsCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		id   string
+		want bool
+	}{
+		{"matching string id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, true},
+		{"matching numeric id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}`, `7`, true},
+		{"whitespace around the id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId": "7" }}`, `"7"`, true},
+		{"other request", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"8"}}`, `"7"`, false},
+		{"string and number are different ids", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `7`, false},
+		{"no requestId", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`, `"7"`, false},
+		{"another notification", `{"jsonrpc":"2.0","method":"notifications/progress","params":{"requestId":"7"}}`, `"7"`, false},
+		{"a request, not a notification", `{"jsonrpc":"2.0","id":"9","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, false},
+		{"wrong jsonrpc version", `{"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, false},
+		{"not json", `hello`, `"7"`, false},
+		{"empty", ``, `"7"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isCancellation([]byte(tc.body), []byte(tc.id)))
+		})
+	}
+}
+
 func TestKeepAliveHoldsIdleStream(t *testing.T) {
 	nc := runNATS(t, nil)
 	serve(t, nc, ServerConfig{KeepAlive: 30 * time.Millisecond}, func(ctx context.Context, in *Inbound, w StreamWriter) error {

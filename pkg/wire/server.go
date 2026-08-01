@@ -15,7 +15,9 @@
 package wire
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,6 +30,7 @@ import (
 	"github.com/nats-io/nats.go/micro"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 const (
@@ -97,8 +100,10 @@ type ServerConfig struct {
 	Version string
 	// KeepAlive overrides DefaultKeepAlive when > 0.
 	KeepAlive time.Duration
-	// Logger receives the wire's own operational messages — today, refused
-	// reply subjects. slog.Default() when nil.
+	// Logger receives the wire's own operational messages: a refused reply
+	// subject, and a control subscription the gateway could not establish —
+	// conditions that degrade a request without failing it, which is exactly
+	// why they need somewhere to go. slog.Default() when nil.
 	Logger *slog.Logger
 	// Claims, when set, parks oversize responses in a claim store instead of
 	// failing them with ErrCodePayloadTooLarge — but only for callers that
@@ -373,11 +378,28 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		ctx, cancel := context.WithCancelCause(s.base)
 		defer cancel(nil)
 
-		// Control subject: any message on {reply}.ctl cancels this request.
-		ctlSub, err := s.nc.Subscribe(req.Reply()+ctlSuffix, func(*nats.Msg) {
+		// Control subject: a notifications/cancelled naming THIS request
+		// cancels it. The body is checked rather than assumed, because
+		// {reply}.ctl is an ordinary subject under the caller's inbox — a
+		// stray publish, a probe, or a cancellation meant for another request
+		// must not end a live call.
+		ctlSubject := req.Reply() + ctlSuffix
+		ctlSub, err := s.nc.Subscribe(ctlSubject, func(m *nats.Msg) {
+			if !isCancellation(m.Data, msg.ID) {
+				return
+			}
 			cancel(errClientCancelled)
 		})
-		if err == nil {
+		if err != nil {
+			// The request still runs — it just cannot be cancelled any more,
+			// and the keepalives would hide that for the whole stream, so the
+			// operator has to hear about it. A SUBSCRIBE the NATS server
+			// refuses does not land here (that arrives asynchronously on the
+			// connection); this is the local failures — closed connection,
+			// unusable subject.
+			s.log.Error("control subscription failed, this request cannot be cancelled",
+				"subject", ctlSubject, "err", err)
+		} else {
 			defer func() { _ = ctlSub.Unsubscribe() }()
 		}
 
@@ -402,6 +424,28 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 			_ = w.Err(jsonrpc.CodeInternalError, "handler returned no response", nil)
 		}
 	}()
+}
+
+// isCancellation reports whether a control-subject message is a
+// notifications/cancelled naming the request with the given raw JSON-RPC id.
+// Ids compare as raw bytes — the same identity rule jsonrpc.IDKey applies to
+// correlation everywhere else, so a string "1" and a number 1 are different
+// requests here exactly as they are there.
+func isCancellation(data, id []byte) bool {
+	if len(id) == 0 {
+		return false
+	}
+	m, err := jsonrpc.Decode(data)
+	if err != nil || m.Kind() != jsonrpc.KindNotification || m.Method != mcpspec.NotifCancelled {
+		return false
+	}
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(m.Params, &p) != nil || len(p.RequestID) == 0 {
+		return false
+	}
+	return bytes.Equal(bytes.TrimSpace(p.RequestID), bytes.TrimSpace(id))
 }
 
 // beginRequest reserves the request's slot in the drain WaitGroup, reporting
