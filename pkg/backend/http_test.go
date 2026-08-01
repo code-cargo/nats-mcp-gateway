@@ -864,3 +864,54 @@ func TestScrubURLsKeepsErrorsDiagnosable(t *testing.T) {
 		assert.Equal(t, want, scrubURLs(in), "input %q", in)
 	}
 }
+
+// TestNonTerminatingListingRecordsTruncation bounds what a backend can make
+// the gateway do by never ending its cursor.
+//
+// Concluding "no annotations" from a truncated read would be wrong — the pages
+// never seen may carry some — so the probe correctly declines to record that.
+// But leaving it at that means every -32020 starts another full sweep, and the
+// backend decides when the cursor ends, so the sweep never gets cheaper.
+// Recording the truncation separately is what lets the recovery give up on a
+// retry that cannot succeed without claiming knowledge it does not have.
+func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
+	var listPages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		listPages.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
+			json.RawMessage(`{"tools":[],"nextCursor":"more"}`)))
+		_, _ = w.Write(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.refreshAnnotations(context.Background(), 0))
+
+	c.mu.Lock()
+	known, truncated := c.annotationsKnown, c.annotationsTruncated
+	c.mu.Unlock()
+
+	assert.False(t, known,
+		"a listing that never ended is not evidence that the server publishes no annotations")
+	assert.True(t, truncated,
+		"the cap was hit with pages unread, and the recovery has to know that")
+	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
+		"the probe reads exactly the cap and stops")
+
+	// The second probe is what the guard exists to prevent: it would read the
+	// same pages and stop in the same place.
+	before := listPages.Load()
+	c.mu.Lock()
+	skip := c.annotationsKnown || c.annotationsTruncated
+	c.mu.Unlock()
+	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
+	assert.Equal(t, before, listPages.Load())
+}

@@ -116,6 +116,12 @@ type httpConn struct {
 	// client is one page, and what the pages after it hold is exactly the
 	// question being answered.
 	annotationsKnown bool
+	// annotationsTruncated records that a probe hit the page cap with the
+	// listing unfinished. Distinct from annotationsKnown: it says "we looked
+	// and could not see it all", which is not grounds to believe there are no
+	// annotations, but is grounds to stop re-reading the same pages — the
+	// backend chooses when its cursor ends.
+	annotationsTruncated bool
 	// refreshGen counts completed out-of-band schema fetches, so concurrent
 	// callers can tell whether one they waited on covered their need.
 	refreshGen uint64
@@ -394,8 +400,14 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 	c.mu.Lock()
 	_, toolKnown := c.annotations[name]
 	known := c.annotationsKnown && (toolKnown || len(c.annotations) == 0)
+	// A truncated probe counts as done for this purpose. It read every page
+	// the cap allows, so another one reads the same ones and learns nothing
+	// new — and the backend chooses when the cursor ends, so without this a
+	// listing that never terminates makes each rejected call re-sweep the
+	// whole toolset.
+	truncated := c.annotationsTruncated
 	c.mu.Unlock()
-	if known {
+	if known || truncated {
 		return false
 	}
 	if err := c.refreshAnnotations(ctx, gen); err != nil {
@@ -783,6 +795,16 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 	// again.
 	if cursor == "" {
 		c.annotationsKnown = true
+	} else {
+		// Read as far as the cap allows and the listing still had more. We
+		// cannot conclude "this server publishes no annotations" from that —
+		// the tools we never saw may carry some — but we also must not keep
+		// paying for the attempt: the next probe reads the same pages and
+		// stops in the same place, so a backend that never terminates its
+		// cursor would turn every -32020 into another full sweep. Recording
+		// the truncation is what makes the recovery give up on a retry that
+		// cannot succeed, without claiming knowledge it does not have.
+		c.annotationsTruncated = true
 	}
 	c.refreshGen++
 	c.mu.Unlock()
