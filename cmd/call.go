@@ -31,6 +31,12 @@ func runCall(c *CallCmd, g *Globals) error {
 	if c.Creds != "" {
 		opts = append(opts, nats.UserCredentials(c.Creds))
 	}
+	if c.InboxPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+			return fmt.Errorf("--inbox-prefix: %w", err)
+		}
+		opts = append(opts, nats.CustomInboxPrefix(c.InboxPrefix))
+	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
 		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
@@ -75,7 +81,7 @@ func runCall(c *CallCmd, g *Globals) error {
 		name = s
 	}
 
-	cfg := wire.ClientConfig{Tenant: c.Tenant, User: c.User}
+	cfg := wire.ClientConfig{Prefix: c.SubjectPrefix, Tenant: c.Tenant, User: c.User}
 	if c.AcceptClaims {
 		js, err := jetstream.New(nc)
 		if err != nil {

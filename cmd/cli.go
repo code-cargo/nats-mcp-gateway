@@ -111,16 +111,22 @@ func (c *ShimCmd) Run(g *Globals) error {
 }
 
 // CallCmd sends one request and prints raw reply frames, for debugging the
-// wire without an MCP client.
+// wire without an MCP client. It carries the shim's prefix flags because the
+// deployments worth pointing a wire debugger at are the awkward ones: against
+// a custom --subject-prefix a hardcoded mcp.v1 reports "no gateway" on a
+// perfectly healthy fleet, and a fenced identity granted only
+// _INBOX_acme_u1.> cannot subscribe to its own replies at all.
 type CallCmd struct {
-	Server       string `help:"Name of the MCP server to call." required:""`
-	Method       string `help:"MCP method (e.g. tools/list)." required:""`
-	Params       string `help:"JSON params." default:"{}"`
-	NatsURL      string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds        string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
-	Tenant       string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
-	User         string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
-	AcceptClaims bool   `help:"Accept claim-checked oversize responses." env:"NATSMCP_ACCEPT_CLAIMS"`
+	Server        string `help:"Name of the MCP server to call." required:""`
+	Method        string `help:"MCP method (e.g. tools/list)." required:""`
+	Params        string `help:"JSON params." default:"{}"`
+	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
+	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
+	User          string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
+	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
+	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
+	AcceptClaims  bool   `help:"Accept claim-checked oversize responses." env:"NATSMCP_ACCEPT_CLAIMS"`
 }
 
 func (c *CallCmd) Run(g *Globals) error {
