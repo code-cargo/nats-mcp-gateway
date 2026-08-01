@@ -543,7 +543,7 @@ func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
 			cmd:  GatewayCmd{InboxPrefix: "_INBOX_acme.u_9f3a", QueueGroup: "mcpgw.acme"},
 			want: []string{
 				`--inbox-prefix="_INBOX_acme.u_9f3a"`, `nats.inboxPrefix=""`,
-				`--queue-group="mcpgw.acme"`, `nats.queueGroup=""`,
+				`--queue-group="mcpgw.acme"`, `nats.queueGroup="mcpgw"`,
 			},
 		},
 		{
@@ -560,7 +560,7 @@ func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
 				PoolIdleTTL: 30 * time.Minute, PoolMaxLifetime: 24 * time.Hour,
 			},
 			want: []string{
-				"--pool-max-concurrent=7", "pool.maxConcurrent=0",
+				"--pool-max-concurrent=7", "pool.maxConcurrent=32",
 				"--pool-max-procs-per-tenant=64", "pool.maxProcsPerTenant=16",
 				"--pool-idle-ttl=30m0s", "--pool-max-lifetime=24h0m0s",
 			},
@@ -1131,4 +1131,59 @@ func TestCredRegistryLookupCannotResurrectPrunedServer(t *testing.T) {
 	assert.Nil(t, resolver, "a stale snapshot must not resurrect a pruned server's resolver")
 	assert.False(t, perUser)
 	assert.Empty(t, r.entries)
+}
+
+// TestFileSourceGuardAllowsSettingsThatDropNothing is the counterweight to
+// TestBootParamsFileSourceRejectsIgnoredFlags. The guard exists to catch a
+// setting the file source would silently discard, and refusing one it would
+// have honoured anyway is the same class of harm pointed the other way: a
+// deployment that already works stops booting.
+//
+// Every case here pins a flag to the value the process uses when the document
+// is silent, so the flag changes nothing. The defaults live below the CLI —
+// wire.DefaultQueueGroup owns the queue group and PoolConfig.fill owns the
+// pool sizes, both deliberately, so that every config source inherits them —
+// which is exactly why comparing against the document's raw zero was wrong.
+func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+		cmd  GatewayCmd
+	}{
+		{
+			"queue group pinned to what an unscoped gateway computes",
+			`{"servers":{}}`, GatewayCmd{QueueGroup: "mcpgw"},
+		},
+		{
+			"queue group pinned to what a scoped gateway computes",
+			`{"servers":{},"nats":{"tenant":"acme","user":"u_9f3a"}}`,
+			GatewayCmd{QueueGroup: "mcpgw.acme.u_9f3a"},
+		},
+		{
+			"pool sizes pinned to the pool's own defaults",
+			`{"servers":{}}`,
+			GatewayCmd{PoolMaxConcurrent: 32, PoolMaxProcsPerTenant: 16,
+				PoolIdleTTL: 5 * time.Minute, PoolMaxLifetime: time.Hour},
+		},
+		{
+			// Read only when claim-check is on, so with no block they are inert.
+			"claim sizing with claim-check absent from the document",
+			`{"servers":{}}`,
+			GatewayCmd{ClaimMaxAge: 10 * time.Minute, ClaimMaxBytes: 1 << 20},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "gateway.json")
+			require.NoError(t, os.WriteFile(path, []byte(tt.doc), 0o600))
+			cmd := tt.cmd
+			cmd.Config = path
+			cfg, err := config.Load(path)
+			require.NoError(t, err)
+			_ = cfg
+			_, err = cmd.bootParams(sourceFile)
+			assert.NoError(t, err, "a flag that changes nothing must not refuse the boot")
+		})
+	}
 }

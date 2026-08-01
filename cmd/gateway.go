@@ -494,30 +494,51 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 		c.SubjectPrefix, boot.prefix)
 	check("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
 		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
+	// Compared against the group the wire will actually join, not against the
+	// document's silence: wire.DefaultQueueGroup owns this default precisely so
+	// every source gets it, so pinning a flag to the value it already computes
+	// drops nothing and must not refuse the boot.
+	effQueue := boot.queueGroup
+	if effQueue == "" {
+		effQueue = wire.DefaultQueueGroup(boot.tenant, boot.user)
+	}
 	check("queue-group", "NATSMCP_QUEUE_GROUP", "nats.queueGroup",
-		c.QueueGroup != "" && c.QueueGroup != boot.queueGroup, c.QueueGroup, boot.queueGroup)
+		c.QueueGroup != "" && c.QueueGroup != effQueue, c.QueueGroup, effQueue)
 	check("scope-tenant", "NATSMCP_SCOPE_TENANT", "nats.tenant",
 		c.ScopeTenant != "" && c.ScopeTenant != boot.tenant, c.ScopeTenant, boot.tenant)
 	check("scope-user", "NATSMCP_SCOPE_USER", "nats.user",
 		c.ScopeUser != "" && c.ScopeUser != boot.user, c.ScopeUser, boot.user)
+	// Same for the pool: PoolConfig.fill substitutes a default for anything
+	// <= 0, so a document that omits these is not asking for zero — it is
+	// asking for 32/16/5m/1h, which is what cli.go's own help text advertises.
+	// A chart that materializes those numbers into env would otherwise be
+	// refused for agreeing with the gateway.
+	effPool := boot.pool.Filled()
 	check("pool-max-concurrent", "NATSMCP_POOL_MAX_CONCURRENT", "pool.maxConcurrent",
-		c.PoolMaxConcurrent != 0 && c.PoolMaxConcurrent != boot.pool.MaxConcurrent,
-		c.PoolMaxConcurrent, boot.pool.MaxConcurrent)
+		c.PoolMaxConcurrent > 0 && c.PoolMaxConcurrent != effPool.MaxConcurrent,
+		c.PoolMaxConcurrent, effPool.MaxConcurrent)
 	check("pool-max-procs-per-tenant", "NATSMCP_POOL_MAX_PROCS_PER_TENANT", "pool.maxProcsPerTenant",
-		c.PoolMaxProcsPerTenant != 0 && c.PoolMaxProcsPerTenant != boot.pool.MaxProcsPerTenant,
-		c.PoolMaxProcsPerTenant, boot.pool.MaxProcsPerTenant)
+		c.PoolMaxProcsPerTenant > 0 && c.PoolMaxProcsPerTenant != effPool.MaxProcsPerTenant,
+		c.PoolMaxProcsPerTenant, effPool.MaxProcsPerTenant)
 	check("pool-idle-ttl", "NATSMCP_POOL_IDLE_TTL", "pool.idleTtl",
-		c.PoolIdleTTL != 0 && c.PoolIdleTTL != boot.pool.IdleTTL, c.PoolIdleTTL, boot.pool.IdleTTL)
+		c.PoolIdleTTL > 0 && c.PoolIdleTTL != effPool.IdleTTL, c.PoolIdleTTL, effPool.IdleTTL)
 	check("pool-max-lifetime", "NATSMCP_POOL_MAX_LIFETIME", "pool.maxLifetime",
-		c.PoolMaxLifetime != 0 && c.PoolMaxLifetime != boot.pool.MaxLifetime, c.PoolMaxLifetime, boot.pool.MaxLifetime)
+		c.PoolMaxLifetime > 0 && c.PoolMaxLifetime != effPool.MaxLifetime, c.PoolMaxLifetime, effPool.MaxLifetime)
 	check("claim-check", "NATSMCP_CLAIM_CHECK", "claimCheck",
 		c.ClaimCheck && !boot.claimCheck, c.ClaimCheck, boot.claimCheck)
-	check("claim-max-age", "NATSMCP_CLAIM_MAX_AGE", "claimCheck.maxAge",
-		c.ClaimMaxAge != 0 && c.ClaimMaxAge != defaultClaimMaxAge && c.ClaimMaxAge != boot.claimMaxAge,
-		c.ClaimMaxAge, boot.claimMaxAge)
-	check("claim-max-bytes", "NATSMCP_CLAIM_MAX_BYTES", "claimCheck.maxBytes",
-		c.ClaimMaxBytes != 0 && c.ClaimMaxBytes != defaultClaimMaxBytes && c.ClaimMaxBytes != boot.claimMaxBytes,
-		c.ClaimMaxBytes, boot.claimMaxBytes)
+	// The sizing flags are read only when claim-check is on (see runGateway),
+	// so with neither side asking for it they are inert and dropping them
+	// costs nothing. When the FLAG asks for it the request is being dropped
+	// whole, and naming only --claim-check would under-report what the
+	// operator asked for and is not getting.
+	if boot.claimCheck || c.ClaimCheck {
+		check("claim-max-age", "NATSMCP_CLAIM_MAX_AGE", "claimCheck.maxAge",
+			c.ClaimMaxAge != 0 && c.ClaimMaxAge != defaultClaimMaxAge && c.ClaimMaxAge != boot.claimMaxAge,
+			c.ClaimMaxAge, boot.claimMaxAge)
+		check("claim-max-bytes", "NATSMCP_CLAIM_MAX_BYTES", "claimCheck.maxBytes",
+			c.ClaimMaxBytes != 0 && c.ClaimMaxBytes != defaultClaimMaxBytes && c.ClaimMaxBytes != boot.claimMaxBytes,
+			c.ClaimMaxBytes, boot.claimMaxBytes)
+	}
 
 	if len(dropped) == 0 {
 		return nil

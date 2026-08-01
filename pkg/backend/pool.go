@@ -53,6 +53,12 @@ type PoolConfig struct {
 	BreakerCooldown  time.Duration
 }
 
+// Filled returns c with every unset field replaced by the value the pool
+// would substitute. Exported so a caller validating configuration can compare
+// against what will actually be in force rather than against the zero the
+// operator left behind.
+func (c PoolConfig) Filled() PoolConfig { c.fill(); return c }
+
 func (c *PoolConfig) fill() {
 	if c.MaxConcurrent <= 0 {
 		c.MaxConcurrent = 32

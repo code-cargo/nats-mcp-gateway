@@ -125,23 +125,30 @@ type Server struct {
 // Serve starts the wire server with the given initial server set. Each
 // request runs in its own goroutine; per-backend concurrency limits belong to
 // the backend pool, not the wire.
+// DefaultQueueGroup is the group a gateway joins when none is configured.
+//
+// A scoped instance defaults to its OWN group: NATS dedupes queue subscribers
+// by group name across different subject patterns, so sharing "mcpgw" with an
+// unscoped fleet serving the same server names would make the two compete for
+// the scoped traffic. The group mirrors the scope — mcpgw.{tenant} for an org
+// deployment, mcpgw.{tenant}.{user} for a per-user pod.
+//
+// This default lives here rather than in the CLI so every config source gets
+// it, which also means a caller wanting to know what a gateway WILL join has
+// to ask here rather than reading a flag.
+func DefaultQueueGroup(tenant, user string) string {
+	switch {
+	case tenant != "" && user != "":
+		return "mcpgw." + tenant + "." + user
+	case tenant != "":
+		return "mcpgw." + tenant
+	}
+	return "mcpgw"
+}
+
 func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	if cfg.QueueGroup == "" {
-		// A scoped instance defaults to its OWN queue group: NATS dedupes
-		// queue subscribers by group name across different subject patterns,
-		// so sharing "mcpgw" with an unscoped fleet serving the same server
-		// names would make the two compete for the scoped traffic. The group
-		// mirrors the scope — mcpgw.{tenant} for an org deployment,
-		// mcpgw.{tenant}.{user} for a per-user pod. This default lives here —
-		// not in the CLI — so every config source gets it.
-		switch {
-		case cfg.Tenant != "" && cfg.User != "":
-			cfg.QueueGroup = "mcpgw." + cfg.Tenant + "." + cfg.User
-		case cfg.Tenant != "":
-			cfg.QueueGroup = "mcpgw." + cfg.Tenant
-		default:
-			cfg.QueueGroup = "mcpgw"
-		}
+		cfg.QueueGroup = DefaultQueueGroup(cfg.Tenant, cfg.User)
 	}
 	if cfg.Name == "" {
 		cfg.Name = "natsmcp-gateway"
