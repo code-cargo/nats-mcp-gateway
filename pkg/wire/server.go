@@ -810,6 +810,16 @@ func (w *streamWriter) End(body []byte) error {
 			cancel()
 			if err == nil {
 				if !w.claim() {
+					// Parking the body and claiming the stream cannot be one
+					// step, and something terminated the stream in between —
+					// a cancellation, most likely. The id is never sent, so
+					// nothing can ever fetch this object, and the fetch is what
+					// would have deleted it. Best effort, like the fetch-side
+					// delete: the bucket TTL stays the backstop, and this
+					// stream is already answered, so there is no one to tell.
+					dctx, dcancel := context.WithTimeout(context.Background(), claimOpTimeout)
+					_ = w.claims.Delete(dctx, w.tenant, id)
+					dcancel()
 					return nil
 				}
 				return w.req.Respond(nil, micro.WithHeaders(micro.Headers{
