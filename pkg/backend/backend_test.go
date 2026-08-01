@@ -21,6 +21,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -77,6 +78,33 @@ func TestStdioEcho(t *testing.T) {
 	require.Nil(t, resp.Error)
 	assert.JSONEq(t, `"c1"`, string(resp.ID), "caller id must be restored")
 	assert.Contains(t, string(resp.Result), "hello")
+}
+
+// Only the Start failure cleaned up after itself. The three pipe setups above
+// it returned straight out, leaving the scratch workdir behind — and the
+// condition that fails a pipe is descriptor exhaustion, which is exactly the
+// condition that repeats. A gateway under it leaked a directory per attempt,
+// and the descriptors of whichever pipes had already succeeded.
+func TestFailedConnectLeavesNothingBehind(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp) // os.MkdirTemp("", ...) lands here
+
+	var lim syscall.Rlimit
+	require.NoError(t, syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim))
+	// Descriptors this process already holds keep working; only new ones fail.
+	// The window is closed on the next line either way.
+	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_NOFILE,
+		&syscall.Rlimit{Cur: 8, Max: lim.Max}))
+	conn, err := fakeBackend(nil).Connect(context.Background())
+	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim))
+
+	if err == nil {
+		_ = conn.Close()
+		t.Fatal("connect succeeded with no descriptors to spare; the test proved nothing")
+	}
+	entries, readErr := os.ReadDir(tmp)
+	require.NoError(t, readErr)
+	assert.Empty(t, entries, "the workdir outlived the failed connect")
 }
 
 func TestMuxConcurrentCallsCorrelate(t *testing.T) {

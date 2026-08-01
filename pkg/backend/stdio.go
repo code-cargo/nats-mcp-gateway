@@ -70,6 +70,24 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 		return nil, fmt.Errorf("backend: temp workdir: %w", err)
 	}
 
+	// Undo everything this function allocated on every path that returns
+	// without a live subprocess to own it. What fails a pipe below is
+	// descriptor exhaustion, and that is a condition the gateway sits in
+	// rather than passes through: leaving a workdir (and the descriptors of
+	// whichever pipes already succeeded) behind on each attempt compounds
+	// exactly the shortage that caused it.
+	spawned := false
+	var opened []io.Closer
+	defer func() {
+		if spawned {
+			return
+		}
+		for _, p := range opened {
+			_ = p.Close()
+		}
+		_ = os.RemoveAll(workDir)
+	}()
+
 	cmd := exec.Command(b.Command, b.Args...)
 	cmd.Dir = workDir
 	cmd.Env = []string{
@@ -89,19 +107,25 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("backend: stdin pipe: %w", err)
 	}
+	opened = append(opened, stdin)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("backend: stdout pipe: %w", err)
 	}
+	opened = append(opened, stdout)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("backend: stderr pipe: %w", err)
 	}
+	opened = append(opened, stderr)
 
+	// Start takes over the parent ends from here — closing them itself if it
+	// fails, and handing them to the loops below if it does not.
+	opened = nil
 	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(workDir)
 		return nil, fmt.Errorf("backend: start %s: %w", b.Command, err)
 	}
+	spawned = true
 
 	c := &stdioConn{
 		cmd:     cmd,
