@@ -697,6 +697,54 @@ func TestPermissionViolationFailsFast(t *testing.T) {
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 }
 
+// A denied SUBSCRIBE is exactly as fatal to a stream as a denied publish, and
+// it arrives the same way: asynchronously on the connection, never from
+// SubscribeSync, which hands back a perfectly good subscription. The request
+// then publishes fine and no reply can ever be delivered to it, so the caller
+// used to sit out the entire inactivity window before being told the stream
+// was "inactive" — for a permission problem NATS reported in milliseconds.
+//
+// The likely cause is an identity whose grant covers its request subjects but
+// not its reply inbox: the shape of an --inbox-prefix deployment with the
+// prefix left off one side.
+func TestSubscribePermissionDeniedFailsFast(t *testing.T) {
+	opts := &server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{{
+			Username: "restricted", Password: "pw",
+			Permissions: &server.Permissions{
+				// The request publish is allowed; only the reply inbox is not.
+				Publish:   &server.SubjectPermission{Allow: []string{"mcp.v1.req.acme.>"}},
+				Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX_other.>"}},
+			},
+		}},
+	}
+	srv, err := server.NewServer(opts)
+	require.NoError(t, err)
+	go srv.Start()
+	require.True(t, srv.ReadyForConnections(5*time.Second))
+	t.Cleanup(srv.Shutdown)
+
+	nc, err := nats.Connect(srv.ClientURL(), nats.UserInfo("restricted", "pw"))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	// Far beyond collect's own 10s fatal: a stream left to the inactivity
+	// deadline fails this test rather than quietly waiting it out.
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", Inactivity: 30 * time.Second})
+	require.NoError(t, err)
+
+	s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.NotNil(t, frames[0].Err)
+	assert.Equal(t, ErrCodePermissionDenied, frames[0].Err.Code)
+	assert.Contains(t, frames[0].Err.Message, "subscribe to",
+		"the message must name the operation that was denied rather than assuming publish")
+}
+
 // The scoped queue-group default lives in Serve so EVERY config source gets
 // it — a scoped instance must never silently share the fleet's "mcpgw" group
 // (the two would compete for the scoped user's traffic).

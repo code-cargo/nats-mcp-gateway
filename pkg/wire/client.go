@@ -141,8 +141,9 @@ type violReg struct {
 	cancel context.CancelCauseFunc
 }
 
-// failViolated cancels every stream whose publish subject the server just
-// refused.
+// failViolated cancels every stream that depends on a subject the server just
+// refused — the request subject it publishes to, or the inbox it expects the
+// reply on.
 func (c *Client) failViolated(err error) {
 	subject := quotedSubject(err.Error())
 	if subject == "" {
@@ -154,9 +155,25 @@ func (c *Client) failViolated(err error) {
 	c.violMu.Unlock()
 	for r := range regs {
 		r.cancel(&Error{
-			Code:    ErrCodePermissionDenied,
-			Message: fmt.Sprintf("NATS denied publish to %q: this caller's permissions do not cover it", subject),
+			Code: ErrCodePermissionDenied,
+			Message: fmt.Sprintf("NATS denied %s %q: this caller's permissions do not cover it",
+				violatedOp(err), subject),
 		})
+	}
+}
+
+// violatedOp reports which operation NATS refused, taken from its own wording
+// ("Permissions Violation for Publish to ..." / "... for Subscription to
+// ..."). Naming it is what tells an operator whether the missing grant is on
+// the request subject or on the reply inbox — two different lines of config.
+func violatedOp(err error) string {
+	switch {
+	case strings.Contains(err.Error(), "Publish to"):
+		return "publish to"
+	case strings.Contains(err.Error(), "Subscription to"):
+		return "subscribe to"
+	default:
+		return "access to"
 	}
 }
 
@@ -226,11 +243,47 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	}
 
 	reply := c.nc.NewRespInbox()
+	streamCtx, stop := context.WithCancelCause(ctx)
+
+	// Register for permission-violation failure on BOTH subjects this request
+	// needs, and do it before either is used. A denied publish and a denied
+	// subscribe are reported the same way — asynchronously on the connection,
+	// never from the call that triggered them — and either one leaves the
+	// stream with nothing that can ever arrive on it. Registering after
+	// subscribing would leave the denial free to land first and find nobody
+	// waiting for it.
+	reg := &violReg{cancel: stop}
+	watched := [...]string{subject, reply}
+	c.violMu.Lock()
+	for _, s := range watched {
+		if c.viol[s] == nil {
+			c.viol[s] = make(map[*violReg]struct{})
+		}
+		c.viol[s][reg] = struct{}{}
+	}
+	c.violMu.Unlock()
+	unregister := func() {
+		c.violMu.Lock()
+		defer c.violMu.Unlock()
+		for _, s := range watched {
+			if regs := c.viol[s]; regs != nil {
+				delete(regs, reg)
+				if len(regs) == 0 {
+					delete(c.viol, s)
+				}
+			}
+		}
+	}
+
 	sub, err := c.nc.SubscribeSync(reply)
 	if err != nil {
+		unregister()
+		stop(nil)
 		return nil, fmt.Errorf("wire: subscribe reply: %w", err)
 	}
 	if err := sub.SetPendingLimits(pendingMsgsLimit, pendingBytesLimit); err != nil {
+		unregister()
+		stop(nil)
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("wire: pending limits: %w", err)
 	}
@@ -258,27 +311,6 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	if c.claims != nil {
 		msg.Header.Set(HeaderAcceptClaim, "1")
 	}
-	streamCtx, stop := context.WithCancelCause(ctx)
-
-	// Register for permission-violation failure BEFORE publishing.
-	reg := &violReg{cancel: stop}
-	c.violMu.Lock()
-	if c.viol[subject] == nil {
-		c.viol[subject] = make(map[*violReg]struct{})
-	}
-	c.viol[subject][reg] = struct{}{}
-	c.violMu.Unlock()
-	unregister := func() {
-		c.violMu.Lock()
-		defer c.violMu.Unlock()
-		if regs := c.viol[subject]; regs != nil {
-			delete(regs, reg)
-			if len(regs) == 0 {
-				delete(c.viol, subject)
-			}
-		}
-	}
-
 	if err := c.nc.PublishMsg(msg); err != nil {
 		unregister()
 		stop(nil)
