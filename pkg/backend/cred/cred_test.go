@@ -336,6 +336,41 @@ func TestOAuthRefreshRotation(t *testing.T) {
 	assert.Equal(t, "refresh-2", string(rotated), "a rotated refresh token must be persisted")
 }
 
+// A public client has a client id and no secret — the shape of every
+// authorization-code/refresh registration for a client that cannot keep one,
+// and oauth-refresh with no clientSecret is a configuration the gateway
+// accepts. RFC 6749 §3.2.1 says such a client identifies itself with client_id
+// in the request BODY. Authenticating instead as (id, empty password) over
+// Basic is not the same claim, and Okta, Auth0 and Keycloak all answer it with
+// a terminal invalid_client — so the mode failed on every attempt, forever,
+// with a backoff that never expires it.
+func TestOAuthPublicClientSendsClientIDInTheBody(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "u1.refresh"), []byte("refresh-1"), 0o600))
+	srv, form := tokenEndpoint(t, http.StatusOK, `{"access_token":"at-p","expires_in":60}`)
+
+	r := &OAuthRefresh{
+		TokenURL: srv.URL, ClientID: "public-cid",
+		Store: &FileTokenStore{Path: filepath.Join(dir, "{user}.refresh")},
+	}
+	c, err := r.Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer at-p", c.Headers["Authorization"])
+	assert.Equal(t, "public-cid", form.Get("client_id"))
+	assert.Empty(t, form.Get("_basic_user"), "a public client must not send an Authorization header at all")
+}
+
+// A confidential client keeps Basic — it is what RFC 6749 §2.3.1 prefers and
+// what every IdP the gateway has been pointed at expects.
+func TestOAuthConfidentialClientKeepsBasic(t *testing.T) {
+	srv, form := tokenEndpoint(t, http.StatusOK, `{"access_token":"at-c","expires_in":60}`)
+	_, err := (&OAuthClientCredentials{TokenURL: srv.URL, ClientID: "cid", ClientSecret: "cs"}).
+		Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, "cid", form.Get("_basic_user"))
+	assert.Empty(t, form.Get("client_id"), "a secret-bearing client authenticates in the header, not the body")
+}
+
 func TestFileTokenStoreReplacesAtomically(t *testing.T) {
 	// A refresh token is the one credential the gateway cannot re-derive: lose
 	// it and the user goes back through consent. Truncate-then-write leaves a
