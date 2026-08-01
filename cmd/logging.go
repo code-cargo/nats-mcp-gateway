@@ -127,7 +127,8 @@ var credInURL = regexp.MustCompile(`(://[^:/@]*:)[^@]*?(@)`)
 func connectFailure(raw string, err error) error {
 	return &connectError{
 		msg: credInURL.ReplaceAllString(
-			fmt.Sprintf("connect NATS %s: %v", redactNATSURL(raw), err), "${1}"+redacted+"${2}"),
+			fmt.Sprintf("connect NATS %s: %v", redactNATSURL(raw), err), "${1}"+redacted+"${2}",
+		),
 		err: err,
 	}
 }
@@ -138,4 +139,5 @@ type connectError struct {
 }
 
 func (e *connectError) Error() string { return e.msg }
+
 func (e *connectError) Unwrap() error { return e.err }

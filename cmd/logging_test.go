@@ -136,7 +136,8 @@ func TestConnectFailureRedactsThroughTheWrappedError(t *testing.T) {
 	} {
 		err := runGateway(
 			&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: raw},
-			&Globals{LogLevel: "error"}, "0.0.0")
+			&Globals{LogLevel: "error"}, "0.0.0",
+		)
 		require.Error(t, err)
 		for _, secret := range []string{"s3c r3t", "p%ss", "s3cr3t", "s3c@r3t", "pw1", "pw2"} {
 			assert.NotContains(t, err.Error(), secret,
