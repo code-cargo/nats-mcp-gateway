@@ -39,15 +39,22 @@ type legacyClient struct {
 
 const discoverTimeout = 30 * time.Second
 
-// engageLegacy handles the initialize request that triggered legacy mode.
+// engageLegacy handles an initialize request: it engages legacy mode on the
+// first one and refreshes the recorded client identity on any repeat, then
+// answers from server/discover. Called only from the Run loop goroutine, which
+// is what makes the s.legacy assignment safe.
 func (s *Shim) engageLegacy(ctx context.Context, msg *jsonrpc.Message) {
 	var p struct {
 		ClientInfo   json.RawMessage `json:"clientInfo"`
 		Capabilities json.RawMessage `json:"capabilities"`
 	}
 	_ = json.Unmarshal(msg.Params, &p)
+	if s.legacy == nil {
+		s.log.Info("legacy client detected, bridging initialize to server/discover")
+	} else {
+		s.log.Info("legacy client re-initialized, answering from server/discover again")
+	}
 	s.legacy = &legacyClient{clientInfo: p.ClientInfo, clientCaps: p.Capabilities}
-	s.log.Info("legacy client detected, bridging initialize to server/discover")
 
 	s.wg.Add(1)
 	go func() {

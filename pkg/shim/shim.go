@@ -172,9 +172,15 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 }
 
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
-	// Legacy wing: a first-request initialize flips the shim into legacy
-	// mode; thereafter ping and logging/setLevel are answered locally.
-	if s.legacy == nil && msg.Method == mcpspec.MethodInitialize {
+	// Legacy wing: an initialize flips the shim into legacy mode; thereafter
+	// ping and logging/setLevel are answered locally. A REPEAT initialize is
+	// answered the same way rather than forwarded — there is no initialize on
+	// the 2026-07-28 wire, so forwarding one sends it to a subject no grant is
+	// written for, and where a broad grant does cover it the gateway's legacy
+	// bridge hands a second handshake to a subprocess that is already
+	// initialized. The client is also re-stating its identity, so the answer
+	// comes from the params it just sent.
+	if msg.Method == mcpspec.MethodInitialize {
 		s.engageLegacy(ctx, msg)
 		return
 	}
