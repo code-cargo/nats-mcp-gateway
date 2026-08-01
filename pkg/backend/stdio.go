@@ -78,6 +78,7 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 	// exactly the shortage that caused it.
 	spawned := false
 	var opened []io.Closer
+	var cmd *exec.Cmd
 	defer func() {
 		if spawned {
 			return
@@ -85,10 +86,23 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 		for _, p := range opened {
 			_ = p.Close()
 		}
+		// Each *Pipe call allocates TWO descriptors: the one it returns, which
+		// `opened` collects, and the child's end it parks in cmd.Stdin/Stdout/
+		// Stderr. os/exec closes that half only inside Start, so a connect
+		// that fails during pipe setup never reaches the code that would
+		// release it — and releasing half of what was allocated compounds the
+		// shortage at half the rate rather than not at all.
+		if cmd != nil {
+			for _, end := range []any{cmd.Stdin, cmd.Stdout, cmd.Stderr} {
+				if f, ok := end.(*os.File); ok {
+					_ = f.Close()
+				}
+			}
+		}
 		_ = os.RemoveAll(workDir)
 	}()
 
-	cmd := exec.Command(b.Command, b.Args...)
+	cmd = exec.Command(b.Command, b.Args...)
 	cmd.Dir = workDir
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),

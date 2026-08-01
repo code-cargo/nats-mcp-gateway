@@ -1059,3 +1059,58 @@ func TestRefuseUnsafeRedirect(t *testing.T) {
 		})
 	}
 }
+
+// TestRedirectHostFoldingIsASCIIOnly guards the comparison that decides
+// whether a hop is "the same host".
+//
+// strings.EqualFold applies Unicode folding, under which U+212A KELVIN SIGN
+// folds to k and U+017F LONG S folds to s — so it would read
+// "ſlacK.example.com" as "slack.example.com". The name that goes on the wire
+// disagrees: Request.write emits it through Punycode with no UTS46 mapping,
+// producing a different DNS label. The TCP target is unchanged, so this is not
+// SSRF; what changes is the Host header, and the injected credential rides
+// along to what any Host-routed ingress treats as a different vhost.
+func TestRedirectHostFoldingIsASCIIOnly(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	for _, to := range []string{
+		"http://ſlacK.example.com/steal", // ſlacK
+		"http://slacK.example.com/steal", // slacK
+		"http://ſlack.example.com/steal", // ſlack
+	} {
+		assert.Error(t, RefuseUnsafeRedirect(req(to), []*http.Request{req("http://slack.example.com/mcp")}),
+			"a fold-equal spelling is a different DNS label on the wire: %q", to)
+	}
+	// ASCII case still folds, which is what the comparison is for.
+	assert.NoError(t, RefuseUnsafeRedirect(
+		req("http://SLACK.example.com/x"), []*http.Request{req("http://slack.example.com/mcp")},
+	))
+}
+
+// TestRedirectHopCapIsEnforced pins the only bound on a same-host loop.
+//
+// Setting CheckRedirect REPLACES Go's built-in 10-hop cap, the backend client
+// is built with Timeout 0 because response streams are long-lived, and the
+// wire handler's context carries no deadline of its own — so a backend that
+// redirects to itself would spin until something else gave out.
+func TestRedirectHopCapIsEnforced(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	via := func(n int) []*http.Request {
+		out := make([]*http.Request, n)
+		for i := range out {
+			out[i] = req("https://h/mcp")
+		}
+		return out
+	}
+	assert.NoError(t, RefuseUnsafeRedirect(req("https://h/a"), via(5)),
+		"a legitimate same-host chain must still be followed")
+	assert.Error(t, RefuseUnsafeRedirect(req("https://h/a"), via(6)),
+		"nothing else bounds this loop")
+}

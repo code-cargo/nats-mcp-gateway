@@ -18,7 +18,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 )
 
 // RefuseUnsafeRedirect is the CheckRedirect every client that carries an
@@ -82,7 +81,7 @@ func RefuseUnsafeRedirect(req *http.Request, via []*http.Request) error {
 // changes for a reason that is not a change of target: there the explicit
 // ports are compared, so h -> h upgrades but h:8080 -> h:8443 does not.
 func sameTarget(from, to *url.URL) bool {
-	if !strings.EqualFold(from.Hostname(), to.Hostname()) {
+	if !asciiEqualFold(from.Hostname(), to.Hostname()) {
 		return false
 	}
 	if from.Scheme != to.Scheme {
@@ -104,4 +103,42 @@ func defaultedPort(u *url.URL) string {
 		return "80"
 	}
 	return ""
+}
+
+// asciiEqualFold compares hostnames case-insensitively over ASCII only.
+//
+// strings.EqualFold applies Unicode simple folding, under which U+212A KELVIN
+// SIGN folds to "k" and U+017F LONG S folds to "s" — so it reads
+// "slack.example.com" and "\u017flac\u212a.example.com" as the same host. The
+// name that goes on the wire does not agree: Request.write emits the host
+// through idna.ToASCII's Punycode profile, which applies no UTS46 mapping and
+// produces a different DNS label.
+//
+// The TCP target is unchanged, because canonicalAddr resolves through
+// idna.Lookup which DOES map — so this is not SSRF. What changes is the Host
+// header, and Go's own credential-stripping check compares the mapped forms
+// and sees no change, so the injected Authorization rides along. On any
+// Host-routed ingress — an nginx server_name, an Envoy vhost, a CDN, an ALB
+// host rule — that punycode label is a different vhost on the same address,
+// which is the wildcard-DNS-tenant case this policy exists to close.
+//
+// DNS labels are ASCII on the wire, so folding only ASCII loses nothing: an
+// IDN spelled two ways is already refused, in both directions.
+func asciiEqualFold(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range len(a) {
+		x, y := a[i], b[i]
+		if 'A' <= x && x <= 'Z' {
+			x += 'a' - 'A'
+		}
+		if 'A' <= y && y <= 'Z' {
+			y += 'a' - 'A'
+		}
+		if x != y {
+			return false
+		}
+	}
+	return true
 }
