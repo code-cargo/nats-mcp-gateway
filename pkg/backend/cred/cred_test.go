@@ -665,6 +665,36 @@ func TestCachedNegativeCacheAndInvalidate(t *testing.T) {
 	assert.Equal(t, 2, inner.count())
 }
 
+// Invalidate promises the next resolve refetches immediately, "any failure
+// backoff cleared too". It cleared the deadline but not the count the next
+// deadline is computed from, so the promise only held for one attempt: every
+// 401-driven invalidation that met a still-unhealthy source doubled the wait
+// again, and after six rounds a key that should retry in a second was pinned
+// at the 30s cap. The rounds cost nothing to reach because Invalidate is what
+// admits each one — a backend rejecting credentials on every request drives
+// them at request rate.
+func TestInvalidateRestartsTheFailureBackoff(t *testing.T) {
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return nil, errors.New("controller down")
+	}}
+	c := Cached(inner, 0)
+
+	for range 6 {
+		_, err := c.Resolve(ctxT(t), "t", "u", "s")
+		require.Error(t, err)
+		c.Invalidate("t", "u", "s")
+	}
+	_, err := c.Resolve(ctxT(t), "t", "u", "s")
+	require.Error(t, err)
+
+	e := c.entry("t", "u", "s")
+	e.mu.Lock()
+	backoff := time.Until(e.retryAt)
+	e.mu.Unlock()
+	assert.InDelta(t, failBackoffBase, backoff, float64(500*time.Millisecond),
+		"an invalidated key must retry at the first backoff step, not wherever the old count had reached")
+}
+
 func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {
 	// A backend that rejects a credential the source keeps re-issuing (wrong
 	// audience, revoked upstream, clock skew) drives Invalidate on every
