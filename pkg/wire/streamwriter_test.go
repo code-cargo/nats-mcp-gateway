@@ -50,10 +50,14 @@ func (r *fakeRequest) Error(_, _ string, body []byte, opts ...micro.RespondOpt) 
 }
 
 func (r *fakeRequest) RespondJSON(any, ...micro.RespondOpt) error { return nil }
-func (r *fakeRequest) Data() []byte                               { return nil }
-func (r *fakeRequest) Headers() micro.Headers                     { return nil }
-func (r *fakeRequest) Subject() string                            { return "" }
-func (r *fakeRequest) Reply() string                              { return r.reply }
+
+func (r *fakeRequest) Data() []byte { return nil }
+
+func (r *fakeRequest) Headers() micro.Headers { return nil }
+
+func (r *fakeRequest) Subject() string { return "" }
+
+func (r *fakeRequest) Reply() string { return r.reply }
 
 // A notification frame must never land behind the terminal frame. The consumer
 // returns at the terminal and unsubscribes, so a msg frame published after it
