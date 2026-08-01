@@ -18,8 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"testing"
 	"time"
 
@@ -485,6 +488,75 @@ func TestWriteFailureDoesNotLeakPending(t *testing.T) {
 	err := c.Write(context.Background(), req)
 	require.Error(t, err, "the write must surface its failure")
 	assert.Empty(t, c.pending, "a request that never left must leave no bookkeeping")
+}
+
+// stubConn is an inner legacy connection whose reads the test feeds by hand.
+type stubConn struct {
+	reads chan *jsonrpc.Message
+}
+
+func (s *stubConn) Write(context.Context, *jsonrpc.Message) error { return nil }
+
+func (s *stubConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
+	select {
+	case m := <-s.reads:
+		return m, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *stubConn) Close() error { return nil }
+
+// A */list_changed must reach EVERY subscription that asked for it. It is the
+// only invalidation a 2025-11-25 server offers, so a subscriber that misses
+// one goes on serving its cached listing for the whole discovery TTL — five
+// minutes by default — with nothing to tell it or the client that the listing
+// is wrong.
+//
+// The fan-out queue holds 16 and Read is what drains it, but the fan-out runs
+// INSIDE Read: one list_changed with more than sixteen subscribers overflows
+// the queue in a single pass, and everything past the sixteenth was logged and
+// thrown away. Sixteen subscribers on one connection is an ordinary number —
+// backends are pooled per (server, tenant), so every client of a tenant using
+// a static-credential server shares one.
+func TestListChangedReachesEverySubscriber(t *testing.T) {
+	const subscribers = 40
+	stub := &stubConn{reads: make(chan *jsonrpc.Message, 1)}
+	c := &conn{
+		inner:      stub,
+		init:       &initResult{},
+		ttlMs:      300000,
+		cacheScope: mcpspec.CacheScopePrivate,
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		synth:      make(chan *jsonrpc.Message, 16),
+		listeners:  make(map[string]listenFilter),
+		pending:    make(map[string]string),
+	}
+	want := map[string]bool{}
+	for i := 0; i < subscribers; i++ {
+		key := strconv.Quote(fmt.Sprintf("sub-%d", i))
+		c.listeners[key] = listenFilter{Tools: true}
+		want[key] = true
+	}
+
+	stub.reads <- jsonrpc.NewNotification(mcpspec.NotifToolsListChanged, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got := map[string]bool{}
+	for len(got) < subscribers {
+		msg, err := c.Read(ctx)
+		require.NoError(t, err,
+			"only %d of %d subscribers received the invalidation", len(got), subscribers)
+		require.Equal(t, mcpspec.NotifToolsListChanged, msg.Method)
+		var p struct {
+			Meta map[string]json.RawMessage `json:"_meta"`
+		}
+		require.NoError(t, json.Unmarshal(msg.Params, &p))
+		got[string(p.Meta[mcpspec.MetaSubscriptionID])] = true
+	}
+	assert.Equal(t, want, got)
 }
 
 // failingConn is a backend.Conn whose writes always fail.

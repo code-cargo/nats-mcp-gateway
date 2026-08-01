@@ -162,10 +162,14 @@ type conn struct {
 	pending   map[string]string       // in-flight request id key -> method
 	readCh    chan readResult         // in-flight inner read, if any
 	closed    bool
-	// closures holds the graceful-closure responses Close queued, drained by
-	// Read ahead of the transport error.
-	closures []*jsonrpc.Message
-	deferErr error // transport error withheld until synth and closures drain
+	// queued holds synthesized messages that must not be dropped but did not
+	// fit in synth: graceful-closure responses from Close, and list_changed
+	// fan-out past synth's capacity. Read drains it before it will touch the
+	// inner connection again, which is also what bounds it — no further inner
+	// message, and so no further fan-out, is processed while anything is
+	// waiting here.
+	queued   []*jsonrpc.Message
+	deferErr error // transport error withheld until synth and queued drain
 }
 
 type readResult struct {
@@ -191,11 +195,11 @@ func (c *conn) Close() error {
 			if err != nil {
 				continue
 			}
-			// Queued on an unbounded slice, not into synth: synth holds 16 and
-			// may already carry fan-out notifications, so a non-blocking send
+			// Queued rather than sent into synth: synth holds 16 and may
+			// already carry fan-out notifications, so a non-blocking send
 			// would hand the abrupt disconnect this exists to prevent to every
 			// subscription past the sixteenth.
-			c.closures = append(c.closures, jsonrpc.NewResponse(json.RawMessage(key), result))
+			c.queued = append(c.queued, jsonrpc.NewResponse(json.RawMessage(key), result))
 		}
 		clear(c.listeners)
 	}
@@ -344,13 +348,13 @@ func (c *conn) Read(ctx context.Context) (*jsonrpc.Message, error) {
 		default:
 		}
 		c.mu.Lock()
-		if len(c.closures) > 0 {
-			m := c.closures[0]
-			c.closures = c.closures[1:]
+		if len(c.queued) > 0 {
+			m := c.queued[0]
+			c.queued = c.queued[1:]
 			c.mu.Unlock()
 			return m, nil
 		}
-		// A transport error withheld so that queued closures could drain
+		// A transport error withheld so that queued messages could drain
 		// surfaces here, once nothing synthesized is left.
 		deferred := c.deferErr
 		c.deferErr = nil
@@ -495,14 +499,14 @@ func (c *conn) innerReadOrSynth(ctx context.Context) (*jsonrpc.Message, error) {
 			// error until synth is empty — otherwise the very messages that
 			// mark a clean shutdown are the ones the shutdown discards.
 			c.mu.Lock()
-			pendingClosures := len(c.closures) > 0
+			pendingQueued := len(c.queued) > 0
 			c.mu.Unlock()
 			select {
 			case m := <-c.synth:
 				c.withholdErr(r.err)
 				return m, nil
 			default:
-				if pendingClosures {
+				if pendingQueued {
 					// Let Read loop round and hand them over first.
 					c.withholdErr(r.err)
 					return nil, nil
@@ -552,6 +556,21 @@ func (c *conn) translateNotification(msg *jsonrpc.Message) *jsonrpc.Message {
 	}
 	c.mu.Unlock()
 
+	// A */list_changed is the ONLY invalidation a 2025-11-25 server offers, so
+	// a subscriber that misses one serves its cached listing for the whole
+	// discovery TTL — five minutes by default — believing it is fresh. That
+	// makes dropping one on a full queue the wrong trade at any subscriber
+	// count, and sixteen subscribers on one connection is ordinary: backends
+	// are pooled per (server, tenant), so a tenant's clients share a
+	// connection and a single list_changed fans out to all of them at once.
+	//
+	// synth cannot simply be waited on, because Read is the only thing that
+	// drains it and the fan-out runs inside Read — a blocking send would
+	// deadlock the connection. What does not fit goes on the queue Read
+	// serves before it will read the inner connection again, which is also
+	// what bounds it: no further list_changed can be read while any of this
+	// one is still waiting, so the overflow never exceeds the subscriber count.
+	var overflow []*jsonrpc.Message
 	for _, id := range ids {
 		params := map[string]json.RawMessage{}
 		if len(msg.Params) > 0 {
@@ -565,11 +584,22 @@ func (c *conn) translateNotification(msg *jsonrpc.Message) *jsonrpc.Message {
 		metaRaw, _ := json.Marshal(meta)
 		params["_meta"] = metaRaw
 		paramsRaw, _ := json.Marshal(params)
+		out := jsonrpc.NewNotification(msg.Method, paramsRaw)
 		select {
-		case c.synth <- jsonrpc.NewNotification(msg.Method, paramsRaw):
+		case c.synth <- out:
 		default:
-			c.log.Warn("listen fan-out queue full, dropping notification", "method", msg.Method)
+			overflow = append(overflow, out)
 		}
+	}
+	if len(overflow) > 0 {
+		// Not a failure — nothing is lost — but it does say this connection
+		// carries more subscribers than synth holds, which is the condition
+		// that used to cost them their invalidations.
+		c.log.Debug("listen fan-out exceeded the synth buffer, queueing the remainder",
+			"method", msg.Method, "queued", len(overflow))
+		c.mu.Lock()
+		c.queued = append(c.queued, overflow...)
+		c.mu.Unlock()
 	}
 	return nil
 }
