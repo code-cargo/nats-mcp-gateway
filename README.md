@@ -253,6 +253,14 @@ credential from being quietly mangled on its way to a backend:
 > arguments meant for the backend's own shell (`--fmt=$HOME`), and eating
 > those would corrupt them just as silently in the other direction.
 
+A server's `url` and its `auth.tokenUrl` must be `https`, because both carry
+credentials — the injected `Authorization` header on every call, and the
+client secret / subject token / refresh token respectively. Loopback
+(`127.0.0.0/8`, `::1`, `localhost`) is exempt, so local MCP servers need no
+ceremony. Set `"allowPlaintext": true` on a server when something outside the
+gateway's view encrypts the hop — a service mesh sidecar, a tunnel — and it
+covers that one server's `url` and `tokenUrl` only.
+
 ### Caching hints
 
 2026-07-28 requires `ttlMs` and `cacheScope` on every cacheable result
