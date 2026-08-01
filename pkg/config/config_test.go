@@ -300,6 +300,34 @@ func TestClaimCheckValidation(t *testing.T) {
 	assert.Contains(t, err.Error(), "maxBytes")
 }
 
+// time.ParseDuration accepts "-30m", so a negative duration used to validate
+// clean and then disappear: every consumer of these fields reads <= 0 as
+// "unset" and substitutes its own default (pool 5m/1h, cred file 1m, claim
+// bucket 5m). The operator who wrote a leading "-" got the default and no
+// signal that their setting had been discarded. Zero stays legal — it IS the
+// documented "use the default" sentinel ("0 = pool default, 5m") — but a
+// negative one cannot be anything but a mistake.
+func TestNegativeDurationsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		doc     string
+		wantErr string
+	}{
+		{`{"pool":{"idleTtl":"-30m"},"servers":{}}`, "pool.idleTtl"},
+		{`{"pool":{"maxLifetime":"-1h"},"servers":{}}`, "pool.maxLifetime"},
+		{`{"claimCheck":{"maxAge":"-5m"},"servers":{}}`, "claimCheck.maxAge"},
+		{`{"servers":{"gh":{"command":"x","auth":{"mode":"file","path":"/c","ttl":"-10s"}}}}`, "auth ttl"},
+	} {
+		_, err := Parse([]byte(tc.doc))
+		require.Error(t, err, tc.doc)
+		assert.Contains(t, err.Error(), tc.wantErr)
+		assert.Contains(t, err.Error(), "negative", tc.doc)
+	}
+
+	// Zero and positive values are untouched.
+	_, err := Parse([]byte(`{"pool":{"idleTtl":"0s","maxLifetime":"24h"},"claimCheck":{"maxAge":"0"},"servers":{}}`))
+	require.NoError(t, err)
+}
+
 func TestCacheScopeValidation(t *testing.T) {
 	server := func(extra string) string {
 		return `{"servers":{"gh":{"transport":"stdio","command":"x"` + extra + `}}}`
