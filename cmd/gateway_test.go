@@ -830,6 +830,44 @@ func TestGatewayInlineConfigServesTenantScoped(t *testing.T) {
 	assert.Equal(t, wire.ErrCodeNoGateway, last.Err.Code)
 }
 
+// Release tags are "vX.Y.Z", and the leading v sent every one of them to the
+// 0.0.0 fallback — so `nats micro list` reported 0.0.0 for the whole fleet and
+// could not tell a rolled-out build from the one it replaced, which is most of
+// what that command is for during a rollout.
+func TestNormalizeVersionKeepsReleaseTags(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"v1.2.3", "1.2.3"},
+		{"v1.2.3-rc.1", "1.2.3-rc.1"},
+		{"1.2.3", "1.2.3"},
+		// No semver reading: the Makefile's default, and a build off an
+		// untagged tree.
+		{"develop", "0.0.0"},
+		{"dev", "0.0.0"},
+		{"", "0.0.0"},
+		{"v", "0.0.0"},
+	} {
+		assert.Equal(t, tc.want, normalizeVersion(tc.in), tc.in)
+	}
+}
+
+// ...and the output still has to satisfy micro, which rejects a non-semver
+// Version outright. That check is why normalizeVersion exists, so stripping
+// the "v" must not walk past it: a rejected version fails wire.Serve, which
+// fails the boot.
+func TestNormalizeVersionSatisfiesMicro(t *testing.T) {
+	nc, _ := fetchNATS(t)
+	for _, v := range []string{"v1.2.3", "v1.2.3-rc.1", "develop"} {
+		ws, err := wire.Serve(nc, wire.ServerConfig{
+			Version: normalizeVersion(v),
+			Servers: []string{"a"},
+		}, nil)
+		require.NoError(t, err, v)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		require.NoError(t, ws.Shutdown(ctx))
+		cancel()
+	}
+}
+
 func waitServing(t *testing.T, a *assembled, serverName string) {
 	t.Helper()
 	require.Eventually(t, func() bool {

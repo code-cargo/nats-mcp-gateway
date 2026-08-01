@@ -22,6 +22,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -719,9 +720,19 @@ func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	})
 }
 
-// normalizeVersion maps build versions like "dev" onto a semver micro will
-// accept.
+// normalizeVersion maps a build version onto a semver micro will accept —
+// micro rejects a service whose Version is not semver, and that rejection
+// fails wire.Serve and with it the boot.
+//
+// Release tags are "vX.Y.Z" and the leading "v" is not part of semver, so it
+// is stripped rather than sent to the fallback: mapping every release to 0.0.0
+// left `nats micro list` reporting one version for the entire fleet, unable to
+// show which instances had taken a rollout. Anything with no semver reading —
+// the Makefile's "develop", a build off an untagged tree — still becomes
+// 0.0.0, since a boot failure would be a worse answer than an unhelpful
+// version.
 func normalizeVersion(v string) string {
+	v = strings.TrimPrefix(v, "v")
 	if len(v) > 0 && v[0] >= '0' && v[0] <= '9' {
 		return v
 	}
