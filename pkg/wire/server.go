@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -292,6 +294,34 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 	}
 	go func() {
 		defer s.wg.Done()
+
+		// Everything this gateway publishes for a request goes to the
+		// reply-to the CALLER chose, under the GATEWAY's identity. NATS
+		// permission-checks the subject a client publishes to; it does not
+		// check the reply-to, which is checked against whoever answers. So a
+		// caller holding one narrow publish grant can name any subject the
+		// gateway may reach and have the gateway write there on its behalf.
+		//
+		// The $ namespace is what makes that an escalation rather than a
+		// nuisance: with claim-check on, the gateway's identity carries
+		// JetStream rights, $JS.API.STREAM.DELETE.<stream> takes no request
+		// body, and the keepalive is an empty-bodied frame emitted unprompted.
+		// The two compose into another tenant's claim bucket being deleted by
+		// a caller who cannot publish to that subject themselves.
+		//
+		// No client reply inbox begins with $ — the namespace is reserved for
+		// the server's own APIs — so refusing it costs nothing and closes that
+		// whole class. It does not close a reply-to aimed at another CLIENT's
+		// inbox; only per-user inbox prefixes do, which is a deployment
+		// control the README now spells out.
+		if reply := req.Reply(); reply == "" || strings.HasPrefix(reply, "$") {
+			// slog.Default rather than a configured logger: wire.Server has
+			// none, and a security refusal that leaves no trace is worse than
+			// one logged somewhere an operator has to go looking for.
+			slog.Default().Warn("refusing a request whose reply subject is not a client inbox",
+				"subject", req.Subject(), "reply", reply)
+			return
+		}
 
 		w := &streamWriter{nc: s.nc, req: req}
 

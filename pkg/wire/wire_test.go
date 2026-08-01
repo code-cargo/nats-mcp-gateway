@@ -644,3 +644,63 @@ func TestNewClientRejectsAnUnusableSubjectPrefix(t *testing.T) {
 		require.NotNil(t, c)
 	}
 }
+
+// TestReplyToASystemSubjectIsRefused closes a confused deputy.
+//
+// NATS permission-checks the subject a client publishes TO. It does not check
+// the reply-to — that is checked against whoever answers, which is the
+// gateway. So every frame the gateway emits for a request goes to a subject
+// the CALLER chose, under the GATEWAY's identity.
+//
+// With claim-check on, that identity carries JetStream rights. $JS.API.STREAM.
+// DELETE.<stream> takes no request body, and the keepalive is an empty-bodied
+// frame the wire emits unprompted — so a caller holding one narrow publish
+// grant could have the gateway delete another tenant's claim bucket, on a
+// subject the caller is themselves refused.
+//
+// No client inbox begins with $; that namespace is the server's own APIs.
+func TestReplyToASystemSubjectIsRefused(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	for _, reply := range []string{
+		"$JS.API.STREAM.DELETE.OBJ_MCP_CLAIMS_victim",
+		"$JS.API.STREAM.PURGE.OBJ_MCP_CLAIMS_victim",
+		"$SYS.REQ.SERVER.PING",
+	} {
+		watch, err := nc.SubscribeSync(reply)
+		require.NoError(t, err)
+		require.NoError(t, nc.PublishMsg(&nats.Msg{
+			Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+			Reply:   reply,
+			Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+			Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+		}))
+		require.NoError(t, nc.Flush())
+
+		// Long enough for a keepalive to have fired had the request been served.
+		_, err = watch.NextMsg(300 * time.Millisecond)
+		assert.ErrorIs(t, err, nats.ErrTimeout,
+			"the gateway published to %q on a caller's say-so", reply)
+		_ = watch.Unsubscribe()
+	}
+
+	// An ordinary inbox reply still works, or the guard has eaten the wire.
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Contains(t, string(resp.Data), `"result"`)
+}
