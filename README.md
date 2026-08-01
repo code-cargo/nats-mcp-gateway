@@ -352,8 +352,11 @@ Adding a credential source has the same three tiers as config reloading
 
 1. **Use a built-in** — the modes above, RFC 8693 included.
 2. **Wrap a script with `exec`** — the helper runs with a scrubbed
-   environment plus `NATSMCP_CRED_{TENANT,USER,SERVER}` and prints
-   `{"headers"|"env": {...}, "expiresAt": "RFC3339"}`. Any credential system
+   environment (`PATH`, `auth.env`, and a private empty `HOME` discarded when
+   the run ends) plus `NATSMCP_CRED_{TENANT,USER,SERVER}`, and prints
+   `{"headers"|"env": {...}, "expiresAt": "RFC3339"}`. A helper needing a
+   populated home — an `aws` or `gcloud` wrapper reading its own config —
+   names `HOME` in `auth.env`, which overrides it. Any credential system
    integrates in ~20 lines; e.g. AWS STS with no SDK in the gateway:
    ```sh
    #!/bin/sh

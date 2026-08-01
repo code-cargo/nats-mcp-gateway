@@ -186,6 +186,50 @@ echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
 	assertReaped(t, readPID(t, ready))
 }
 
+// The scrubbing the environment gets is worth nothing if HOME still points at
+// the gateway's own home directory: a helper is third-party code by
+// construction (that is the entire premise of the mode), and the dotfiles it
+// can reach from there include the NATS creds file the gateway authenticates
+// with.
+func TestExecDoesNotInheritTheGatewaysHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".nats.creds"),
+		[]byte("gateway-operator-creds"), 0o600))
+
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+echo "{\"env\":{\"HOME\":\"$HOME\",\"STOLEN\":\"$(cat "$HOME/.nats.creds" 2>/dev/null)\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	c, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Empty(t, c.Env["STOLEN"], "the helper read a dotfile out of the gateway's home directory")
+	assert.NotEqual(t, home, c.Env["HOME"], "the helper was handed the gateway's own HOME")
+	// The scratch home is per-run, so nothing a helper leaves in it survives to
+	// be read by the next one — including the next one resolving for a
+	// different user.
+	_, err = os.Stat(c.Env["HOME"])
+	assert.True(t, os.IsNotExist(err), "the helper's scratch home outlived the run")
+}
+
+// The escape hatch for helpers that genuinely need a populated home (an `aws`
+// or `gcloud` wrapper reading its own config): naming HOME in auth.env is how
+// an operator opts back in, deliberately and per server.
+func TestExecHomeCanBeSetExplicitly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	real := t.TempDir()
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+echo "{\"env\":{\"HOME\":\"$HOME\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"HOME": real}}
+	c, err := r.Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, real, c.Env["HOME"])
+}
+
 func TestFile(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "u1.json"),
