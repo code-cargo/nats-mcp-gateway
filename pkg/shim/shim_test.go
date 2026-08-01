@@ -237,6 +237,32 @@ func TestFinishedRequestDoesNotUnregisterItsDuplicate(t *testing.T) {
 		"the finished request's cleanup unregistered the still-running one, which can no longer be cancelled")
 }
 
+// A null request id identifies nothing. Every response to it comes back as
+// "id":null, so the client cannot tell which request was answered — and the
+// shim's stream map, keyed by id, files every such request under one key, so a
+// notifications/cancelled for one cancels whichever happens to be registered.
+// Answering the request is what makes that visible to the client instead of
+// letting it lose a request to a collision.
+func TestNullRequestIDIsRefused(t *testing.T) {
+	h := newHarness(t, true)
+	h.send(t, `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`)
+	h.send(t, `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"wedge"}}`)
+
+	for i := 0; i < 2; i++ {
+		line := h.next(t, 10*time.Second)
+		m, err := jsonrpc.Decode([]byte(line))
+		require.NoError(t, err)
+		assert.JSONEq(t, `null`, string(m.ID), "the refusal echoes the null id, as JSON-RPC requires")
+		require.NotNil(t, m.Error, "a null-id request must be refused, not served: %s", line)
+		assert.Equal(t, jsonrpc.CodeInvalidRequest, m.Error.Code)
+	}
+
+	h.shim.streamMu.Lock()
+	defer h.shim.streamMu.Unlock()
+	assert.NotContains(t, h.shim.streams, "null",
+		"no null-id request may reach the stream map, where they all share one key")
+}
+
 func TestShimNoGatewayYieldsLegibleError(t *testing.T) {
 	h := newHarness(t, false) // no gateway serving "fake"
 	h.send(t, req("7", "tools/list", ""))

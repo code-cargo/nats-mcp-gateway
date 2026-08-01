@@ -171,7 +171,23 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+// nullID is the one id that identifies nothing.
+var nullID = []byte("null")
+
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
+	// Every response to a null-id request comes back as "id":null, so the
+	// client cannot tell which of its requests was answered — and the stream
+	// map is keyed by id, so two of them share one entry and a
+	// notifications/cancelled for one cancels whichever is registered. JSON-RPC
+	// 2.0 discourages null request ids for exactly this reason. Refusing is
+	// what makes the problem visible to the client; serving it loses a request
+	// to a collision instead.
+	if bytes.Equal(bytes.TrimSpace(msg.ID), nullID) {
+		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest,
+			"null is not a usable request id: responses could not be matched back to requests")
+		return
+	}
+
 	// Legacy wing: an initialize flips the shim into legacy mode; thereafter
 	// ping and logging/setLevel are answered locally. A REPEAT initialize is
 	// answered the same way rather than forwarded — there is no initialize on
