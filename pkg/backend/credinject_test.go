@@ -38,6 +38,57 @@ type expiringFake struct {
 
 func (b *expiringFake) CredExpiresAt() time.Time { return b.expiresAt }
 
+// The pool licenses an in-flight call to overrun its credentials' expiry —
+// the reaper only takes idle entries, so a long stream pins its backend. It
+// licenses nothing about STARTING one. A Get that sampled the entry while it
+// was live and then parked on a full semaphore must re-check before it
+// dispatches, or the wait itself becomes the way a new call runs on a backend
+// whose credentials the gateway has already decided to stop using.
+func TestGetDoesNotStartACallOnAPastDeadlineEntry(t *testing.T) {
+	expiry := time.Now().Add(credExpirySkew + 150*time.Millisecond)
+	p := NewPool(PoolConfig{MaxConcurrent: 1}, func(Key) (Backend, error) {
+		return &expiringFake{Backend: fakeBackend(nil), expiresAt: expiry}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+
+	oldMux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+
+	type queued struct {
+		mux     *Mux
+		release func()
+		err     error
+	}
+	waited := make(chan queued, 1)
+	go func() {
+		mux, rel, err := p.Get(context.Background(), key)
+		waited <- queued{mux, rel, err}
+	}()
+
+	// Only once it is genuinely parked on the semaphore does the deadline
+	// passing underneath it mean anything.
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		e := p.entries[key]
+		return e != nil && e.waiters == 1
+	}, 5*time.Second, time.Millisecond, "the second Get never reached the semaphore")
+
+	time.Sleep(250 * time.Millisecond) // the deadline passes while it waits
+	release()
+
+	select {
+	case got := <-waited:
+		require.NoError(t, got.err)
+		defer got.release()
+		assert.NotSame(t, oldMux, got.mux,
+			"a call admitted after the deadline must run on a replacement backend")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the queued Get never returned")
+	}
+}
+
 func TestPoolRecyclesAtCredentialExpiry(t *testing.T) {
 	// Deadline = expiry - credExpirySkew = ~150ms from now. The reaper ticks
 	// every 30s, so a replacement inside the test window proves the

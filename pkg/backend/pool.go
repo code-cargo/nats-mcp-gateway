@@ -16,6 +16,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -160,9 +161,33 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 	return p
 }
 
+// errEntryRetired means the entry a Get had settled on stopped being the one
+// to use while that Get was queued for a call slot. Internal to Get's retry;
+// it never reaches a caller.
+var errEntryRetired = errors.New("backend: pooled entry retired while queued")
+
+// getMaxAttempts bounds that retry. Each attempt spawns at most one backend,
+// so a pathological case — credentials already expired the moment they are
+// resolved — must not become a spawn-and-discard loop; the caller is told to
+// re-issue instead.
+const getMaxAttempts = 3
+
 // Get returns the live Mux for the key, creating it if needed, and reserves
 // one concurrency slot. The caller MUST call release when its call finishes.
 func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
+	for range getMaxAttempts {
+		mux, release, err := p.get(ctx, key)
+		if !errors.Is(err, errEntryRetired) {
+			return mux, release, err
+		}
+	}
+	return nil, nil, fmt.Errorf("backend: %s/%s could not be given a live backend to run on, re-issue the request",
+		key.Tenant, key.Server)
+}
+
+// get is one attempt at Get, reporting errEntryRetired when the caller should
+// start over.
+func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 	var superseded []*Mux
 	p.mu.Lock()
 	e := p.entries[key]
@@ -270,6 +295,16 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	}
 	p.mu.Lock()
 	e.waiters--
+	// The entry was sampled before the wait, and the wait is unbounded: a full
+	// semaphore holds a Get until other calls finish. Everything checked at
+	// lookup has to be checked again here, or waiting becomes the way a NEW
+	// call starts on a backend past its credential deadline — or on one
+	// EvictServer replaced, or one that died meanwhile.
+	if p.entries[key] != e || e.mux.Dead() || time.Now().After(e.deadline) {
+		p.mu.Unlock()
+		<-sem // hand the slot to whoever is behind us; we are not using it
+		return nil, nil, errEntryRetired
+	}
 	e.inflight++
 	p.mu.Unlock()
 
