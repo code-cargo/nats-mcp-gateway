@@ -81,16 +81,20 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 		// pgid, which on this host is as likely as not another backend's
 		// subprocess tree.
 		//
-		// ErrProcessDone here means the helper finished a hair before the
-		// deadline, which os/exec reads as "nothing was interrupted" — the
-		// answer that keeps such a helper from being reported as cancelled.
-		if err := cmd.Process.Kill(); err != nil {
+		// Signal 0 asks os.Process whether the pid is still ours without
+		// spending the kill on the leader alone. ErrProcessDone means the
+		// helper finished a hair before the deadline, which os/exec reads as
+		// "nothing was interrupted" — the answer that keeps such a helper from
+		// being reported as cancelled.
+		if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
 			return err
 		}
-		// The leader answered to a signal a moment ago, so its pid is still
-		// ours and so is the group named by it. Anything it forked is what
-		// this reaches; anything that outlives the group is what WaitDelay
-		// below bounds.
+		// One signal to the whole group, leader included. Killing the leader
+		// first and the group second would be the same two signals in the
+		// order that loses them: os/exec is free to reap the leader in
+		// between, and the group kill then names a pid the kernel has
+		// released, so the child this exists to reach survives to the grace
+		// period.
 		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil &&
 			!errors.Is(err, syscall.ESRCH) {
 			return err

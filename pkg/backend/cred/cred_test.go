@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,7 +35,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
-	"syscall"
 )
 
 func ctxT(t *testing.T) context.Context {
