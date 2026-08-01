@@ -54,6 +54,7 @@ type harness struct {
 	stdin  io.WriteCloser
 	lines  chan string
 	runErr chan error
+	shim   *Shim
 }
 
 func newHarness(t *testing.T, withGateway bool) *harness {
@@ -87,7 +88,7 @@ func newHarness(t *testing.T, withGateway bool) *harness {
 	stdoutR, stdoutW := io.Pipe()
 	s := New(wc, Config{Server: "fake"})
 
-	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1)}
+	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1), shim: s}
 	go func() { h.runErr <- s.Run(context.Background(), stdinR, stdoutW) }()
 	go func() {
 		sc := bufio.NewScanner(stdoutR)
@@ -200,6 +201,40 @@ func TestShimCancelSuppressesResponse(t *testing.T) {
 	m, err := jsonrpc.Decode([]byte(line))
 	require.NoError(t, err)
 	assert.JSONEq(t, `"6"`, string(m.ID))
+}
+
+// Two requests sharing an id, the first finishing while the second is still
+// in flight. The stream map is keyed by id, so the second registration
+// replaces the first — and the first's cleanup then deleted the key regardless
+// of whose stream was behind it. The live request loses its only route back:
+// notifications/cancelled for it finds nothing and is dropped, so the client
+// can no longer cancel a request it can still see running.
+func TestFinishedRequestDoesNotUnregisterItsDuplicate(t *testing.T) {
+	h := newHarness(t, true)
+	const id = `"dup"`
+	// Both registrations happen on the Run loop in line order, so the wedge is
+	// unambiguously the one left in the map.
+	h.send(t, req("dup", "tools/list", ""))
+	h.send(t, req("dup", "tools/call", `"name":"wedge"`))
+
+	// The tools/list answer is the only line either request produces: wedge
+	// never responds. Seeing it means that request's pump has delivered its
+	// terminal frame and is running its cleanup.
+	line := h.next(t, 10*time.Second)
+	m, err := jsonrpc.Decode([]byte(line))
+	require.NoError(t, err)
+	require.JSONEq(t, id, string(m.ID))
+	require.Contains(t, string(m.Result), `"echo"`, "the finished request is the tools/list")
+
+	// The cleanup runs immediately behind that write; this only has to outlast
+	// the goroutine unwinding, not any I/O.
+	time.Sleep(200 * time.Millisecond)
+
+	h.shim.streamMu.Lock()
+	_, live := h.shim.streams[id]
+	h.shim.streamMu.Unlock()
+	assert.True(t, live,
+		"the finished request's cleanup unregistered the still-running one, which can no longer be cancelled")
 }
 
 func TestShimNoGatewayYieldsLegibleError(t *testing.T) {

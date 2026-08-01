@@ -252,7 +252,14 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 		defer s.wg.Done()
 		defer func() {
 			s.streamMu.Lock()
-			delete(s.streams, idKey)
+			// Only if this stream is still the one registered. A client that
+			// reuses an id while the first request is in flight replaces the
+			// entry, and an unconditional delete would then retire the LIVE
+			// request's route on the dead one's way out — leaving a request the
+			// client can still see running but can no longer cancel.
+			if s.streams[idKey] == stream {
+				delete(s.streams, idKey)
+			}
 			s.streamMu.Unlock()
 		}()
 		for f := range stream.C {
