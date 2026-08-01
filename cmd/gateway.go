@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -498,8 +499,8 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		hb := &backend.HTTPBackend{URL: s.URL, Headers: s.Headers, Legacy: !modern, Logger: blog}
 		if resolver != nil {
 			hb.TokenSource = &credTokenSource{
-				resolver: resolver,
-				tenant:   key.Tenant, user: credUser, server: key.Server,
+				resolver: resolver, log: blog,
+				tenant: key.Tenant, user: credUser, server: key.Server,
 			}
 		}
 		inner = hb
@@ -550,13 +551,26 @@ func (b *expiringBackend) CredExpiresAt() time.Time { return b.expiresAt }
 // bearer and a 401 forces a refetch.
 type credTokenSource struct {
 	resolver             *cred.CachedResolver
+	log                  *slog.Logger
 	tenant, user, server string
 }
 
 func (t *credTokenSource) Headers(ctx context.Context) (map[string]string, error) {
 	c, _, err := t.resolver.ResolveGen(ctx, t.tenant, t.user, t.server)
 	if err != nil {
-		return nil, err
+		// The third resolve site, and the only one on the REQUEST path: an
+		// HTTP backend answering 401 makes doWithAuthRetry invalidate and
+		// resolve again, so this runs exactly when the credential source is
+		// most likely to be failing and most likely to say why. What it says
+		// travels — newRequest wraps it, roundTripOnce turns it into a -32603,
+		// and the proxy forwards a backend's JSON-RPC error verbatim by
+		// design. The same suppression the other two sites apply is owed here,
+		// or the helper's stderr reaches the tenant user through the one path
+		// that runs on every request.
+		ref := cred.FailureRef()
+		t.log.Warn("credential resolution failed for a backend request",
+			"err", err, "ref", ref, "server", t.server)
+		return nil, errors.New(cred.CallerMessage(err, ref))
 	}
 	return c.Headers, nil
 }

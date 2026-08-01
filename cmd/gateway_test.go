@@ -969,3 +969,36 @@ func TestCredRegistryLookupCannotResurrectPrunedServer(t *testing.T) {
 	assert.False(t, perUser)
 	assert.Empty(t, r.entries)
 }
+
+// TestTokenSourceDoesNotEchoTheResolverDetail covers the third resolve site,
+// and the only one on the request path.
+//
+// The proxy's resolve and the pool factory's both suppress the resolver's own
+// error text. credTokenSource did not — and an HTTP backend answering 401
+// makes doWithAuthRetry invalidate and resolve AGAIN, so this path runs at
+// exactly the moment the credential source is failing and saying why. From
+// there the text is wrapped by newRequest, turned into a -32603 by
+// roundTripOnce, and forwarded to the caller verbatim, because forwarding a
+// backend's JSON-RPC error unchanged is what the proxy is for.
+func TestTokenSourceDoesNotEchoTheResolverDetail(t *testing.T) {
+	const secret = "sts assume-role arn:aws:iam::918273:role/prod failed reading " +
+		"/var/run/secrets/acme/u1.jwt (token AKIAWOULDBEBAD)"
+
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755))
+
+	resolver := cred.Cached(&cred.Exec{Command: helper, Timeout: 10 * time.Second}, 0)
+	ts := &credTokenSource{
+		resolver: resolver, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tenant: "acme", user: "u1", server: "aws",
+	}
+
+	_, err := ts.Headers(context.Background())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD", "the helper's stderr reached the caller")
+	assert.NotContains(t, err.Error(), "/var/run/secrets", "a pod path reached the caller")
+	assert.NotContains(t, err.Error(), "arn:aws:iam", "an internal identity reached the caller")
+	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
+}
