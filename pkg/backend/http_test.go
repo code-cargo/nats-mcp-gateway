@@ -456,7 +456,8 @@ func TestOnePageOfAListingCannotSettleTheWholeToolset(t *testing.T) {
 			if r.Header.Get("Mcp-Param-Region") != region {
 				w.WriteHeader(http.StatusBadRequest)
 				resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
-					msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil))
+					msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil,
+				))
 				_, _ = w.Write(resp)
 				return
 			}
