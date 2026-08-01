@@ -16,11 +16,14 @@ package shim
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,6 +220,76 @@ func TestShimCrashYieldsStreamLost(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m.Error)
 	assert.Equal(t, wire.ErrCodeStreamLost, m.Error.Code)
+}
+
+// One client line past the cap must cost that line and nothing else. Read
+// through bufio.Scanner it cost the session: ErrTooLong ends the scan, Run
+// returns, and every concurrent request is abandoned with no error frame while
+// the MCP client watches its server process exit.
+func TestShimOversizeClientLineDoesNotEndTheSession(t *testing.T) {
+	h := newHarness(t, true)
+
+	// Written from its own goroutine: a shim that stops reading part-way
+	// through the line would otherwise wedge the test on the pipe rather than
+	// fail it.
+	go func() {
+		_, _ = h.stdin.Write(append(bytes.Repeat([]byte("x"), maxLineBytes+1), '\n'))
+		_, _ = h.stdin.Write([]byte(req("1", "tools/list", "") + "\n"))
+	}()
+
+	select {
+	case err := <-h.runErr:
+		t.Fatalf("the shim exited over one oversize line: %v", err)
+	case line, ok := <-h.lines:
+		require.True(t, ok, "shim stdout closed")
+		m, err := jsonrpc.Decode([]byte(line))
+		require.NoError(t, err)
+		require.Nil(t, m.Error, "the request behind the oversize line must be served normally: %s", line)
+		assert.JSONEq(t, `"1"`, string(m.ID))
+	case <-time.After(20 * time.Second):
+		t.Fatal("the shim stopped reading after the oversize line")
+	}
+}
+
+// The line reader is hand-rolled, so its edges are pinned here: the cap counts
+// the line and not its terminator, an oversize line costs only itself, and a
+// stream that ends mid-line still ends the loop.
+func TestReadLineSkipsOnlyTheOversizeLine(t *testing.T) {
+	const max = 8
+	read := func(in string) (lines []string, drops int, err error) {
+		r := bufio.NewReaderSize(strings.NewReader(in), 16)
+		for {
+			line, rerr := readLine(r, max)
+			if errors.Is(rerr, errLineTooLong) {
+				drops++
+				continue
+			}
+			if len(line) > 0 {
+				lines = append(lines, string(line))
+			}
+			if rerr != nil {
+				return lines, drops, rerr
+			}
+		}
+	}
+
+	lines, drops, err := read("a\n" + strings.Repeat("x", max+1) + "\nb\n")
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{"a", "b"}, lines, "the lines around an oversize one are untouched")
+	assert.Equal(t, 1, drops)
+
+	lines, drops, err = read(strings.Repeat("y", max) + "\ntrailing")
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{strings.Repeat("y", max), "trailing"}, lines,
+		"a line exactly at the cap is kept, and so is an unterminated last line")
+	assert.Zero(t, drops)
+
+	// A stream cut off mid-oversize-line must report the drop and then stop,
+	// not spin on a reader that will never produce a newline.
+	lines, drops, err = read("a\n" + strings.Repeat("z", max+1))
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{"a"}, lines)
+	assert.Equal(t, 1, drops)
 }
 
 func TestShimInjectsMissingProtocolVersion(t *testing.T) {
