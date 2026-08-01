@@ -172,7 +172,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}
 	nc, err := nats.Connect(boot.url, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", boot.url, err)
+		return fmt.Errorf("connect NATS %s: %w", redactNATSURL(boot.url), err)
 	}
 	defer nc.Close()
 
@@ -297,7 +297,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		}
 	}()
 
-	log.Info("gateway starting", "nats", boot.url, "source", kind.describe(c))
+	log.Info("gateway starting", "nats", redactNATSURL(boot.url), "source", kind.describe(c))
 
 	// Run the config loop. It returns when ctx is cancelled (signal) or on a
 	// fatal initial-config error.

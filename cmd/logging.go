@@ -21,6 +21,49 @@ import (
 	"strings"
 )
 
+// redacted replaces a credential in a logged URL. Spelled the way
+// net/url.URL.Redacted spells it, so it reads as a redaction and not as
+// somebody's actual password.
+const redacted = "xxxxx"
+
+// redactNATSURL strips credentials from a NATS URL (or comma-separated
+// cluster list, which is how nats.go takes one) for logging. A URL with no
+// credential comes back byte-for-byte, so the ordinary case still logs what
+// the operator configured.
+//
+// This is deliberately textual rather than a net/url round trip. A password
+// containing an unescaped "@" or a space fails net/url parsing, and a
+// parse-based redactor has nothing to return but the raw string at exactly
+// the moment it is holding a credential. Scanning for the last "@" ahead of
+// the host cannot fail: neither a scheme nor a host may contain one.
+func redactNATSURL(raw string) string {
+	urls := strings.Split(raw, ",")
+	for i, u := range urls {
+		scheme := ""
+		if n := strings.Index(u, "://"); n >= 0 {
+			// nats.go supplies "nats://" when the scheme is absent, so a
+			// scheme-less URL carries userinfo just the same.
+			scheme, u = u[:n+3], u[n+3:]
+		}
+		at := strings.LastIndex(u, "@")
+		if at < 0 {
+			continue
+		}
+		userinfo, host := u[:at], u[at+1:]
+		if user, _, ok := strings.Cut(userinfo, ":"); ok {
+			// user:password. The username stays: "connecting as the wrong
+			// identity" is a diagnosis a log line can deliver, and the
+			// password is never part of one.
+			urls[i] = scheme + user + ":" + redacted + "@" + host
+			continue
+		}
+		// No password at all means nats.go reads the whole userinfo as an
+		// auth token, so here the username is the secret.
+		urls[i] = scheme + redacted + "@" + host
+	}
+	return strings.Join(urls, ",")
+}
+
 // NewLogger builds the process logger. It always writes to stderr: in the
 // shim, stdout is the MCP stdio pipe and a single stray log line there
 // corrupts the protocol stream.

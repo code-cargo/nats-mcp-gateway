@@ -23,6 +23,47 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// The README's own canonical config is "nats://gw:pw@nats:4222", so the
+// deployment shape this gateway ships with puts a password in the one string
+// the boot line and the connect error both print. Anywhere those land — a pod
+// log, a crash-loop event, a support paste — the credential lands too.
+func TestRedactNATSURL(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want string
+	}{
+		// The README's canonical config. The username survives: "wrong
+		// identity" is a real diagnosis, "wrong password" is not one the log
+		// can help with.
+		{"nats://gw:s3cr3t@nats:4222", "nats://gw:xxxxx@nats:4222"},
+		// nats.go reads a passwordless userinfo as an auth token, so here the
+		// username IS the credential and nothing survives.
+		{"nats://s3cr3t@nats:4222", "nats://xxxxx@nats:4222"},
+		// No credential, nothing to hide: these must log exactly as written,
+		// including the flag's own default.
+		{"nats://nats:4222", "nats://nats:4222"},
+		{"nats://127.0.0.1:4222", "nats://127.0.0.1:4222"},
+		{"", ""},
+		// nats.go supplies the scheme when it is missing, so the scheme-less
+		// form carries credentials just as well.
+		{"gw:s3cr3t@nats:4222", "gw:xxxxx@nats:4222"},
+		// A cluster is one comma-separated string to nats.go, and every member
+		// of it usually carries the same credential.
+		{
+			"nats://gw:s3cr3t@a:4222,nats://gw:s3cr3t@b:4222,nats://c:4222",
+			"nats://gw:xxxxx@a:4222,nats://gw:xxxxx@b:4222,nats://c:4222",
+		},
+		// An unescaped "@" in the password makes this unparseable as a URL,
+		// which is exactly when a redactor that leaned on net/url would give
+		// up and pass the secret through.
+		{"tls://gw:s3c@r3t@nats:4222", "tls://gw:xxxxx@nats:4222"},
+	} {
+		got := redactNATSURL(tc.raw)
+		assert.Equal(t, tc.want, got, tc.raw)
+		assert.NotContains(t, got, "s3cr3t", tc.raw)
+	}
+}
+
 // An unrecognized level used to round down to info and an unrecognized format
 // to text, so "--log-level=verbose" produced exactly the output the operator
 // already had. That is the worst moment to swallow a flag: the reason to touch

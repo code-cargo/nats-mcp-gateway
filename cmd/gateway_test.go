@@ -490,6 +490,22 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 	assert.Empty(t, boot.inboxPrefix)
 }
 
+// The connect failure is the likeliest place a NATS URL is ever read by a
+// human, and until it was redacted it was also the likeliest place the
+// password leaked: a gateway that cannot reach NATS crash-loops, so the error
+// lands in a pod's event stream and in whatever the operator pastes into a
+// ticket.
+func TestConnectErrorRedactsPassword(t *testing.T) {
+	err := runGateway(
+		&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: "nats://gw:s3cr3t@127.0.0.1:14222"},
+		&Globals{LogLevel: "error"}, "0.0.0",
+	)
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "s3cr3t")
+	assert.Contains(t, err.Error(), "nats://gw:xxxxx@127.0.0.1:14222",
+		"the host and identity must survive: they are what the operator needs")
+}
+
 // The wire prefix and queue group get the same boot check as the inbox prefix,
 // and for a sharper reason: nothing downstream rejects a wildcard prefix.
 // "mcp.*" binds the endpoint subject "mcp.*.req.*.*.{server}.>" — micro accepts

@@ -47,7 +47,7 @@ func runShim(c *ShimCmd, g *Globals) error {
 	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
+		return fmt.Errorf("connect NATS %s: %w", redactNATSURL(c.NatsURL), err)
 	}
 	defer nc.Close()
 
@@ -69,6 +69,6 @@ func runShim(c *ShimCmd, g *Globals) error {
 	}
 
 	s := shim.New(wc, shim.Config{Server: c.Server, Logger: log})
-	log.Info("shim running", "server", c.Server, "tenant", c.Tenant, "nats", c.NatsURL)
+	log.Info("shim running", "server", c.Server, "tenant", c.Tenant, "nats", redactNATSURL(c.NatsURL))
 	return s.Run(context.Background(), os.Stdin, os.Stdout)
 }
