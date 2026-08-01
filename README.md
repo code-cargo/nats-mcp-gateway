@@ -122,6 +122,20 @@ publish: [
 subscribe: ["_INBOX.>"]
 ```
 
+`_INBOX.>` is written here for brevity and is **account-wide in both
+directions**: it lets a caller subscribe to every other caller's reply inbox,
+and publish to one. Under it a co-tenant reads other users' tool results and
+resource contents, and can publish to the `{reply}.ctl` subject a request
+listens on. The gateway refuses a control message that is not a
+`notifications/cancelled` naming that request, which stops a stray or
+misrouted publish from ending a live call — but it cannot stop a caller who
+can already read the reply stream from reproducing the id.
+
+Per-user inbox prefixes are what isolate clients from one another. The
+auth-callout recipe below mints `_INBOX_{tenant}_{user}.>`, which closes both
+directions at the NATS layer, and is the same reasoning the gateway applies to
+its own identity with `--inbox-prefix`.
+
 Two things make that real:
 
 1. **The integrity check** (`pkg/proxy/integrity.go`): the gateway proves the

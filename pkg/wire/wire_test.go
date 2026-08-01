@@ -1027,3 +1027,24 @@ func TestCancellationSurvivesADifferentEncoder(t *testing.T) {
 	assert.False(t, isCancellation(cancelBody("1"), []byte(`1`)),
 		"a string id and a number id are different ids")
 }
+
+// TestOnlyStringsAndNumbersCanNameARequest pins decodeID's contract against
+// the shortcut that used to run ahead of it.
+//
+// JSON-RPC 2.0 allows only a string or a number as an id, and a byte-equality
+// fast path answered before that check could refuse anything else. `null` is
+// the one that matters: jsonrpc.HasID counts a literal null as present, so
+// {"id":null,"method":…} really is a request on the wire, and null is the one
+// id nobody has to guess.
+func TestOnlyStringsAndNumbersCanNameARequest(t *testing.T) {
+	for _, id := range []string{`null`, `true`, `false`, `{"a":1}`, `[1]`, `[]`, `{}`} {
+		assert.False(t, sameRequestID([]byte(id), []byte(id)),
+			"%s is not an id and must not name a request, even against itself", id)
+	}
+	for _, id := range []string{`"a"`, `"a<b"`, `1`, `-2`, `1.5`, `"1"`} {
+		assert.True(t, sameRequestID([]byte(id), []byte(id)), "%s is a legitimate id", id)
+	}
+	// Distinctness survives the change.
+	assert.False(t, sameRequestID([]byte(`"1"`), []byte(`1`)))
+	assert.False(t, sameRequestID([]byte(`1`), []byte(`1.0`)))
+}

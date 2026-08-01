@@ -465,9 +465,12 @@ func isCancellation(data, id []byte) bool {
 // expects, since json.Number keeps the literal and two spellings of one number
 // are not the same id under JSON-RPC's "the client chose this string" rule.
 func sameRequestID(a, b []byte) bool {
-	if bytes.Equal(bytes.TrimSpace(a), bytes.TrimSpace(b)) {
-		return true
-	}
+	// Decoded first, with no byte-equality shortcut ahead of it. A shortcut
+	// would answer before decodeID could refuse a value that is not an id at
+	// all, so `null` would name the request whose id is `null` — and
+	// jsonrpc.HasID counts a literal null as present, which is how such a
+	// request exists on the wire in the first place. That is the one id an
+	// attacker never has to guess.
 	da, err := decodeID(a)
 	if err != nil {
 		return false
