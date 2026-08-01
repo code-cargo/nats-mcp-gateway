@@ -656,20 +656,97 @@ func TestStaleRefreshResultDiscarded(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return slowStarted.Load() }, 2*time.Second, time.Millisecond)
 
-	// Invalidate (as a 401 would) and re-resolve: fresh material, new gen.
+	// Invalidate, as a 401 would: whatever the refresh is about to return
+	// answers a question about credentials this entry no longer holds.
 	c.Invalidate("t", "u", "s")
+
+	// Let it land, then resolve. The caller joins the refresh already in
+	// flight rather than opening a second one, so this single call covers
+	// both halves: it returns only once that refresh is done, and what it
+	// returns must come from a NEW resolve rather than from the superseded
+	// result that landed while it waited.
+	close(release)
 	fresh, genFresh, err := c.ResolveGen(ctxT(t), "t", "u", "s")
 	require.NoError(t, err)
-	assert.Equal(t, "fresh", fresh.Env["T"])
+	assert.Equal(t, "fresh", fresh.Env["T"], "a superseded refresh must not overwrite fresher credentials")
 	assert.Greater(t, genFresh, gen0)
 
-	// Let the stale refresh land: it must be discarded.
-	close(release)
-	time.Sleep(50 * time.Millisecond)
 	got, genAfter, err := c.ResolveGen(context.Background(), "t", "u", "s")
 	require.NoError(t, err)
-	assert.Equal(t, "fresh", got.Env["T"], "a superseded refresh must not overwrite fresher credentials")
+	assert.Equal(t, "fresh", got.Env["T"])
 	assert.Equal(t, genFresh, genAfter)
+}
+
+func TestExpiredMissWaitsForTheRefreshInFlight(t *testing.T) {
+	// The refresh-ahead deliberately resolves without holding e.mu, so callers
+	// with still-valid credentials are not blocked behind it. A refresh slower
+	// than the lead window outlives those credentials, and the next caller
+	// then takes the expired path — which single-flights against other
+	// foreground callers but knows nothing about the refresh already running.
+	//
+	// Two resolves against one source at once is not merely wasteful for the
+	// refresh_token grant: both load the same refresh token, and an IdP with
+	// one-time-use rotation and reuse detection (the Auth0 and Okta defaults)
+	// answers the second use by revoking the whole token family. The user's
+	// grant is then dead until they consent again.
+	const ttl = 600 * time.Millisecond // lead clamps to ttl/2 = 300ms
+	var live, peak, calls atomic.Int32
+	release := make(chan struct{})
+	refreshStarted := make(chan struct{})
+	inner := ResolveFunc(func(context.Context, string, string, string) (*Credentials, error) {
+		n := live.Add(1)
+		defer live.Add(-1)
+		for {
+			was := peak.Load()
+			if n <= was || peak.CompareAndSwap(was, n) {
+				break
+			}
+		}
+		if calls.Add(1) == 2 { // the refresh-ahead: slower than the lead window
+			close(refreshStarted)
+			select {
+			case <-release:
+			case <-time.After(30 * time.Second): // never block the suite forever
+			}
+		}
+		return &Credentials{
+			Env:       map[string]string{"T": fmt.Sprint(calls.Load())},
+			ExpiresAt: time.Now().Add(ttl),
+		}, nil
+	})
+	c := Cached(inner, time.Hour)
+
+	primed, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	time.Sleep(2 * ttl / 3) // inside the lead window, comfortably before expiry
+	served, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	require.Equal(t, primed.Env["T"], served.Env["T"],
+		"this caller must have been served from cache and merely kicked the refresh")
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresh-ahead never ran")
+	}
+
+	time.Sleep(2 * ttl / 3) // the credentials expire under the running refresh
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+		done <- err
+	}()
+
+	time.Sleep(200 * time.Millisecond) // long enough for a second grant to fire
+	close(release)
+	select {
+	case err := <-done:
+		require.NoError(t, err, "the waiting caller must be served, not failed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the expired-path caller never returned")
+	}
+	assert.Equal(t, int32(1), peak.Load(),
+		"an expired miss must join the refresh already in flight, not open a second grant")
 }
 
 func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
