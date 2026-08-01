@@ -985,3 +985,77 @@ func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
 	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
 	assert.Equal(t, before, listPages.Load())
 }
+
+// TestRedirectCannotCarryTheCredentialAway covers the four things Go's default
+// redirect policy will do with an injected credential.
+//
+// requireHTTPS constrains the URL an operator wrote; the URL actually dialled
+// is chosen by the backend. Go follows ten hops, keeps Authorization across a
+// scheme downgrade and across a subdomain hop (isDomainOrSubdomain never looks
+// at the scheme), never strips the BODY, and hands the final response back to
+// the caller — so a redirect is at once credential theft, cleartext downgrade,
+// and a read primitive into the pod's network.
+func TestRedirectCannotCarryTheCredentialAway(t *testing.T) {
+	var stolen atomic.Int32
+	thief := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			stolen.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	}))
+	t.Cleanup(thief.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, thief.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	b := &HTTPBackend{URL: redirector.URL, Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"}}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	// However it surfaces — a transport error or a synthesized JSON-RPC error —
+	// what must not happen is the hop being followed.
+	assert.Equal(t, int32(0), stolen.Load(), "the credential reached the redirect target")
+	if err == nil && resp != nil {
+		assert.NotContains(t, string(resp.Result), "internal",
+			"the redirect target's body reached the caller")
+	}
+}
+
+func TestRefuseUnsafeRedirect(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	tests := []struct {
+		name, from, to string
+		ok             bool
+	}{
+		{"same host, path only", "https://h/mcp", "https://h/mcp/", true},
+		{"plain stays plain", "http://h/mcp", "http://h/other", true},
+		{"scheme downgrade", "https://h/mcp", "http://h/mcp", false},
+		{"different host", "https://h/mcp", "https://other/mcp", false},
+		{"subdomain", "https://mcp.example.com/x", "https://evil.mcp.example.com/x", false},
+		{"host case only", "https://H/mcp", "https://h/mcp", true},
+		{"explicit default port", "https://h/mcp", "https://h:443/mcp", true},
+		{"different port, same host", "http://h:8080/mcp", "http://h:9090/mcp", false},
+		{"upgrade is fine", "http://h/mcp", "https://h/mcp", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RefuseUnsafeRedirect(req(tt.to), []*http.Request{req(tt.from)})
+			if tt.ok {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
+}

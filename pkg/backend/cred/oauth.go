@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 )
 
 // The OAuth resolvers speak RFC 6749 token endpoints with stdlib net/http
@@ -202,7 +204,7 @@ func tokenRequest(ctx context.Context, client *http.Client, tokenURL, clientID, 
 // Credentials, also returning any rotated refresh token.
 func tokenRequestFull(ctx context.Context, client *http.Client, tokenURL, clientID, clientSecret string, form url.Values) (*Credentials, string, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 30 * time.Second, CheckRedirect: backend.RefuseUnsafeRedirect}
 	}
 	// A client with an id and no secret is a PUBLIC client, and RFC 6749 §3.2.1
 	// has it identify itself with client_id in the request BODY. Set before the

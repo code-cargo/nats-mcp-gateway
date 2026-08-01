@@ -76,7 +76,8 @@ func (b *HTTPBackend) Connect(ctx context.Context) (Conn, error) {
 	}
 	client := b.Client
 	if client == nil {
-		client = &http.Client{Timeout: 0} // streams are long-lived; per-request ctx bounds them
+		// Timeout 0: streams are long-lived; per-request ctx bounds them.
+		client = &http.Client{Timeout: 0, CheckRedirect: RefuseUnsafeRedirect}
 	}
 	c := &httpConn{
 		backend: b,
