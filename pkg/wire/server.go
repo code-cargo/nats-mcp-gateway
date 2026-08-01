@@ -851,8 +851,17 @@ func (w *streamWriter) errWithID(id []byte, code int, message string, data any) 
 	}
 	body, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, data))
 	if err != nil {
+		// The body could not be built, so the caller gets a canned one — and
+		// the code and message travel with it, because micro copies both into
+		// headers and a frame whose headers disagree with its body describes
+		// two different failures. Reassigning them also puts the size check
+		// below on the values actually being sent: skipping it here would
+		// leave the one path that can still publish an oversized terminal
+		// frame, which is the failure this whole guard exists to prevent.
+		code, message = jsonrpc.CodeInternalError, "error encoding failed"
 		body = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"error encoding failed"}}`)
-	} else if max := w.nc.MaxPayload(); int64(len(body))+errOverhead(code, message) > max {
+	}
+	if max := w.nc.MaxPayload(); int64(len(body))+errOverhead(code, message) > max {
 		// This frame is the last thing the stream can say, and it carries the
 		// message twice — in the body and in micro's error header — so a
 		// handler error over about half of max_payload (a backend quoting the
