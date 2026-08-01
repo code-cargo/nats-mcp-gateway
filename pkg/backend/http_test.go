@@ -416,6 +416,81 @@ func TestNoWastedRetryWhenAnnotationsAreUnchanged(t *testing.T) {
 		"a known-unannotated tool must never be re-probed")
 }
 
+func TestOnePageOfAListingCannotSettleTheWholeToolset(t *testing.T) {
+	// tools/list is paginated, and one conn is shared by every caller of a
+	// (server, tenant, credential set) — so one client fetching page 1 and
+	// another calling a tool that lives on page 2 is ordinary traffic, not a
+	// corner case. Page 1 carrying no x-mcp-header says nothing about page 2,
+	// and concluding otherwise disables the recovery permanently: the call is
+	// rejected for a missing Mcp-Param-*, the gateway decides it already knows
+	// this server has no annotations, and the -32020 is unrecoverable for as
+	// long as the conn lives.
+	var listCalls, callAttempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		w.Header().Set("Content-Type", "application/json")
+		switch msg.Method {
+		case mcpspec.MethodToolsList:
+			listCalls.Add(1)
+			var p struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(msg.Params, &p)
+			page := `{"resultType":"complete","nextCursor":"p2","tools":[
+				{"name":"ping","inputSchema":{"type":"object"}}]}`
+			if p.Cursor == "p2" {
+				page = `{"resultType":"complete","tools":[
+					{"name":"execute_sql","inputSchema":{"type":"object","properties":{
+						"region":{"type":"string","x-mcp-header":"Region"}}}}]}`
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, json.RawMessage(page)))
+			_, _ = w.Write(resp)
+		default:
+			callAttempts.Add(1)
+			var p struct {
+				Arguments map[string]any `json:"arguments"`
+			}
+			_ = json.Unmarshal(msg.Params, &p)
+			region, _ := p.Arguments["region"].(string)
+			if r.Header.Get("Mcp-Param-Region") != region {
+				w.WriteHeader(http.StatusBadRequest)
+				resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
+					msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil))
+				_, _ = w.Write(resp)
+				return
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
+				json.RawMessage(`{"resultType":"complete","content":[]}`)))
+			_, _ = w.Write(resp)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// An ordinary first page passes through, carrying no annotations.
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`)), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error)
+	require.Contains(t, string(resp.Result), "ping")
+
+	params, _ := json.Marshal(map[string]any{
+		"name": "execute_sql", "arguments": map[string]any{"region": "us-west1"},
+	})
+	resp, err = m.Call(context.Background(), jsonrpc.NewRequest("2", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error, "the recovery must still run for a tool whose page was never seen")
+	assert.Equal(t, int32(2), callAttempts.Load(), "one rejection, one retry carrying the header")
+	assert.Equal(t, int32(3), listCalls.Load(),
+		"the client's page plus both pages of the probe that had to read past it")
+}
+
 func TestLegacyHTTPBackendIsNotJudgedAgainstXMcpHeader(t *testing.T) {
 	// x-mcp-header does not exist in 2025-11-25. Excluding a legacy server's
 	// tools for violating a rule its author never agreed to would silently

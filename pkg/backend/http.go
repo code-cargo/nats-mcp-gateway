@@ -106,9 +106,13 @@ type httpConn struct {
 	// refresh path decides whether to retry by comparing what it knew before
 	// against what it knows after, not by consulting a third state.
 	annotations map[string][]headerParam
-	// annotationsKnown records that a full tools/list has been read at least
-	// once. Without it a backend rejecting for a reason mirroring cannot fix
-	// re-probes its whole (paginated) tool list on every call, forever.
+	// annotationsKnown records that a tools/list has been read to its LAST
+	// page at least once. Without it a backend rejecting for a reason
+	// mirroring cannot fix re-probes its whole tool list on every call,
+	// forever. Only the out-of-band probe sets it, because only the probe
+	// follows the cursor to the end: a page passing through on its way to a
+	// client is one page, and what the pages after it hold is exactly the
+	// question being answered.
 	annotationsKnown bool
 	// refreshGen counts completed out-of-band schema fetches, so concurrent
 	// callers can tell whether one they waited on covered their need.
@@ -600,12 +604,8 @@ func (c *httpConn) absorbToolsList(m *jsonrpc.Message) {
 	}
 	// A listing with the annotation nowhere in it needs no parsing at all —
 	// which is every server that does not use the feature, i.e. all of them
-	// today. Recording the fact is what stops a -32020 raised for some other
-	// reason from re-probing on every single call thereafter.
+	// today.
 	if !bytes.Contains(m.Result, schemaAnnotationBytes) {
-		c.mu.Lock()
-		c.annotationsKnown = true
-		c.mu.Unlock()
 		return
 	}
 	var result map[string]json.RawMessage
@@ -641,7 +641,6 @@ func (c *httpConn) absorbToolsList(m *jsonrpc.Message) {
 	}
 
 	c.mu.Lock()
-	c.annotationsKnown = true
 	if c.annotations == nil {
 		c.annotations = make(map[string][]headerParam, len(learned))
 	}
@@ -734,6 +733,13 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 	// on to run its own — crediting it with work that did not happen would
 	// have it skip the retry and fail a call whose fix was available.
 	c.mu.Lock()
+	// "This server publishes no annotations" follows from "no annotation was
+	// seen" only for a run that reached the end of the cursor. One stopped by
+	// the page cap has tools it never looked at, and must stay willing to look
+	// again.
+	if cursor == "" {
+		c.annotationsKnown = true
+	}
 	c.refreshGen++
 	c.mu.Unlock()
 	return nil
