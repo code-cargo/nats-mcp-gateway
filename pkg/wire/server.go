@@ -384,7 +384,7 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		// Keepalives until terminal.
 		kaDone := make(chan struct{})
 		defer close(kaDone)
-		go s.keepAliveLoop(req.Reply(), kaDone, w)
+		go s.keepAliveLoop(kaDone, w)
 
 		herr := handler(ctx, in, w)
 
@@ -507,7 +507,7 @@ func (s *Server) refuseDrained(req micro.Request) {
 	_ = w.Err(ErrCodeStreamLost, "gateway draining, re-issue the request", nil)
 }
 
-func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWriter) {
+func (s *Server) keepAliveLoop(done <-chan struct{}, w *streamWriter) {
 	ticker := time.NewTicker(s.keepAlive)
 	defer ticker.Stop()
 	for {
@@ -515,13 +515,9 @@ func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWrit
 		case <-done:
 			return
 		case <-ticker.C:
-			if w.terminated() {
+			if !w.ka() {
 				return
 			}
-			_ = s.nc.PublishMsg(&nats.Msg{
-				Subject: reply,
-				Header:  nats.Header{HeaderFrame: []string{string(FrameKA)}},
-			})
 		}
 	}
 }
@@ -562,8 +558,18 @@ func (w *streamWriter) claim() bool {
 	return true
 }
 
+// Msg publishes under the same lock the terminal frames claim, rather than
+// checking terminated() and publishing after releasing it. In that gap a
+// concurrent End can claim the stream and respond, putting this notification
+// on the reply subject BEHIND the terminal frame — where the consumer has
+// already stopped reading and the request is already answered. The proxy
+// reaches the gap for real: pkg/backend's mux hands a response to the blocked
+// Call and reads on immediately, so a backend notification arriving before
+// Call unregisters is dispatched here while the handler is inside End.
 func (w *streamWriter) Msg(body []byte) error {
-	if w.terminated() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
 		return fmt.Errorf("wire: stream already terminated")
 	}
 	if max := w.nc.MaxPayload(); int64(len(body)) > max {
@@ -577,6 +583,22 @@ func (w *streamWriter) Msg(body []byte) error {
 		Data:    body,
 		Header:  nats.Header{HeaderFrame: []string{string(FrameMsg)}},
 	})
+}
+
+// ka publishes one keepalive, reporting whether the stream is still live. It
+// holds the lock across the publish for the same reason Msg does: once the
+// terminal frame is on the reply subject, nothing else may follow it.
+func (w *streamWriter) ka() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return false
+	}
+	_ = w.nc.PublishMsg(&nats.Msg{
+		Subject: w.req.Reply(),
+		Header:  nats.Header{HeaderFrame: []string{string(FrameKA)}},
+	})
+	return true
 }
 
 func (w *streamWriter) End(body []byte) error {
