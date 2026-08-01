@@ -249,7 +249,17 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 		}
 		conn, err := b.Connect(ctx)
 		if err != nil {
-			p.recordFailure(key)
+			// A Connect the CALLER ended (its context cancelled or its deadline
+			// passed) is not evidence the backend cannot start, and the breaker
+			// exists only to stop us hammering one that cannot. Counting it means
+			// impatient clients open the circuit: a legacy backend handshakes
+			// inside Connect, so a cold `npx` server routinely takes longer to
+			// come up than a client is willing to wait, and three such clients
+			// would refuse the server to everyone — including the callers content
+			// to wait for it — for the whole cooldown.
+			if ctx.Err() == nil {
+				p.recordFailure(key)
+			}
 			p.releasePending(key.Tenant)
 			return nil, nil, err
 		}

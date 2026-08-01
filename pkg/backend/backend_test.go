@@ -509,6 +509,52 @@ func TestPoolCircuitBreaker(t *testing.T) {
 	assert.Contains(t, err.Error(), "circuit open", "after threshold failures the breaker must fail fast without spawning")
 }
 
+// blockingBackend hangs in Connect until the caller's context ends, standing
+// in for the slow spawn a real one is: a legacy backend's Connect runs the
+// initialize handshake, and a cold `npx` server can take seconds to answer it.
+type blockingBackend struct{}
+
+func (blockingBackend) Connect(ctx context.Context) (Conn, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+// The breaker exists to stop the gateway hammering a backend that cannot
+// start. A caller that gave up says nothing about whether the backend can
+// start — and counting it means impatient clients, not a broken server, are
+// what opens the circuit. Three of them (the default threshold) and every
+// other caller of that server is refused for the whole cooldown, including
+// the ones prepared to wait.
+func TestCallerCancellationDoesNotOpenTheCircuit(t *testing.T) {
+	p := NewPool(PoolConfig{BreakerThreshold: 3, BreakerCooldown: time.Minute},
+		func(Key) (Backend, error) { return blockingBackend{}, nil }, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme"}
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+		_, _, err := p.Get(ctx, key)
+		cancel()
+		require.ErrorIs(t, err, context.DeadlineExceeded)
+	}
+
+	p.mu.Lock()
+	br := p.broken[key]
+	p.mu.Unlock()
+	assert.Nil(t, br, "a caller that stopped waiting was counted as a spawn failure")
+
+	// The breaker still opens on the failure it is actually for.
+	p.factory = func(Key) (Backend, error) { return &StdioBackend{Command: "/nonexistent/binary-xyz"}, nil }
+	for range 3 {
+		_, _, err := p.Get(context.Background(), key)
+		require.Error(t, err)
+	}
+	_, _, err := p.Get(context.Background(), key)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "circuit open",
+		"a backend that genuinely cannot start must still open the circuit")
+}
+
 func TestPoolReplacesDeadConn(t *testing.T) {
 	p := NewPool(PoolConfig{}, poolFactory, nil)
 	t.Cleanup(p.Shutdown)
