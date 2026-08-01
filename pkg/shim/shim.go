@@ -36,7 +36,9 @@ import (
 const maxLineBytes = 16 * 1024 * 1024
 
 // errLineTooLong reports a client line past maxLineBytes. The line has been
-// drained to its newline, so the reader is already positioned on the next one.
+// consumed either way, so the loop can read on: drained to its newline when
+// there was one, or to the end of a stream that stopped mid-line — in which
+// case the next read returns the sticky io.EOF and ends the loop.
 var errLineTooLong = errors.New("shim: client line exceeds the line cap")
 
 // Config configures a shim.
