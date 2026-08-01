@@ -428,9 +428,21 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 
 // isCancellation reports whether a control-subject message is a
 // notifications/cancelled naming the request with the given raw JSON-RPC id.
-// Ids compare as raw bytes — the same identity rule jsonrpc.IDKey applies to
-// correlation everywhere else, so a string "1" and a number 1 are different
-// requests here exactly as they are there.
+//
+// Ids compare by DECODED VALUE, which is deliberately NOT what jsonrpc.IDKey
+// does. IDKey compares raw bytes, and everywhere else in this repo that is
+// right, because both sides of the comparison came out of the same decode.
+// Here they did not: a native client's request body is forwarded verbatim
+// while the cancellation naming it is re-encoded, and encoding/json escapes
+// <, > and & — so the same id arrives spelled two ways and IDKey calls them
+// different requests.
+//
+//	jsonrpc.IDKey:  "a<b" vs "a\u003cb" -> different
+//	isCancellation: "a<b" vs "a\u003cb" -> the same request
+//
+// A string "1" and a number 1 are still different requests, and so are 1 and
+// 1.0: sameRequestID keeps a number's literal via UseNumber, because the
+// client chose the spelling and it is the client's to keep.
 func isCancellation(data, id []byte) bool {
 	if len(id) == 0 {
 		return false
