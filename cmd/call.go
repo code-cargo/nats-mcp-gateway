@@ -43,6 +43,12 @@ func runCall(c *CallCmd, g *Globals) error {
 	if err := json.Unmarshal([]byte(c.Params), &params); err != nil {
 		return fmt.Errorf("--params is not a JSON object: %w", err)
 	}
+	if params == nil {
+		// A JSON null decodes into a map cleanly and leaves it nil, so it is
+		// the one non-object --params the check above lets past. Read as "no
+		// params", the way the shim's injectMeta reads it.
+		params = map[string]json.RawMessage{}
+	}
 	var meta map[string]json.RawMessage
 	if raw, ok := params["_meta"]; ok {
 		_ = json.Unmarshal(raw, &meta)
