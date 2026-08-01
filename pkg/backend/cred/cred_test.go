@@ -24,6 +24,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -118,7 +120,15 @@ func TestExecCancellationKillsTheWholeHelperTree(t *testing.T) {
 	ready := filepath.Join(dir, "ready")
 	script := filepath.Join(dir, "helper.sh")
 	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
-sh -c 'echo > "$READY"; sleep 60' &
+# The long-lived child is forked BEFORE the marker is written, so a test that
+# waits for the marker knows the process which will hold stdout past the kill
+# already exists. Written the other way round the marker only proves the
+# marker-WRITER exists, and the kill can enumerate the process group before
+# that writer has forked the sleep — which the group kill then misses, leaving
+# WaitDelay to close the pipe and the timing assertion to fail on a machine
+# fast enough to get there first.
+sleep 60 &
+echo $! > "$READY"
 sleep 60
 `), 0o755))
 
@@ -135,15 +145,11 @@ sleep 60
 		return err == nil
 	}, 30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
 
+	childPID := readPID(t, ready)
 	cancel()
-	start := time.Now()
 	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"),
 		"a cancelled helper must fail, not hang")
-	// Returning only once the grace period is up means the child kept stdout
-	// open through the kill and the pipes had to be closed out from under it,
-	// which is the fallback working, not the group kill.
-	assert.Less(t, time.Since(start), helperWaitDelay,
-		"cancellation reached the helper alone, not its process group")
+	assertReaped(t, childPID)
 }
 
 func TestExecReturnsWhenAChildOutlivesTheHelper(t *testing.T) {
@@ -698,7 +704,15 @@ func TestExecCancelStillKillsTheGroupWhenTheHelperIsLive(t *testing.T) {
 	ready := filepath.Join(dir, "ready")
 	script := filepath.Join(dir, "helper.sh")
 	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
-sh -c 'echo > "$READY"; sleep 60' &
+# The long-lived child is forked BEFORE the marker is written, so a test that
+# waits for the marker knows the process which will hold stdout past the kill
+# already exists. Written the other way round the marker only proves the
+# marker-WRITER exists, and the kill can enumerate the process group before
+# that writer has forked the sleep — which the group kill then misses, leaving
+# WaitDelay to close the pipe and the timing assertion to fail on a machine
+# fast enough to get there first.
+sleep 60 &
+echo $! > "$READY"
 sleep 60
 `), 0o755))
 
@@ -709,9 +723,34 @@ sleep 60
 	require.Eventually(t, func() bool { _, err := os.Stat(ready); return err == nil },
 		30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
 
+	childPID := readPID(t, ready)
 	cancel()
-	start := time.Now()
 	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"))
-	assert.Less(t, time.Since(start), helperWaitDelay,
-		"the group kill must still reach the child, not fall back to the grace period")
+	assertReaped(t, childPID)
+}
+
+// readPID reads the pid the helper's forked child published for itself.
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err, "helper published %q as its child pid", raw)
+	return pid
+}
+
+// assertReaped waits for a pid to stop existing.
+//
+// Asserted directly rather than inferred from how long the resolve took. The
+// timing form — "it returned in under WaitDelay, so the group kill must have
+// worked" — is a race against the very grace period it is trying to prove
+// unnecessary, and it fails on a machine fast enough to reach the kill before
+// the group has settled. What the group kill promises is that the child is
+// gone; that is what this checks.
+func assertReaped(t *testing.T, pid int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return syscall.Kill(pid, syscall.Signal(0)) != nil
+	}, 10*time.Second, 20*time.Millisecond,
+		"pid %d survived the group kill and still holds the helper's stdout", pid)
 }
