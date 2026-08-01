@@ -223,6 +223,16 @@ func (a *Auth) validate(server string) error {
 			return fmt.Errorf("server %q: auth ttl: %w", server, err)
 		}
 	}
+	// The cred subject is a PUBLISH prefix ({subject}.{tenant}.{user}.{server})
+	// and NATS will not publish to a subject holding a wildcard. Unchecked, the
+	// mistake surfaces on the first credential resolution as "no responders
+	// available" — which points the operator at a missing controller instead of
+	// at this line.
+	if a.Subject != "" {
+		if err := wire.ValidateSubjectPrefix(a.Subject); err != nil {
+			return fmt.Errorf("server %q: auth subject: %w", server, err)
+		}
+	}
 	return nil
 }
 
@@ -310,6 +320,21 @@ func (c *Config) validate() error {
 	if c.Pool.MaxLifetime != "" {
 		if _, err := time.ParseDuration(c.Pool.MaxLifetime); err != nil {
 			return fmt.Errorf("pool.maxLifetime: %w", err)
+		}
+	}
+	// The wire prefix fronts every subscription this gateway binds, and it is
+	// the one setting nothing downstream re-checks: micro accepts "*" in an
+	// endpoint subject and NATS binds it, so an unvalidated "mcp.*" widens the
+	// authz-bearing subscription to every prefix in the account and never
+	// fails.
+	if c.NATS.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.NATS.SubjectPrefix); err != nil {
+			return fmt.Errorf("nats.subjectPrefix: %w", err)
+		}
+	}
+	if c.NATS.QueueGroup != "" {
+		if err := wire.ValidateQueueGroup(c.NATS.QueueGroup); err != nil {
+			return fmt.Errorf("nats.queueGroup: %w", err)
 		}
 	}
 	if c.NATS.InboxPrefix != "" {

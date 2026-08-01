@@ -490,6 +490,39 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 	assert.Empty(t, boot.inboxPrefix)
 }
 
+// The wire prefix and queue group get the same boot check as the inbox prefix,
+// and for a sharper reason: nothing downstream rejects a wildcard prefix.
+// "mcp.*" binds the endpoint subject "mcp.*.req.*.*.{server}.>" — micro accepts
+// it, NATS binds it, and this gateway then receives traffic addressed to every
+// other prefix in the account. The empty-token forms and a spaced queue group
+// do fail, but only at the first config apply, from nats.go and micro, naming
+// neither the setting nor the value.
+func TestBootParamsValidatesSubjectPrefixAndQueueGroup(t *testing.T) {
+	for _, bad := range []string{"mcp.*", "mcp.>", "mcp v1", "mcp.v1.", ".mcp.v1", "mcp..v1"} {
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", SubjectPrefix: bad}).bootParams(sourceFetch)
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "--subject-prefix", bad)
+	}
+	for _, bad := range []string{"mcpgw.*", "mcpgw.>", "mcp gw", "mcpgw.", "mcpgw..acme"} {
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", QueueGroup: bad}).bootParams(sourceFetch)
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "--queue-group", bad)
+	}
+
+	boot, err := (&GatewayCmd{ConfigSubject: "cfg", SubjectPrefix: "acme.mcp", QueueGroup: "mcpgw.acme"}).
+		bootParams(sourceFetch)
+	require.NoError(t, err)
+	assert.Equal(t, "acme.mcp", boot.prefix)
+	assert.Equal(t, "mcpgw.acme", boot.queueGroup)
+
+	// Unset stays unset, so wire.Serve still applies its scope-aware queue
+	// group default.
+	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
+	require.NoError(t, err)
+	assert.Empty(t, boot.prefix)
+	assert.Empty(t, boot.queueGroup)
+}
+
 // A custom inbox prefix must cover EVERY request/reply this process issues —
 // the config fetch AND the `nats` cred resolver — because that is the whole
 // point: it lets a scoped pod's identity be granted a narrow inbox instead of

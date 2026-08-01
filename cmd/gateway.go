@@ -360,6 +360,19 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	if c.ScopeUser != "" && !wire.TokenSafe(c.ScopeUser) {
 		return bootParams{}, fmt.Errorf("--scope-user %q is not subject-token safe (%s)", c.ScopeUser, `A-Za-z0-9_-`)
 	}
+	// The wire prefix has no downstream check at all: micro accepts a "*" in an
+	// endpoint subject and NATS binds it, so "mcp.*" would subscribe this
+	// instance to every prefix in the account without ever failing.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
+		}
+	}
+	if c.QueueGroup != "" {
+		if err := wire.ValidateQueueGroup(c.QueueGroup); err != nil {
+			return bootParams{}, fmt.Errorf("--queue-group: %w", err)
+		}
+	}
 	// Validated here rather than left to nats.Connect: the option's own check
 	// misses spaces, and its "invalid custom prefix" names neither the setting
 	// nor the value.
