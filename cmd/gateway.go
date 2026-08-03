@@ -368,6 +368,13 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 			return bootParams{}, fmt.Errorf("--inbox-prefix: %w", err)
 		}
 	}
+	// wire.Serve rejects this too — this is what names the flag, and what
+	// fails before we open a connection.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
+		}
+	}
 
 	boot := bootParams{
 		url:         c.NatsURL,

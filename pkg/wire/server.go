@@ -167,6 +167,15 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = DefaultPrefix
+	} else if err := ValidateSubjectPrefix(prefix); err != nil {
+		// The same check NewClient makes, and for a sharper reason on this
+		// side: EndpointSubject pastes the prefix in unchecked, so an empty
+		// token or a wildcard builds a SUBSCRIBE that is either invalid — the
+		// server's -ERR 'Invalid Subject' is unrecognised by nats.go, which
+		// closes the connection for good — or wider than the grant the prefix
+		// exists to narrow. Every config source reaches Serve, so this is the
+		// one place none of them can forget.
+		return nil, fmt.Errorf("wire: %w", err)
 	}
 
 	if cfg.Tenant == "" && cfg.User != "" {

@@ -645,6 +645,28 @@ func TestNewClientRejectsAnUnusableSubjectPrefix(t *testing.T) {
 	}
 }
 
+// The gateway half of the same gap, and the sharper one: EndpointSubject
+// pastes the prefix in unchecked the way BuildSubject did. An empty token
+// builds an invalid SUBSCRIBE — nats.go rejects that one locally today — but a
+// WILDCARD is accepted all the way through, so `mcp.*` quietly starts a
+// replica subscribed to mcp.*.req.*.*.{server}.>, widening the very
+// subscription the prefix exists to narrow. Every config source reaches Serve.
+func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
+		_, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		assert.Error(t, err, "prefix %q builds an endpoint subject nothing should serve", prefix)
+	}
+	// Including the empty prefix that means "use DefaultPrefix".
+	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
+		srv, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		require.NoError(t, err, "prefix %q is legitimate", prefix)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		require.NoError(t, srv.Shutdown(ctx))
+		cancel()
+	}
+}
+
 // TestReplyToASystemSubjectIsRefused closes a confused deputy.
 //
 // NATS permission-checks the subject a client publishes TO. It does not check

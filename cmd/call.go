@@ -37,6 +37,13 @@ func runCall(c *CallCmd, g *Globals) error {
 		}
 		opts = append(opts, nats.CustomInboxPrefix(c.InboxPrefix))
 	}
+	// NewClient checks this too; checking it here as well is what names the
+	// flag that is wrong, the same way --inbox-prefix does above.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return fmt.Errorf("--subject-prefix: %w", err)
+		}
+	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
 		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
