@@ -24,6 +24,7 @@ import (
 
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go/jetstream"
+	"github.com/nats-io/nats.go/micro"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -142,5 +143,102 @@ func TestNotificationAtPayloadBoundaryIsTypedTooLarge(t *testing.T) {
 
 	var werr *Error
 	require.ErrorAs(t, <-msgErr, &werr)
+	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
+}
+
+// The tests above all pin the reject side. Those below pin the other edge,
+// which is the one a "safe" refactor breaks silently: rounding the measured
+// overhead up to a comfortable constant would still pass every test above
+// while quietly diverting legal responses into claim-check or an error frame.
+// A body of exactly max_payload minus the frame's headers is the largest thing
+// this wire can carry, and it has to go out whole.
+//
+// So these spell the header serialization out rather than calling
+// frameOverhead: a test that sizes its body from the very constant it is
+// guarding shrinks in lockstep with the bug and proves only that the code
+// agrees with itself. Hardcoding here is the point — production measures so it
+// is never wrong, the test asserts so a wrong measurement is loud.
+func wireHeaderBytes(kv ...string) int {
+	n := len("NATS/1.0\r\n") + len("\r\n")
+	for i := 0; i < len(kv); i += 2 {
+		n += len(kv[i]) + len(": ") + len(kv[i+1]) + len("\r\n")
+	}
+	return n
+}
+
+func TestFrameOverheadMatchesTheWire(t *testing.T) {
+	assert.EqualValues(t, wireHeaderBytes(HeaderFrame, string(FrameEnd)), endOverhead)
+	assert.EqualValues(t, wireHeaderBytes(HeaderFrame, string(FrameMsg)), msgOverhead)
+	assert.EqualValues(t,
+		wireHeaderBytes(HeaderFrame, string(FrameErr),
+			micro.ErrorHeader, "boom", micro.ErrorCodeHeader, "-32603"),
+		errOverhead(-32603, "boom"),
+		"micro copies the message into Nats-Service-Error, so an err frame pays for it twice")
+}
+
+func TestEndJustUnderBoundaryPublishesWhole(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	body := bytes.Repeat([]byte("x"),
+		boundaryMaxPayload-wireHeaderBytes(HeaderFrame, string(FrameEnd)))
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End(body)
+	})
+
+	s, err := client(t, nc, 3*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameEnd, frames[0].Kind,
+		"an exact fit must not be pushed into the oversize branch")
+	assert.Equal(t, body, frames[0].Body)
+}
+
+func TestNotificationJustUnderBoundaryPublishes(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	msgErr := make(chan error, 1)
+	body := bytes.Repeat([]byte("x"),
+		boundaryMaxPayload-wireHeaderBytes(HeaderFrame, string(FrameMsg)))
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		msgErr <- w.Msg(body)
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	s, err := client(t, nc, 3*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+
+	require.NoError(t, <-msgErr, "an exact fit must not be dropped")
+	require.Len(t, frames, 2)
+	assert.Equal(t, FrameMsg, frames[0].Kind)
+	assert.Equal(t, body, frames[0].Body)
+}
+
+// Sizing a request after its headers exist is only worth the reordering if the
+// headers are actually caller-shaped. They are: Mcp-Name carries the tool name
+// or resource URI verbatim, so the same body is sendable under one name and
+// refused under another.
+func TestRequestCeilingMovesWithToolName(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	c := client(t, nc, time.Second)
+
+	// The header set Do builds for a request that carries no name.
+	unnamed := wireHeaderBytes(
+		HeaderWire, WireVersion,
+		HeaderMethod, "tools/call",
+		HeaderProtocolVersion, "2026-07-28",
+	)
+
+	req := testRequest("1", "tools/call")
+	req.Body = bytes.Repeat([]byte("x"), boundaryMaxPayload-unnamed)
+	s, err := c.Do(context.Background(), req)
+	require.NoError(t, err, "an exact fit for the unnamed header set must be accepted")
+	s.Close()
+
+	req.Name = strings.Repeat("n", 200)
+	_, err = c.Do(context.Background(), req)
+	var werr *Error
+	require.ErrorAs(t, err, &werr,
+		"the same body must be refused once Mcp-Name takes part of the budget")
 	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
 }
