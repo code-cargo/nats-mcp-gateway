@@ -856,6 +856,14 @@ func (w *streamWriter) errWithID(id []byte, code int, message string, data any) 
 	if !w.claim() {
 		return nil
 	}
+	if message == "" {
+		// micro.Request.Error refuses an empty description with ErrArgRequired,
+		// and the stream is claimed by the time that refusal comes back: the
+		// terminal frame never goes out, and the caller waits out its whole
+		// inactivity window to be handed a -32010 promising a retry will help,
+		// for a request that was answered nowhere. Any description beats none.
+		message = "backend reported an error with no description"
+	}
 	body, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, data))
 	if err != nil {
 		// The body could not be built, so the caller gets a canned one — and
@@ -920,6 +928,14 @@ func fitErrFrame(id []byte, code int, message string, data any, body []byte, max
 	if b, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, shed, nil)); err == nil {
 		return b, shed
 	}
+	// Deliberately NOT a fixpoint: every form above keeps the id, so a
+	// caller-chosen id big enough to fill the frame by itself leaves even the
+	// shed form oversized and nothing publishes. Shedding the id would fit, and
+	// is refused — the shim writes this body through to a client that
+	// correlates on the id and nothing else, so a null-id frame is unroutable.
+	// The stream ends in the client's inactivity timeout instead, which the
+	// shim reports against the right id: slow and correct over prompt and
+	// uncorrelatable. TestErrFrameNeverShedsTheID pins this.
 	return body, message
 }
 

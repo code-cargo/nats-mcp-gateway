@@ -100,6 +100,11 @@ func TestRedactNATSURL(t *testing.T) {
 		// which is exactly when a redactor that leaned on net/url would give
 		// up and pass the secret through.
 		{"tls://gw:s3c@r3t@nats:4222", "tls://gw:xxxxx@nats:4222"},
+		// A credential-free URL whose PATH carries an "@". The password span
+		// is bounded by "/" so the authority survives: an operator reading a
+		// connect failure needs the host and port intact, and reporting the
+		// port as "xxxxx" reads as a redaction that fired on nothing.
+		{"https://h:443/u/a@b.example", "https://h:443/u/a@b.example"},
 	} {
 		got := redactNATSURL(tc.raw)
 		assert.Equal(t, tc.want, got, tc.raw)

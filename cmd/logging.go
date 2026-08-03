@@ -47,7 +47,18 @@ func redactNATSURL(raw string) string {
 			// scheme-less URL carries userinfo just the same.
 			scheme, u = u[:n+3], u[n+3:]
 		}
-		at := strings.LastIndex(u, "@")
+		// Userinfo lives in the authority, and the authority ends at the first
+		// "/". Searching the whole remainder instead lets a credential-FREE
+		// URL whose PATH carries an "@" — "https://h:443/u/a@b" — read as
+		// userinfo of "h:443/u/a", and the port and half the path come back to
+		// the operator as the redaction. Nothing leaks; the line just stops
+		// saying where the process was trying to connect, which is all it was
+		// there to say.
+		authority := u
+		if slash := strings.IndexByte(u, '/'); slash >= 0 {
+			authority = u[:slash]
+		}
+		at := strings.LastIndex(authority, "@")
 		if at < 0 {
 			continue
 		}
@@ -122,7 +133,14 @@ func NewLogger(g *Globals) (*slog.Logger, error) {
 //
 // Greedy within that span, so userinfo ends at the LAST "@": a password may
 // contain an unescaped one, a host may not.
-var credInURL = regexp.MustCompile(`(://[^:/@\s,]*:)[^\s,]*(@)`)
+//
+// "/" bounds it as well, because userinfo lives in the authority component and
+// the authority ends at the first "/". Without that, a credential-FREE URL
+// whose path or query carries an "@" — "https://h:443/u/a@b.example" — matches
+// from the port to that "@", and the port and half the path are reported to
+// the operator as "xxxxx". Nothing leaks either way; what is at stake is
+// whether the line still says where the process was trying to connect.
+var credInURL = regexp.MustCompile(`(://[^:/@\s,]*:)[^\s,/]*(@)`)
 
 // connectFailure renders a NATS connect error with the credential gone from
 // BOTH halves of the message.
