@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -97,7 +98,7 @@ func (s *Shim) Run(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 			// id to answer with — the body it was in never parsed — so the one
 			// request pays for it, which is the whole point: under Scanner the
 			// session's other requests paid too.
-			s.log.Warn("dropping oversize line from client", "cap", maxLineBytes)
+			s.log.Warn("dropping oversize line from client", "err", err, "cap", maxLineBytes)
 			continue
 		}
 		line := bytes.TrimSpace(raw)
@@ -136,7 +137,7 @@ func (s *Shim) Run(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 // session's other requests with it.
 func readLine(r *bufio.Reader, max int) ([]byte, error) {
 	var line []byte
-	dropped := false
+	dropped, n := false, 0
 	for {
 		chunk, err := r.ReadSlice('\n')
 		if err == nil {
@@ -144,10 +145,11 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 			// cap is on the line rather than on its terminator.
 			chunk = chunk[:len(chunk)-1]
 		}
+		n += len(chunk)
 		switch {
 		case dropped:
 			// Past the cap already: read on only to find the newline.
-		case len(line)+len(chunk) > max:
+		case n > max:
 			dropped, line = true, nil
 		default:
 			// ReadSlice hands back the reader's own buffer, so this has to
@@ -159,8 +161,10 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 			continue
 		case dropped:
 			// A stream that ends mid-line reports the drop first; the next
-			// call re-reads the sticky io.EOF and ends the loop.
-			return nil, errLineTooLong
+			// call re-reads the sticky io.EOF and ends the loop. The length is
+			// carried along because it is the number whoever is reading the
+			// log wants: the cap on its own never says how far past it we went.
+			return nil, fmt.Errorf("%w (%d bytes)", errLineTooLong, n)
 		default:
 			return line, err
 		}

@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"testing"
@@ -295,7 +296,29 @@ func TestReadLineSkipsOnlyTheOversizeLine(t *testing.T) {
 	assert.Equal(t, io.EOF, err)
 	assert.Equal(t, []string{"a"}, lines)
 	assert.Equal(t, 1, drops)
+
+	// The drop carries how far past the cap the line went: the cap alone is
+	// the one number the operator reading that log line already knows.
+	_, err = readLine(bufio.NewReaderSize(strings.NewReader(strings.Repeat("w", 40)+"\n"), 16), max)
+	require.ErrorIs(t, err, errLineTooLong)
+	assert.Contains(t, err.Error(), "40 bytes")
 }
+
+// EOF ends the loop without being reported; anything else is a real failure of
+// the client's pipe and has to reach Run's caller, or the shim exits 0 on a
+// broken stdin and whatever supervises it sees a clean shutdown.
+func TestRunReportsAReadFailure(t *testing.T) {
+	boom := errors.New("stdin exploded")
+	s := New(nil, Config{Server: "test", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	err := s.Run(context.Background(),
+		io.MultiReader(strings.NewReader("not json\n"), errReader{boom}), io.Discard)
+	assert.ErrorIs(t, err, boom)
+}
+
+// errReader fails every read, standing in for a pipe that breaks mid-session.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
 func TestShimInjectsMissingProtocolVersion(t *testing.T) {
 	h := newHarness(t, true)
