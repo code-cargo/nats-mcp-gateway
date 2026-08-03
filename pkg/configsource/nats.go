@@ -61,6 +61,8 @@ type NATS struct {
 	BootTimeout time.Duration
 	// Logger is optional; boot retries log at warn.
 	Logger *slog.Logger
+
+	changeFilter
 }
 
 func (s *NATS) requestTimeout() time.Duration {
@@ -148,13 +150,10 @@ func (s *NATS) Watch(ctx context.Context) <-chan Update {
 			defer func() { _ = sub.Unsubscribe() }()
 		}
 
-		var lastHash string
 		emitIfChanged := func(cfg *config.Config) {
-			h := hashConfig(cfg)
-			if h == lastHash {
+			if !s.changed(cfg) {
 				return
 			}
-			lastHash = h
 			send(ctx, out, Update{Config: cfg})
 		}
 

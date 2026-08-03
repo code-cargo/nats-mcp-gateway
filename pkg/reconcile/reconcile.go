@@ -26,6 +26,7 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
@@ -88,11 +89,12 @@ func (d Delta) Empty() bool {
 	return len(d.Added) == 0 && len(d.Removed) == 0 && len(d.Changed) == 0
 }
 
-// Apply reconciles the gateway to next. It updates the wire services first; if
-// that fails the previous config stays live (nothing is swapped and no pools
-// are evicted), so a bad revision can never leave the gateway half-updated.
-// On success it evicts the pools of removed and changed servers and publishes
-// the new config as current.
+// Apply reconciles the gateway to next. A revision the wire refuses leaves the
+// previous config live and undoes whatever the attempt could have started —
+// but only that, so a bad revision can neither leave the gateway half-updated
+// nor disturb work the previous config was already serving. On success it
+// evicts the pools of removed and changed servers and publishes the new config
+// as current.
 //
 // The server set is all that reconciles. A revision whose `nats` block has
 // moved away from the running gateway's is reported (see warnNATSDrift) and
@@ -118,9 +120,42 @@ func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 	// backend factory resolves the definition through Current — which must
 	// therefore already be the new config. Roll back on failure so a bad
 	// revision leaves the previous config live.
+	//
+	// windowStart is the instant next becomes reachable through Current, and
+	// so the earliest a backend could be built from it. The rollback below
+	// needs it to tell next's backends from prev's.
+	windowStart := time.Now()
 	r.cur.Store(next)
 	if err := r.ws.SetServers(next.ServerNames()); err != nil {
 		r.cur.Store(prev)
+		// next was briefly the live config, so a request racing this apply
+		// could have pooled a backend built from a definition that is now
+		// rolled back. Nothing downstream would ever collect it: the pool is
+		// keyed by (server, tenant), and once prev is live again its
+		// definition matches, so no later diff calls the server changed. Drop
+		// what next could have spawned — for a changed server that costs a
+		// respawn from prev, and for an added one it is the only chance to
+		// notice at all. A removed server needs nothing: it is absent from
+		// next, so the factory refused to build it to begin with.
+		//
+		// Only what was born in the window, though. prev is live again and its
+		// definition never changed, so an older backend is serving exactly what
+		// it should; evicting it would fail in-flight calls for a revision that
+		// never touched them. A backend born in the window may have come from
+		// either config — from prev if its Get read Current just before the
+		// store — and dropping one of those costs a respawn, which is the
+		// cheaper side of the trade.
+		for _, name := range d.Changed {
+			r.pool.EvictServerSince(name, windowStart)
+		}
+		for _, name := range d.Added {
+			r.pool.EvictServerSince(name, windowStart)
+		}
+		// This narrows the window; it cannot close it. A Get that resolved
+		// next and is still spawning when the loops above run inserts its
+		// backend afterwards, and nothing collects that one. Closing it for
+		// real means stamping entries with the revision they were built from
+		// and rejecting stale inserts — the pool has no such notion today.
 		return Delta{}, err
 	}
 

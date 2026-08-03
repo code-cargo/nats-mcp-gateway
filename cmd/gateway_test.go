@@ -21,9 +21,11 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1084,8 +1086,26 @@ func waitServingAs(t *testing.T, a *assembled, user, serverName string) {
 // callAs is call with an explicit user identity and tool arguments.
 func (a *assembled) callAs(t *testing.T, user, serverName, tool string, args map[string]any) wire.Frame {
 	t.Helper()
-	c, err := wire.NewClient(a.clientNC, wire.ClientConfig{Tenant: "demo", User: user, Inactivity: 3 * time.Second})
+	return wireCall(t, a.clientNC, "demo", user, serverName, tool, args)
+}
+
+// wireCall issues one tools/call over the wire and returns the terminal frame.
+func wireCall(t *testing.T, nc *nats.Conn, tenant, user, serverName, tool string, args map[string]any) wire.Frame {
+	t.Helper()
+	c, err := wire.NewClient(nc, wire.ClientConfig{Tenant: tenant, User: user, Inactivity: 3 * time.Second})
 	require.NoError(t, err)
+	f, err := clientCall(c, serverName, tool, args)
+	require.NoError(t, err)
+	return f
+}
+
+// clientCall is wireCall's fallible half, on a client the caller owns. Use it
+// where failing the test in place is wrong — require.Eventually runs its
+// condition on a goroutine of its own, and t.FailNow there does not stop the
+// test — or where one client should serve many calls: NewClient chains onto the
+// connection's async error handler, so building one per poll tick grows that
+// chain for the life of the connection.
+func clientCall(c *wire.Client, serverName, tool string, args map[string]any) (wire.Frame, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
@@ -1101,12 +1121,74 @@ func (a *assembled) callAs(t *testing.T, user, serverName, tool string, args map
 		Server: serverName, Method: "tools/call", Name: tool,
 		ProtocolVersion: mcpspec.ProtocolVersion, Body: body,
 	})
-	require.NoError(t, err)
+	if err != nil {
+		return wire.Frame{}, err
+	}
 	var last wire.Frame
 	for f := range s.C {
 		last = f
 	}
-	return last
+	return last, nil
+}
+
+// SIGHUP end to end through the real gateway: signal handler -> the file
+// source's reload hook -> re-read -> apply -> a new server answering on the
+// wire. Every link in that chain is process-level, so nothing below cmd can
+// cover it — and the one link an operator can actually observe (a HUP that
+// does nothing) is the one worth pinning.
+func TestGatewaySighupReloadsFileConfig(t *testing.T) {
+	_, url := fetchNATS(t)
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.json")
+	writeCfg := func(entries ...string) {
+		body := fmt.Sprintf(`{"nats":{"url":%q},"servers":{%s}}`, url, strings.Join(entries, ","))
+		tmp := path + ".tmp"
+		require.NoError(t, os.WriteFile(tmp, []byte(body), 0o600))
+		require.NoError(t, os.Rename(tmp, path))
+	}
+	writeCfg(fakeServerJSON("a", fakeEnv(nil)))
+
+	clientNC, err := nats.Connect(url)
+	require.NoError(t, err)
+	t.Cleanup(clientNC.Close)
+	c, err := wire.NewClient(clientNC, wire.ClientConfig{Tenant: "demo", Inactivity: 3 * time.Second})
+	require.NoError(t, err)
+	// Polled from require.Eventually's goroutine, so it reports rather than
+	// fails: a not-yet-bound server is the expected answer here, not an error.
+	serving := func(server string) bool {
+		f, err := clientCall(c, server, "echo", nil)
+		return err == nil && f.Kind == wire.FrameEnd
+	}
+
+	// runGateway installs process-wide signal handlers and never removes them;
+	// drop them with the test so `go test` stays interruptible afterwards.
+	t.Cleanup(func() { signal.Reset(syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP) })
+
+	done := make(chan error, 1)
+	go func() {
+		// ReloadInterval stays 0 so polling is off and SIGHUP is the only
+		// thing that can produce the second server.
+		done <- runGateway(&GatewayCmd{Config: path}, &Globals{LogLevel: "error", LogFormat: "text"}, "0.0.0")
+	}()
+
+	// Serving proves the handlers are installed, so the signals below cannot
+	// reach the default disposition and kill the test binary.
+	require.Eventually(t, func() bool { return serving("a") }, 15*time.Second, 100*time.Millisecond,
+		"the gateway never began serving its initial config")
+
+	writeCfg(fakeServerJSON("a", fakeEnv(nil)), fakeServerJSON("b", fakeEnv(nil)))
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGHUP))
+	require.Eventually(t, func() bool { return serving("b") }, 15*time.Second, 100*time.Millisecond,
+		"SIGHUP did not reload the file source")
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	select {
+	case err := <-done:
+		assert.NoError(t, err, "a signal-driven shutdown is a clean exit")
+	case <-time.After(15 * time.Second):
+		t.Fatal("the gateway did not drain after SIGTERM")
+	}
 }
 
 // The full config-driven per-user path: an auth.mode=exec server resolves a

@@ -29,7 +29,10 @@ import (
 //   - The FIRST update carrying an error is fatal (there is nothing to serve
 //     yet) — Run returns it.
 //   - After the gateway is serving, a later source error or a failed apply is
-//     logged and dropped; the previously-applied config stays live.
+//     logged and dropped; the previously-applied config stays live. A failed
+//     apply also stays RETRYABLE: Run reports it back to a Retryable source so
+//     the revision is re-delivered on the source's next trigger instead of
+//     being suppressed as content already seen.
 //
 // apply is typically reconcile.(*Reconciler).Apply wrapped to drop its Delta.
 func Run(ctx context.Context, log *slog.Logger, src Source, apply func(*config.Config) error) error {
@@ -59,6 +62,15 @@ func Run(ctx context.Context, log *slog.Logger, src Source, apply func(*config.C
 					return fmt.Errorf("configsource: applying initial config: %w", err)
 				}
 				log.Error("applying config failed; keeping last good config", "err", err)
+				// A source that dedups by content has already recorded this
+				// revision as delivered. Tell it otherwise, or the next
+				// redelivery of the same content — the poll tick, the change
+				// event, the operator's SIGHUP — is suppressed upstream of
+				// here and the failure becomes permanent for as long as the
+				// config keeps saying the same thing.
+				if r, ok := src.(Retryable); ok {
+					r.Retry()
+				}
 				continue
 			}
 			serving = true

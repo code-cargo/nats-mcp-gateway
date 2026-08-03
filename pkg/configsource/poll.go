@@ -38,39 +38,45 @@ func Poll(interval time.Duration, fetch FetchFunc) Source {
 	if interval <= 0 {
 		interval = 30 * time.Second
 	}
-	return SourceFunc(func(ctx context.Context) <-chan Update {
-		out := make(chan Update)
-		go func() {
-			defer close(out)
-			var lastHash string
-			emit := func() {
-				cfg, err := fetch(ctx)
-				if err != nil {
-					send(ctx, out, Update{Err: err})
-					return
-				}
-				h := hashConfig(cfg)
-				if h == lastHash {
-					return // unchanged: stay quiet
-				}
-				lastHash = h
-				send(ctx, out, Update{Config: cfg})
-			}
+	return &poller{interval: interval, fetch: fetch}
+}
 
-			emit() // initial
-			ticker := time.NewTicker(interval)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					emit()
-				}
+type poller struct {
+	interval time.Duration
+	fetch    FetchFunc
+	changeFilter
+}
+
+// Watch implements Source.
+func (p *poller) Watch(ctx context.Context) <-chan Update {
+	out := make(chan Update)
+	go func() {
+		defer close(out)
+		emit := func() {
+			cfg, err := p.fetch(ctx)
+			if err != nil {
+				send(ctx, out, Update{Err: err})
+				return
 			}
-		}()
-		return out
-	})
+			if !p.changed(cfg) {
+				return // unchanged: stay quiet
+			}
+			send(ctx, out, Update{Config: cfg})
+		}
+
+		emit() // initial
+		ticker := time.NewTicker(p.interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				emit()
+			}
+		}
+	}()
+	return out
 }
 
 // Static returns a Source that emits cfg once and then holds it: the config

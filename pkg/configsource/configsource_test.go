@@ -239,6 +239,146 @@ func TestRunApplyErrorKeepsLastGood(t *testing.T) {
 	assert.Equal(t, [][]string{{"a"}, {"a", "c"}}, applied, "failed apply is skipped, last good survives")
 }
 
+// applyRecorder is an apply func that records every revision it is handed and
+// rejects the ones a test tells it to. It is how the retry tests distinguish
+// "the source never re-delivered" from "the apply was never retried".
+type applyRecorder struct {
+	seen   chan []string
+	reject atomic.Bool
+}
+
+func newApplyRecorder() *applyRecorder {
+	return &applyRecorder{seen: make(chan []string, 16)}
+}
+
+func (a *applyRecorder) apply(c *config.Config) error {
+	a.seen <- names(c)
+	if a.reject.Load() {
+		return errors.New("apply rejected")
+	}
+	return nil
+}
+
+// next returns the next applied revision, failing the test if none arrives.
+func (a *applyRecorder) next(t *testing.T, why string) []string {
+	t.Helper()
+	select {
+	case got := <-a.seen:
+		return got
+	case <-time.After(3 * time.Second):
+		t.Fatalf("no config was applied: %s", why)
+		return nil
+	}
+}
+
+// A revision that fails to APPLY has to stay retryable. Every source suppresses
+// unchanged content, so unless the failed apply is fed back the source treats
+// that content as delivered and swallows every redelivery of it — here the
+// SIGHUP path, whose whole purpose is to force a re-read.
+func TestFileReloadRetriesAfterFailedApply(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.json")
+	writeCfg := func(servers ...string) {
+		body := `{"servers":{`
+		for i, s := range servers {
+			if i > 0 {
+				body += ","
+			}
+			body += fmt.Sprintf(`%q:{"transport":"stdio","command":"cmd"}`, s)
+		}
+		body += `}}`
+		tmp := filepath.Join(dir, "gw.json.tmp")
+		require.NoError(t, os.WriteFile(tmp, []byte(body), 0o600))
+		require.NoError(t, os.Rename(tmp, path))
+	}
+	writeCfg("a")
+
+	f := NewFile(path, 0) // no polling: Reload (SIGHUP) is the only trigger
+	rec := newApplyRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = Run(ctx, nil, f, rec.apply) }()
+
+	assert.Equal(t, []string{"a"}, rec.next(t, "initial revision"))
+
+	// A new revision that fails to apply.
+	rec.reject.Store(true)
+	writeCfg("a", "b")
+	f.Reload()
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "the changed file"))
+
+	// The operator fixes whatever the apply choked on and HUPs again. The file
+	// is byte-identical to the revision that failed, which is exactly the case
+	// content dedup would swallow.
+	//
+	// This HUP races Run's Retry, and must work whichever lands first: if Retry
+	// wins, the reload finds a cleared baseline and emits; if the reload wins it
+	// is suppressed, and Retry re-fires it (TestFileRetryRefiresASpentTrigger).
+	// Polling is off, so a source that only cleared the baseline would hang here
+	// on the second ordering.
+	rec.reject.Store(false)
+	f.Reload()
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "a config that failed to apply must be retried on the next SIGHUP"))
+}
+
+// The periodic poll is the missed-event safety net, so it has to be able to
+// carry a retry of content it already delivered.
+func TestPollRetriesAfterFailedApply(t *testing.T) {
+	var fetches atomic.Int32
+	src := Poll(20*time.Millisecond, func(context.Context) (*config.Config, error) {
+		if fetches.Add(1) == 1 {
+			return cfgWith("a"), nil
+		}
+		return cfgWith("a", "b"), nil
+	})
+
+	rec := newApplyRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = Run(ctx, nil, src, rec.apply) }()
+
+	assert.Equal(t, []string{"a"}, rec.next(t, "initial revision"))
+	rec.reject.Store(true)
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "the changed fetch"))
+	rec.reject.Store(false)
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "a config that failed to apply must be retried on the next poll"))
+}
+
+func TestDedupRetriesAfterFailedApply(t *testing.T) {
+	// A push source that re-emits the same revision on every event — the
+	// over-emitting shape Dedup exists for.
+	raw := SourceFunc(func(ctx context.Context) <-chan Update {
+		out := make(chan Update)
+		go func() {
+			defer close(out)
+			cur := cfgWith("a")
+			for {
+				select {
+				case out <- Update{Config: cur}:
+					cur = cfgWith("a", "b")
+				case <-ctx.Done():
+					return
+				}
+				if !sleep(ctx, 20*time.Millisecond) {
+					return
+				}
+			}
+		}()
+		return out
+	})
+
+	rec := newApplyRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = Run(ctx, nil, Dedup(raw), rec.apply) }()
+
+	assert.Equal(t, []string{"a"}, rec.next(t, "initial revision"))
+	rec.reject.Store(true)
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "the changed revision"))
+	rec.reject.Store(false)
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "a config that failed to apply must survive dedup on the next emit"))
+}
+
 func TestFileSourceReloadOnChange(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "gw.json")
@@ -353,6 +493,36 @@ func TestNATSSourceFetchAndEvent(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("change event did not trigger a re-fetch")
 	}
+}
+
+// The refetch interval is the fetch source's missed-event safety net, so it
+// has to be able to redeliver content whose apply failed — otherwise the
+// gateway serves the previous config until the CONTROLLER's document changes,
+// which may be never.
+func TestNATSSourceRefetchRetriesAfterFailedApply(t *testing.T) {
+	nc := runNATS(t)
+	r := &configResponder{nc: nc}
+	r.set("a")
+	sub, err := nc.Subscribe("cfg.request", func(m *nats.Msg) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		_ = m.Respond(r.current)
+	})
+	require.NoError(t, err)
+	defer func() { _ = sub.Unsubscribe() }()
+
+	src := &NATS{Conn: nc, RequestSubject: "cfg.request", Refetch: 50 * time.Millisecond}
+	rec := newApplyRecorder()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = Run(ctx, nil, src, rec.apply) }()
+
+	assert.Equal(t, []string{"a"}, rec.next(t, "initial revision"))
+	rec.reject.Store(true)
+	r.set("a", "b")
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "the changed document"))
+	rec.reject.Store(false)
+	assert.Equal(t, []string{"a", "b"}, rec.next(t, "a config that failed to apply must be retried on the next refetch"))
 }
 
 func TestNATSSourceRetriesUntilResponderUp(t *testing.T) {
@@ -504,4 +674,66 @@ func TestNATSSourceBootTimeoutFatal(t *testing.T) {
 	}
 	err := Run(context.Background(), nil, src, func(*config.Config) error { return nil })
 	require.Error(t, err, "a responder that never answers must eventually be fatal")
+}
+
+// TestRetryDeliversARevisionThatHashesLikeNothing guards the one value a
+// content filter must not confuse with its own empty state.
+//
+// The filter's baseline and a revision's identity used to share the empty
+// string: hashConfig returned "" for a nil config and for one it could not
+// marshal, and Retry reset the baseline to "". So the delivery Retry exists to
+// let through was the delivery most likely to be dropped — a failed apply set
+// the baseline to "", and the next nil revision hashed to "" and matched it.
+// "Every server removed" is a legitimate revision, and a gateway that failed
+// one apply must not be the reason it never lands.
+func TestRetryDeliversARevisionThatHashesLikeNothing(t *testing.T) {
+	var f changeFilter
+
+	require.True(t, f.changed(nil), "the first revision is always a change")
+	require.False(t, f.changed(nil), "an unchanged revision is suppressed")
+
+	f.Retry()
+	assert.True(t, f.changed(nil),
+		"a retry must re-deliver the revision whose apply failed, whatever it hashes to")
+}
+
+// Dropping the baseline is not enough on its own: Run applies on its own
+// goroutine, so the source is free to fire again the moment Run takes a
+// revision off the channel. A trigger that lands there finds unchanged content
+// and is suppressed — spent before Retry is ever called. retry has to say so,
+// or a source with nothing else to fall back on waits forever.
+func TestRetryReportsATriggerSpentWhileTheApplyFailed(t *testing.T) {
+	var f changeFilter
+
+	require.True(t, f.changed(cfgWith("a")), "the revision Run is applying")
+	assert.False(t, f.retry(), "no trigger was spent, so there is none to re-fire")
+
+	require.True(t, f.changed(cfgWith("a")), "the baseline was dropped: re-delivered")
+	require.False(t, f.changed(cfgWith("a")), "a trigger lands mid-apply and is swallowed")
+	assert.True(t, f.retry(), "the swallowed trigger must be reported")
+	assert.False(t, f.retry(), "and reported once — re-firing is not repeatable")
+}
+
+// The File source is the one that cannot ride out a spent trigger: with polling
+// off, SIGHUP is the only thing that re-reads the file, so a HUP swallowed
+// during a failing apply is simply gone. Retry has to fire one in its place.
+func TestFileRetryRefiresASpentTrigger(t *testing.T) {
+	f := NewFile(filepath.Join(t.TempDir(), "gw.json"), 0)
+
+	require.True(t, f.changed(cfgWith("a")), "the revision Run is applying")
+	require.False(t, f.changed(cfgWith("a")), "a HUP lands mid-apply and is swallowed")
+
+	f.Retry()
+	// require, not assert: the drain below would block forever otherwise, and a
+	// regression should fail the test, not hang the package.
+	require.Len(t, f.reload, 1, "Retry must replace the trigger the suppressed emit spent")
+
+	// It must not manufacture one, either — that is what keeps a config that
+	// fails every time from spinning: the re-fired reload emits (the baseline
+	// is clear), which is not a suppression, so the next failure re-arms
+	// nothing.
+	<-f.reload
+	require.True(t, f.changed(cfgWith("a")))
+	f.Retry()
+	assert.Empty(t, f.reload, "Retry must not invent a trigger when none was lost")
 }

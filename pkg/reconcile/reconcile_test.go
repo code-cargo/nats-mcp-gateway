@@ -329,6 +329,51 @@ func TestDriftFieldsCoversKeysPresentOnOneSideOnly(t *testing.T) {
 	assert.Equal(t, []string{"bootOnly", "nextOnly"}, driftFields(boot, next))
 }
 
+// A rolled-back revision must not leave its backends behind, and must not take
+// anything else with it. Current() publishes next BEFORE the wire update, so
+// for as long as the update runs the pool factory resolves definitions out of a
+// config that may never become live; a backend spawned in that window outlives
+// the rollback under the same (server, tenant) key, and no later apply evicts
+// it — once prev is live again its definition matches, so the diff is empty.
+// Apply therefore evicts on the failure path, bounded to the window.
+//
+// The bound is what this test pins: a backend that predates the failed apply
+// belongs to prev, which is live again, so it must survive. Killing it would
+// mean a revision that never took effect could still fail live calls. The
+// other half — that a backend born INSIDE the window is dropped — is the
+// pool's contract and is pinned there (TestEvictServerSince); reaching it from
+// here would need a hook to hold Apply open mid-window, and there is none.
+func TestApplyRollbackKeepsWhatThePreviousConfigOwns(t *testing.T) {
+	st := newStack(t, nil)
+
+	_, err := st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+	pidA := pidOf(t, st.call(t, "acme", "a", "echo"))
+
+	// A revision that redefines a and carries a server the wire cannot bind:
+	// the wire update fails, so nothing of it ever becomes live.
+	_, err = st.rec.Apply(cfg(map[string]config.Server{
+		"a":        fakeSrv(map[string]string{"EXTRA": "1"}),
+		"bad name": fakeSrv(nil),
+	}))
+	require.Error(t, err)
+
+	cur := st.rec.Current()
+	require.NotNil(t, cur)
+	assert.Equal(t, []string{"a"}, cur.ServerNames(), "the previous config must be live again")
+	assert.Nil(t, cur.Servers["a"].Env, "the rolled-back definition must not survive")
+
+	assert.Equal(t, pidA, pidOf(t, st.call(t, "acme", "a", "echo")),
+		"a revision that never took effect must not respawn a backend prev still owns")
+
+	// And the gateway is still reconcilable afterwards: the same change without
+	// the unbindable name applies, and NOW a is expected to respawn.
+	_, err = st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(map[string]string{"EXTRA": "1"})}))
+	require.NoError(t, err)
+	assert.NotEqual(t, pidA, pidOf(t, st.call(t, "acme", "a", "echo")),
+		"a changed server must respawn once its revision really is live")
+}
+
 func fakeSrv(extraEnv map[string]string) config.Server {
 	return config.Server{
 		Protocol:  mcpspec.ProtocolVersion,

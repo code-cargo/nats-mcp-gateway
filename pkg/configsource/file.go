@@ -29,6 +29,7 @@ type File struct {
 	path         string
 	pollInterval time.Duration
 	reload       chan struct{}
+	changeFilter
 }
 
 // NewFile builds a file source. pollInterval <= 0 disables polling (reload
@@ -52,23 +53,39 @@ func (f *File) Reload() {
 	}
 }
 
+// Retry implements Retryable, re-arming the trigger when one was spent on the
+// failed revision.
+//
+// With pollInterval <= 0 a HUP is the only thing that re-reads the file, and
+// Run applies on its own goroutine: a HUP sent while the failing apply is still
+// running re-reads, finds content the filter has not yet been told to
+// re-deliver, and is swallowed. Clearing the baseline afterwards fixes nothing
+// — that HUP is gone, and the next one may be a long way off. So fire one
+// ourselves in its place.
+//
+// This cannot spin. The reload it fires emits (the baseline is clear), which
+// clears the swallowed flag, so a second failure re-arms nothing unless another
+// trigger was genuinely lost.
+func (f *File) Retry() {
+	if f.changeFilter.retry() {
+		f.Reload()
+	}
+}
+
 // Watch implements Source.
 func (f *File) Watch(ctx context.Context) <-chan Update {
 	out := make(chan Update)
 	go func() {
 		defer close(out)
-		var lastHash string
 		emit := func() {
 			cfg, err := config.Load(f.path)
 			if err != nil {
 				send(ctx, out, Update{Err: err})
 				return
 			}
-			h := hashConfig(cfg)
-			if h == lastHash {
+			if !f.changed(cfg) {
 				return
 			}
-			lastHash = h
 			send(ctx, out, Update{Config: cfg})
 		}
 
