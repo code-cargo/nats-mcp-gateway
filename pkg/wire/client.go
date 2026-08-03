@@ -233,6 +233,17 @@ type Stream struct {
 // design: on an at-most-once bus a cancel can race the gateway's control
 // subscription and be lost; the request then simply completes or times out.
 func (s *Stream) Cancel(notification []byte) error {
+	// Sized for the same reason Do sizes its request: unchecked, this reaches
+	// Publish and comes back a bare nats.ErrMaxPayload, which a caller
+	// switching on our codes reads as an unclassified transport failure
+	// instead of the one thing it is. A control frame carries no headers, so
+	// here the body really is the whole budget.
+	if max := s.nc.MaxPayload(); int64(len(notification)) > max {
+		return &Error{
+			Code:    ErrCodePayloadTooLarge,
+			Message: fmt.Sprintf("cancel notification %d bytes exceeds NATS max_payload %d", len(notification), max),
+		}
+	}
 	return s.nc.Publish(s.reply+ctlSuffix, notification)
 }
 
@@ -244,15 +255,42 @@ func (s *Stream) Close() { s.stop() }
 // (no responders, inactivity, slow consumer) into a terminal FrameErr so
 // consumers have exactly one code path.
 func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
-	if max := c.nc.MaxPayload(); int64(len(req.Body)) > max {
-		return nil, &Error{
-			Code:    ErrCodePayloadTooLarge,
-			Message: fmt.Sprintf("request body %d bytes exceeds NATS max_payload %d", len(req.Body), max),
-		}
-	}
 	subject, err := BuildSubject(c.prefix, c.tenant, c.user, req.Server, req.Method, req.Name)
 	if err != nil {
 		return nil, err
+	}
+
+	header := nats.Header{
+		HeaderWire:   []string{WireVersion},
+		HeaderMethod: []string{req.Method},
+		// Encoded like Name, and for the same reason: the shim lifts this
+		// straight out of the client's params._meta without validating it,
+		// so it is caller-controlled text on its way into a header. A CR
+		// or LF here would forge extra header lines in the published frame.
+		HeaderProtocolVersion: []string{mcpspec.EncodeHeaderValue(req.ProtocolVersion)},
+	}
+	if req.Name != "" {
+		// Encoded only for the header. The subject above was already built
+		// from the RAW name, which is what the permission grant is written
+		// against — encoding before that point would silently change it.
+		header.Set(HeaderName, mcpspec.EncodeHeaderValue(req.Name))
+	}
+	if c.claims != nil {
+		header.Set(HeaderAcceptClaim, "1")
+	}
+
+	// Sized here, after the headers exist, because they share the body's
+	// max_payload budget and this set is caller-shaped — a long tool name or
+	// resource URI moves the ceiling for every request that carries it.
+	// Weighing the body alone let those requests through to PublishMsg, which
+	// refuses them as a bare nats.ErrMaxPayload: a caller switching on our
+	// codes reads that as an unclassified transport failure instead of the
+	// one thing it is, and retries a request that can only ever be too big.
+	if overhead, max := frameOverhead(header), c.nc.MaxPayload(); int64(len(req.Body))+overhead > max {
+		return nil, &Error{
+			Code:    ErrCodePayloadTooLarge,
+			Message: fmt.Sprintf("request body %d bytes (+%d frame headers) exceeds NATS max_payload %d", len(req.Body), overhead, max),
+		}
 	}
 
 	reply := c.nc.NewRespInbox()
@@ -301,29 +339,7 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 		return nil, fmt.Errorf("wire: pending limits: %w", err)
 	}
 
-	msg := &nats.Msg{
-		Subject: subject,
-		Reply:   reply,
-		Data:    req.Body,
-		Header: nats.Header{
-			HeaderWire:   []string{WireVersion},
-			HeaderMethod: []string{req.Method},
-			// Encoded like Name, and for the same reason: the shim lifts this
-			// straight out of the client's params._meta without validating it,
-			// so it is caller-controlled text on its way into a header. A CR
-			// or LF here would forge extra header lines in the published frame.
-			HeaderProtocolVersion: []string{mcpspec.EncodeHeaderValue(req.ProtocolVersion)},
-		},
-	}
-	if req.Name != "" {
-		// Encoded only for the header. The subject above was already built
-		// from the RAW name, which is what the permission grant is written
-		// against — encoding before that point would silently change it.
-		msg.Header.Set(HeaderName, mcpspec.EncodeHeaderValue(req.Name))
-	}
-	if c.claims != nil {
-		msg.Header.Set(HeaderAcceptClaim, "1")
-	}
+	msg := &nats.Msg{Subject: subject, Reply: reply, Data: req.Body, Header: header}
 
 	if err := c.nc.PublishMsg(msg); err != nil {
 		unregister()
