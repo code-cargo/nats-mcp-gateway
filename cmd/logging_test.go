@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -252,4 +253,45 @@ func TestConnectFailureKeepsWhatIsNotACredential(t *testing.T) {
 		got := connectFailure(tc.raw, errors.New(tc.wrapped)).Error()
 		assert.Equal(t, tc.want, got, tc.raw)
 	}
+}
+
+// A creds file signs a server nonce, so nothing secret crosses an unencrypted
+// hop; a password or token written into the URL is sent as configured. Only
+// the second is worth a line, and it is a warning rather than a refusal
+// because "nats://" is the scheme in the flag's own default and in this
+// README's canonical config.
+func TestWarnPlaintextNATSURL(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		warn bool
+	}{
+		{"nats://gw:s3cr3t@prod:4222", true},
+		{"gw:s3cr3t@prod:4222", true},        // nats.go supplies the scheme
+		{"nats://t0ken@prod:4222", true},     // colon-less userinfo is the token
+		{"nats://prod:4222", false},          // a creds file is not sent in the clear
+		{"tls://gw:s3cr3t@prod:4222", false}, // already encrypted
+		{"nats://gw:s3cr3t@127.0.0.1:4222", false},
+		{"nats://gw:s3cr3t@localhost:4222", false},
+		{"", false},
+	} {
+		var buf bytes.Buffer
+		log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+		warnPlaintextNATSURL(log, tc.raw)
+		got := buf.String()
+		if !tc.warn {
+			assert.Empty(t, got, tc.raw)
+			continue
+		}
+		assert.Contains(t, got, "unencrypted", tc.raw)
+		assert.NotContains(t, got, "s3cr3t", tc.raw)
+		assert.NotContains(t, got, "t0ken", tc.raw)
+	}
+
+	// A cluster list is one string to nats.go, and one plaintext member is
+	// enough to send the credential in the clear.
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	warnPlaintextNATSURL(log, "tls://gw:s3cr3t@a:4222,nats://gw:s3cr3t@b:4222")
+	assert.Contains(t, buf.String(), "b:4222")
+	assert.NotContains(t, buf.String(), "s3cr3t")
 }

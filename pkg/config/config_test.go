@@ -592,3 +592,30 @@ func TestCacheScopeValidation(t *testing.T) {
 		})
 	}
 }
+
+// A helper whose child holds stdout past the wait delay FAILS the resolve
+// rather than running to the timeout, so a deployment whose helper legitimately
+// does that needs the bound raised. It was reachable only from Go until now.
+func TestAuthWaitDelay(t *testing.T) {
+	parse := func(doc string) error {
+		_, err := Parse([]byte(doc))
+		return err
+	}
+	require.NoError(t, parse(`{"servers":{"a":{"command":"x","auth":{"mode":"exec","command":"h","waitDelay":"30s"}}}}`))
+	require.NoError(t, parse(`{"servers":{"a":{"command":"x","auth":{"mode":"exec","command":"h"}}}}`),
+		"unset takes the default")
+
+	err := parse(`{"servers":{"a":{"command":"x","auth":{"mode":"exec","command":"h","waitDelay":"-1s"}}}}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "negative")
+
+	err = parse(`{"servers":{"a":{"command":"x","auth":{"mode":"exec","command":"h","waitDelay":"soon"}}}}`)
+	require.Error(t, err)
+
+	// Rejected rather than ignored on the modes that never spawn anything, the
+	// same way perUser is: a setting that silently does nothing is how an
+	// operator concludes the bound does not work.
+	err = parse(`{"servers":{"a":{"command":"x","auth":{"mode":"file","path":"/p","waitDelay":"30s"}}}}`)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "waitDelay")
+}

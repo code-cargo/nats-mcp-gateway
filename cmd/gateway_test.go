@@ -1847,3 +1847,58 @@ func TestSharedEnvVarsDoNotRefuseTheFileSourceBoot(t *testing.T) {
 		assert.Contains(t, err.Error(), "nats.tenant")
 	})
 }
+
+// Everything after the apply is conditional on it: pruning a rejected revision
+// would retire resolvers the config still in force is using, and warning on one
+// would name servers nobody is serving. The dedupe state has to survive across
+// revisions too — the fetch source re-applies on every tick, which is exactly
+// how the nats-drift line came to warn forever.
+func TestApplyRevisionReportsOnlyWhatApplied(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	perUser := func(t *testing.T) *config.Config {
+		t.Helper()
+		cfg, err := config.Parse([]byte(`{"servers":{"gh":{"command":"x","auth":{"mode":"exec","command":"h"}}}}`))
+		require.NoError(t, err)
+		return cfg
+	}
+
+	var applyErr error
+	var pruned int
+	apply := func(*config.Config) (reconcile.Delta, error) { return reconcile.Delta{}, applyErr }
+	prune := func(map[string]config.Server) { pruned++ }
+	run := applyRevision(log, apply, prune)
+
+	// A rejected revision reports nothing and prunes nothing.
+	applyErr = errors.New("refused")
+	require.Error(t, run(perUser(t)))
+	assert.Zero(t, pruned, "a rejected revision must not retire the live config's resolvers")
+	assert.Empty(t, buf.String())
+
+	// The same revision, once it applies.
+	applyErr = nil
+	require.NoError(t, run(perUser(t)))
+	assert.Equal(t, 1, pruned)
+	assert.Contains(t, buf.String(), "gh", "the per-user servers are named once they are being served")
+
+	// And the fetch source's next tick says nothing new.
+	before := buf.Len()
+	require.NoError(t, run(perUser(t)))
+	assert.Equal(t, before, buf.Len(), "an unchanged revision must not re-warn on every tick")
+}
+
+// The bound was reachable only from Go, so a deployment whose helper backgrounds
+// a refresh — a cloud CLI holding the pipe past the default — had no way to say
+// so from the document that configures the helper.
+func TestExecResolverCarriesTheConfiguredWaitDelay(t *testing.T) {
+	r := buildResolver(&config.Auth{Mode: config.AuthExec, Command: "h", WaitDelay: "30s"}, nil, "")
+	e, ok := r.(*cred.Exec)
+	require.True(t, ok)
+	assert.Equal(t, 30*time.Second, e.WaitDelay)
+
+	// Unset stays zero, which is how Exec spells "take the default" — pinning a
+	// number here would silently become the default's second definition.
+	r = buildResolver(&config.Auth{Mode: config.AuthExec, Command: "h"}, nil, "")
+	assert.Zero(t, r.(*cred.Exec).WaitDelay)
+}

@@ -310,18 +310,11 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}()
 
 	log.Info("gateway starting", "nats", redactNATSURL(boot.url), "source", kind.describe(c))
+	warnPlaintextNATSURL(log, boot.url)
 
 	// Run the config loop. It returns when ctx is cancelled (signal) or on a
 	// fatal initial-config error.
-	var perUserWarned string
-	runErr := configsource.Run(ctx, log, source, func(cfg *config.Config) error {
-		_, err := rec.Apply(cfg)
-		if err == nil {
-			registry.prune(cfg.Servers)
-			perUserWarned = warnPerUserGrain(log, cfg, perUserWarned)
-		}
-		return err
-	})
+	runErr := configsource.Run(ctx, log, source, applyRevision(log, rec.Apply, registry.prune))
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -331,6 +324,28 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		return runErr // a real error, not a clean signal-driven shutdown
 	}
 	return drainErr
+}
+
+// applyRevision builds the config-source callback: one revision applied, and
+// the consequences of it reported.
+//
+// Named rather than written inline at the Run call because the ordering is the
+// content. Everything after apply runs only for a revision that took: pruning
+// on a rejected one would retire resolvers the config still in force is using,
+// and warning on one would name servers nobody is serving. The dedupe state
+// lives in the closure for the same reason it exists at all — the fetch source
+// re-applies on every tick, and a warning per tick is the defect this batch
+// removed from the drift line.
+func applyRevision(log *slog.Logger, apply func(*config.Config) (reconcile.Delta, error), prune func(map[string]config.Server)) func(*config.Config) error {
+	var perUserWarned string
+	return func(cfg *config.Config) error {
+		if _, err := apply(cfg); err != nil {
+			return err
+		}
+		prune(cfg.Servers)
+		perUserWarned = warnPerUserGrain(log, cfg, perUserWarned)
+		return nil
+	}
 }
 
 // warnPerUserGrain names the servers whose credentials are resolved per caller.
@@ -1088,7 +1103,8 @@ func (r *credRegistry) lookup(name string, s config.Server) (*cred.CachedResolve
 func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	switch a.Mode {
 	case config.AuthExec:
-		return &cred.Exec{Command: a.Command, Args: a.Args, Env: a.Env}
+		waitDelay, _ := time.ParseDuration(a.WaitDelay) // validated at config load; 0 takes the default
+		return &cred.Exec{Command: a.Command, Args: a.Args, Env: a.Env, WaitDelay: waitDelay}
 	case config.AuthFile:
 		ttl, _ := time.ParseDuration(a.TTL) // validated at config load
 		return &cred.File{Path: a.Path, TTL: ttl}

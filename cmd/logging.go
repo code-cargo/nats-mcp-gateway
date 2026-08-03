@@ -17,6 +17,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"regexp"
 	"strconv"
@@ -223,3 +224,64 @@ func (e *connectError) Error() string { return e.msg }
 // for printing: log e, not errors.Unwrap(e).
 
 func (e *connectError) Unwrap() error { return e.err }
+
+// warnPlaintextNATSURL says so when the gateway's own NATS credential is about
+// to cross an unencrypted hop.
+//
+// A warning rather than a refusal, unlike the backend URLs requireHTTPS
+// governs, because this one is load-bearing in a way those are not: "nats://"
+// is the scheme in every quickstart, in this README's canonical config
+// (nats://gw:pw@nats:4222), and in the flag's own default. Refusing it would
+// fail the boot of the deployment the documentation describes, which is the
+// shape of mistake that has already had to be undone once on this path.
+//
+// Only userinfo is worth a line. A creds file authenticates by signing a
+// server nonce, so nothing secret crosses the wire even in the clear; a
+// password or token in the URL is sent as written. Loopback is exempt for the
+// reason it is everywhere else — that traffic reaches no network anyone can
+// read — and "tls://" and "ws(s)://" are somebody else's decision to have
+// already made.
+func warnPlaintextNATSURL(log *slog.Logger, raw string) {
+	for _, u := range strings.Split(raw, ",") {
+		u = strings.TrimSpace(u)
+		scheme, rest, ok := strings.Cut(u, "://")
+		if !ok {
+			// nats.go supplies "nats://" for a scheme-less URL, so this is the
+			// plaintext scheme too.
+			scheme, rest = "nats", u
+		}
+		if !strings.EqualFold(scheme, "nats") {
+			continue
+		}
+		authority := rest
+		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+			authority = rest[:slash]
+		}
+		at := strings.LastIndex(authority, "@")
+		if at < 0 {
+			continue
+		}
+		host := authority[at+1:]
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+		if isLoopbackHost(host) {
+			continue
+		}
+		log.Warn("the NATS URL carries a credential over an unencrypted connection; use tls://, or terminate TLS in front of this hop",
+			"nats", redactNATSURL(u))
+	}
+}
+
+// isLoopbackHost mirrors pkg/config's, which is not exported. Kept here rather
+// than exported from there because the two answer different questions — that
+// one exempts a backend URL from a refusal, this one suppresses a warning —
+// and coupling them would make a change to either a change to both.
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}

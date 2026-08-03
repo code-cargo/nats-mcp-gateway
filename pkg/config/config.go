@@ -167,10 +167,15 @@ const (
 type Auth struct {
 	Mode string `json:"mode"`
 
-	// exec mode.
-	Command string            `json:"command,omitempty"`
-	Args    []string          `json:"args,omitempty"`
-	Env     map[string]string `json:"env,omitempty"`
+	// exec mode. WaitDelay (Go duration) bounds how long the helper's stdout
+	// may stay open after it exits — a grandchild holding the pipe, typically
+	// a cloud CLI that backgrounds a refresh. Reaching it FAILS the resolve
+	// rather than extending it, so a helper whose child legitimately holds the
+	// pipe longer than the default needs this raised; unset takes the default.
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	WaitDelay string            `json:"waitDelay,omitempty"`
 
 	// file mode. Path may contain {tenant}/{user}/{server}; TTL (Go
 	// duration) applies when the file carries no expiresAt.
@@ -412,6 +417,15 @@ func (a *Auth) validate(server string, allowPlaintext bool) error {
 	}
 	if a.TTL != "" {
 		if err := validateDuration(fmt.Sprintf("server %q: auth ttl", server), a.TTL); err != nil {
+			return err
+		}
+	}
+	if a.WaitDelay != "" {
+		if a.Mode != AuthExec {
+			return fmt.Errorf("server %q: auth mode %q does not take waitDelay (only %q does)",
+				server, a.Mode, AuthExec)
+		}
+		if err := validateDuration(fmt.Sprintf("server %q: auth waitDelay", server), a.WaitDelay); err != nil {
 			return err
 		}
 	}

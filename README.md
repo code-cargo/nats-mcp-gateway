@@ -407,7 +407,7 @@ credential, and per-user modes keep secrets out of the config entirely.
 | `static` (default) | shared | config `env`/`headers` — today's behavior |
 | `file` | shared, or per-user when `path` contains `{user}` | a mounted/rotated file (`path`; optional `ttl`, default 1m, applied when the file carries no `expiresAt`) |
 | `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`; optional `scope`, `audience`) |
-| `exec` | per-user, or shared with `"perUser": false` | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
+| `exec` | per-user, or shared with `"perUser": false` | a credential-helper command (`command`; optional `args`, `env` passthrough, `waitDelay`) — the universal adapter, below |
 | `oauth-token-exchange` | shared, or per-user when `subjectTokenFile` contains `{user}` | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |
 | `oauth-refresh` | shared, or per-user when `refreshTokenFile` contains `{user}` | refresh_token grant (`tokenUrl`, `clientId`, `refreshTokenFile`; a rotated refresh token is written back) |
 | `nats` | per-user, or shared with `"perUser": false` | request/reply to a controller (below; the subject prefix defaults to `{subjectPrefix}.cred` and `subject` overrides it) |
