@@ -600,7 +600,14 @@ Three ways to hot-reload from a new backend, cheapest first:
    ```
 3. **Implement `Source`** — for push systems (a Kubernetes informer, a webhook)
    that already know when config changed. Wrap it in `configsource.Dedup` to
-   suppress no-op emissions.
+   suppress no-op emissions. A source that suppresses them itself should also
+   implement `configsource.Retryable`: `Run` calls it when an apply fails, and
+   a source that ignores it will mistake the failed revision for one the
+   gateway is already running and swallow every redelivery of it. If the
+   source's trigger does not repeat on its own, `Retry` must also re-fire it —
+   the apply runs on `Run`'s goroutine, so a trigger can arrive and be
+   suppressed before `Retry` is ever called. `Watch` each source value once:
+   the baseline lives on the source, which is what makes `Retry` possible.
 
 `pkg/reconcile.Reconciler` is the source-agnostic engine that applies a config
 to the running wire + pool; `configsource.Run` is the consume loop that keeps

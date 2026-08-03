@@ -292,6 +292,48 @@ func TestEvictServer(t *testing.T) {
 	assert.NotEqual(t, a2, pidOf("a", "bravo"), "evicted server must respawn per tenant")
 }
 
+// EvictServerSince is reconcile.Apply's rollback eviction. A failed apply has to
+// drop backends built from the revision it is undoing, but only those: the
+// previous config is live again and its definition never changed, so anything
+// older is serving exactly what it should. The cutoff is what separates them.
+func TestEvictServerSince(t *testing.T) {
+	p := NewPool(PoolConfig{}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	pidOf := func(server, tenant string) float64 {
+		mux, release, err := p.Get(context.Background(), Key{Server: server, Tenant: tenant})
+		require.NoError(t, err)
+		defer release()
+		resp, err := mux.Call(context.Background(), callTool("i", "echo", `{}`, ""), nil)
+		require.NoError(t, err)
+		var r struct {
+			PID float64 `json:"pid"`
+		}
+		require.NoError(t, json.Unmarshal(resp.Result, &r))
+		return r.PID
+	}
+
+	before := pidOf("a", "acme")
+	other := pidOf("b", "acme")
+
+	// Everything after here stands in for the window in which a failed
+	// revision was briefly the live config.
+	windowStart := time.Now()
+	during := pidOf("a", "bravo")
+
+	p.EvictServerSince("a", windowStart)
+
+	assert.Equal(t, before, pidOf("a", "acme"),
+		"a backend older than the window came from the config that is live again")
+	assert.NotEqual(t, during, pidOf("a", "bravo"),
+		"a backend born in the window may have come from the rolled-back revision")
+	assert.Equal(t, other, pidOf("b", "acme"), "an unrelated server must be untouched")
+
+	// The zero cutoff means everything, which is how EvictServer is built on it.
+	p.EvictServerSince("a", time.Time{})
+	assert.NotEqual(t, before, pidOf("a", "acme"), "the zero cutoff must spare nothing")
+}
+
 func TestPoolTenantQuota(t *testing.T) {
 	p := NewPool(PoolConfig{MaxProcsPerTenant: 2}, poolFactory, nil)
 	t.Cleanup(p.Shutdown)

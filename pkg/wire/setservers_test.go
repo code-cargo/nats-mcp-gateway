@@ -114,6 +114,42 @@ func TestSetServersLeavesUnchangedInFlight(t *testing.T) {
 	assert.Contains(t, string(last.Body), `"ok":true`)
 }
 
+// A reconcile that fails partway must leave the CURRENT set serving. The
+// caller's response to the error is to keep the previous config live, and that
+// config still owns the servers this call was asked to drop — so dropping them
+// before the adds are known to succeed strands them: no gateway answers a
+// server the live config still lists.
+func TestSetServersFailedAddKeepsCurrentSetServing(t *testing.T) {
+	nc := runNATS(t, nil)
+	srv, err := Serve(nc, ServerConfig{Servers: []string{"alpha"}}, echoHandler)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+	c := client(t, nc, time.Second)
+	require.Equal(t, FrameEnd, terminal(t, c, "alpha").Kind)
+
+	// Swap alpha out for beta plus a name no endpoint can be built for: beta
+	// binds, then the bad name fails the reconcile.
+	require.Error(t, srv.SetServers([]string{"beta", "bad name"}))
+
+	assert.Equal(t, FrameEnd, terminal(t, c, "alpha").Kind,
+		"a failed reconcile must not stop a server the live config still owns")
+
+	f := terminal(t, c, "beta")
+	require.NotNil(t, f.Err)
+	assert.Equal(t, ErrCodeNoGateway, f.Err.Code,
+		"a server from the failed revision must not be left bound")
+
+	// The service map is consistent afterwards, so a later reconcile still
+	// reaches the state it asks for.
+	require.NoError(t, srv.SetServers([]string{"alpha", "beta"}))
+	assert.Equal(t, FrameEnd, terminal(t, c, "alpha").Kind)
+	assert.Equal(t, FrameEnd, terminal(t, c, "beta").Kind)
+}
+
 func TestServeEmptyThenPopulate(t *testing.T) {
 	nc := runNATS(t, nil)
 	srv, err := Serve(nc, ServerConfig{}, echoHandler) // no servers at boot

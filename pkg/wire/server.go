@@ -246,6 +246,19 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 // Existing services (unchanged servers) are left untouched, so their in-flight
 // requests are undisturbed. It is safe to call repeatedly while serving.
 //
+// A failure rolls back to the set it found, so the caller's "keep the previous
+// config live" (reconcile.Apply) is true of the wire too. That is why the adds
+// come FIRST — the servers this call would drop are still owned by the config
+// that stays live if an add fails, and a caller that had stopped them would be
+// advertising a config it no longer answers for. The rollback is best-effort in
+// the same way removal is: a service that will not stop is kept and reported,
+// never forgotten (see stopLocked).
+//
+// Both sets are briefly bound while the adds run. That is safe because a
+// service's subject carries its own {server} token, so no two of them overlap;
+// and across a fleet the queue group makes each request reach exactly one
+// gateway, however many of them are mid-reconcile.
+//
 // A stopped service stops answering its subject, so a subsequent request to a
 // removed server hits NATS no-responders and the client sees ErrCodeNoGateway.
 // Removal does NOT cancel in-flight handlers — only Shutdown does.
@@ -258,20 +271,14 @@ func (s *Server) SetServers(names []string) error {
 	s.svcMu.Lock()
 	defer s.svcMu.Unlock()
 
-	for name, svc := range s.svcs {
-		if _, ok := desired[name]; !ok {
-			_ = svc.Stop()
-			delete(s.svcs, name)
-		}
-	}
-
+	added := make([]string, 0, len(names))
 	for _, name := range names {
 		if _, ok := s.svcs[name]; ok {
 			continue
 		}
 		subject, err := EndpointSubject(s.prefix, s.tenant, s.user, name)
 		if err != nil {
-			return err
+			return errors.Join(err, s.stopLocked(added))
 		}
 		svc, err := micro.AddService(s.nc, micro.Config{
 			Name:    s.name + "-" + name,
@@ -283,11 +290,59 @@ func (s *Server) SetServers(names []string) error {
 			},
 		})
 		if err != nil {
-			return fmt.Errorf("wire: add service %q: %w", name, err)
+			return errors.Join(fmt.Errorf("wire: add service %q: %w", name, err), s.stopLocked(added))
 		}
 		s.svcs[name] = svc
+		added = append(added, name)
+	}
+
+	var stale []string
+	for name := range s.svcs {
+		if _, ok := desired[name]; !ok {
+			stale = append(stale, name)
+		}
+	}
+	// Logged, not returned: the desired set is bound by here, so failing on a
+	// removal would make the caller roll back an apply whose new servers are
+	// already serving. stopLocked keeps what it could not stop, so the entry
+	// stays in s.svcs and a later SetServers tries it again.
+	//
+	// "Later" is doing real work in that sentence: reconcile.Apply short-
+	// circuits an empty diff without calling here at all, so the next attempt
+	// comes with the next actual config change, which may be never. Until then
+	// the service keeps answering for a server the live config does not list —
+	// which is what the operator needs to be told, since nothing else will.
+	if err := s.stopLocked(stale); err != nil {
+		s.log.Warn("a removed server's service could not be stopped and is still bound; "+
+			"it will be retried on the next config change",
+			"err", err)
 	}
 	return nil
+}
+
+// stopLocked stops the named services and forgets the ones that stopped.
+// svcMu must be held.
+//
+// A service whose Stop fails is KEPT. Stop is what unsubscribes it, so on
+// failure it may still be answering, and dropping the handle would leave a
+// subscription bound to a name nothing tracks — unreachable by any later
+// reconcile, which is a worse end state than an entry that is stopped again
+// next time round. The joined error is what tells the caller its rollback was
+// partial; nothing here can make it whole.
+func (s *Server) stopLocked(names []string) error {
+	var errs []error
+	for _, name := range names {
+		svc, ok := s.svcs[name]
+		if !ok {
+			continue
+		}
+		if err := svc.Stop(); err != nil {
+			errs = append(errs, fmt.Errorf("stop service %q: %w", name, err))
+			continue
+		}
+		delete(s.svcs, name)
+	}
+	return errors.Join(errs...)
 }
 
 // stopAllServices stops every running micro service.

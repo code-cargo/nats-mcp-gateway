@@ -47,8 +47,33 @@ type Update struct {
 // closes the returned channel. The first Update is the initial config. A
 // source owns its own trigger (file poll, NATS event, ticker, …) and its own
 // goroutine lifecycle bound to ctx.
+//
+// Watch once per source value. The built-ins carry their change-detection
+// baseline on the source itself — that is what makes Retryable possible — so a
+// second Watch inherits it rather than starting fresh, and two concurrent
+// Watches would split revisions between them instead of each seeing all. Build
+// a new source for a new consumer.
 type Source interface {
 	Watch(ctx context.Context) <-chan Update
+}
+
+// Retryable is a Source that suppresses revisions it has already delivered and
+// can be told that one of them did not stick. Run calls Retry after a failed
+// apply, so the same content is delivered again on the source's next trigger
+// rather than being mistaken for a revision the gateway is already running.
+//
+// Implement it on any source that dedups; every built-in one does. A source
+// that emits everything it sees needs nothing here.
+//
+// Retry must also account for a trigger spent while the apply was failing: the
+// source is free to fire again the moment Run takes a revision off the channel,
+// so a trigger can arrive, find unchanged content, and be suppressed before
+// Retry is ever called. A source with a repeating trigger recovers on its next
+// tick. One without — File with polling off, where SIGHUP is the only trigger —
+// must re-fire itself, or the retry waits on an operator who has no way to know
+// their signal was eaten.
+type Retryable interface {
+	Retry()
 }
 
 // SourceFunc adapts a plain function to a Source.

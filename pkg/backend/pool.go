@@ -351,10 +351,31 @@ func (p *Pool) reap() {
 // client re-issues), and the next Get spawns a fresh backend from the new
 // definition.
 func (p *Pool) EvictServer(server string) {
+	p.evictServer(server, time.Time{})
+}
+
+// EvictServerSince is EvictServer restricted to connections spawned after t.
+//
+// It is for a revision that was rolled back, where the server's live definition
+// is the one it already had. Only a backend born inside the failed apply's
+// window could have been built from the revision being undone; an older one is
+// provably from the definition that is live again, and killing it would fail
+// in-flight calls that the rollback is supposed to leave alone.
+//
+// Circuit-breaker state is cleared for the whole server either way: it carries
+// no birth time to filter on, and clearing it only ever permits an earlier
+// respawn attempt.
+func (p *Pool) EvictServerSince(server string, t time.Time) {
+	p.evictServer(server, t)
+}
+
+// evictServer drops every connection for the server born after since. The zero
+// time matches everything, which is what EvictServer wants.
+func (p *Pool) evictServer(server string, since time.Time) {
 	p.mu.Lock()
 	var victims []*Mux
 	for k, e := range p.entries {
-		if k.Server == server {
+		if k.Server == server && e.born.After(since) {
 			victims = append(victims, e.mux)
 			delete(p.entries, k)
 		}
@@ -365,7 +386,7 @@ func (p *Pool) EvictServer(server string) {
 	// server with its old credentials.
 	kept := p.orphans[:0]
 	for _, e := range p.orphans {
-		if e.key.Server == server {
+		if e.key.Server == server && e.born.After(since) {
 			victims = append(victims, e.mux)
 		} else {
 			kept = append(kept, e)
