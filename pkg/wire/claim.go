@@ -51,6 +51,30 @@ const (
 	claimOpTimeout = 30 * time.Second
 )
 
+// DefaultClaimMaxAge and DefaultClaimMaxBytes are what a claim bucket gets for
+// a limit left unset. They live here, beside the code that substitutes them,
+// so a caller validating configuration cannot drift from the value that will
+// actually be in force — see FilledClaimLimits.
+const (
+	DefaultClaimMaxAge   = 5 * time.Minute
+	DefaultClaimMaxBytes = 1 << 30 // 1GiB
+)
+
+// FilledClaimLimits returns the bucket limits in force for the given pair,
+// substituting the default for anything unset. It is the claim-check analogue
+// of backend.PoolConfig.Filled, exported for the same reason: a caller
+// checking configuration has to compare against what the bucket will actually
+// get, not against the zero an operator left behind.
+func FilledClaimLimits(maxAge time.Duration, maxBytes int64) (time.Duration, int64) {
+	if maxAge <= 0 {
+		maxAge = DefaultClaimMaxAge
+	}
+	if maxBytes <= 0 {
+		maxBytes = DefaultClaimMaxBytes
+	}
+	return maxAge, maxBytes
+}
+
 // ObjectClaims implements ClaimStore on a JetStream Object Store: one
 // lazily-created bucket per tenant, TTL as the cleanup backstop (the client
 // deletes eagerly after a successful fetch, but a crashed client must not
@@ -61,9 +85,10 @@ const (
 type ObjectClaims struct {
 	// JS is the JetStream context (jetstream.New(nc)).
 	JS jetstream.JetStream
-	// MaxAge is the bucket TTL (default 5m). Gateway-side only.
+	// MaxAge is the bucket TTL (DefaultClaimMaxAge if unset). Gateway-side only.
 	MaxAge time.Duration
-	// MaxBytes caps each tenant bucket (default 1GiB). Gateway-side only.
+	// MaxBytes caps each tenant bucket (DefaultClaimMaxBytes if unset).
+	// Gateway-side only.
 	MaxBytes int64
 
 	mu      sync.Mutex
@@ -207,14 +232,7 @@ func (o *ObjectClaims) recreateBucket(ctx context.Context, tenant string) (jetst
 	if !TokenSafe(tenant) {
 		return nil, fmt.Errorf("wire: tenant %q is not token safe", tenant)
 	}
-	maxAge := o.MaxAge
-	if maxAge <= 0 {
-		maxAge = 5 * time.Minute
-	}
-	maxBytes := o.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = 1 << 30 // 1GiB
-	}
+	maxAge, maxBytes := FilledClaimLimits(o.MaxAge, o.MaxBytes)
 	obs, err := o.JS.CreateOrUpdateObjectStore(ctx, jetstream.ObjectStoreConfig{
 		Bucket:      claimBucketPrefix + tenant,
 		Description: "natsmcp claim-check overflow for tenant " + tenant,

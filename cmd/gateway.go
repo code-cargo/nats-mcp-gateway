@@ -445,12 +445,17 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 // Value.Parse, which marks the value Set either way, so on a bare
 // `gateway --config` every defaulted flag already reports Set. Only the VALUE
 // separates them. TestFileSourceGuardAgainstKongDefaults pins these to the
-// tags, so a changed default fails a test instead of every file-source boot.
+// tags, so a changed default fails a test instead of every file-source boot —
+// which is why that test also parses a document that ENABLES claim-check. The
+// sizing comparison is skipped when neither side asks for claim-check, so a
+// defaults-only document would leave wire's two claim limits unpinned.
+//
+// Each of these names the value the process substitutes for the unset setting,
+// not a second copy of it: defaulting belongs to the package that acts on the
+// setting (nats.go, wire, backend), so every config source inherits it.
 const (
 	defaultNatsURL       = nats.DefaultURL
 	defaultSubjectPrefix = wire.DefaultPrefix
-	defaultClaimMaxAge   = 5 * time.Minute
-	defaultClaimMaxBytes = 1 << 30
 )
 
 // checkFileSourceFlags rejects a fetch/inline-only setting that the file source
@@ -493,9 +498,16 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url)
 	check("nats-creds", "NATSMCP_NATS_CREDS", "nats.credsFile",
 		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile)
+	// Against the prefix the wire will actually bind, for the same reason the
+	// queue group and the pool are: wire.Serve owns this default, so a document
+	// that omits the field is not asking for the empty prefix.
+	effPrefix := boot.prefix
+	if effPrefix == "" {
+		effPrefix = wire.DefaultPrefix
+	}
 	check("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
-		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != boot.prefix,
-		c.SubjectPrefix, boot.prefix)
+		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != effPrefix,
+		c.SubjectPrefix, effPrefix)
 	check("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
 		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
 	// Compared against the group the wire will actually join, not against the
@@ -536,12 +548,24 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 	// whole, and naming only --claim-check would under-report what the
 	// operator asked for and is not getting.
 	if boot.claimCheck || c.ClaimCheck {
+		// Against the limits the bucket will actually get, the same way the
+		// pool is: wire.FilledClaimLimits substitutes a default for anything
+		// <= 0, so a document enabling claimCheck without sizing it is asking
+		// for 5m/1GiB, not for zero. When the DOCUMENT does not enable
+		// claim-check the sizing is compared and reported raw instead: there
+		// is no bucket, so nothing is in force to name, and the zero pairs
+		// with the claimCheck=false line already reporting that the whole
+		// feature is being dropped.
+		inDocAge, inDocBytes := boot.claimMaxAge, boot.claimMaxBytes
+		if boot.claimCheck {
+			inDocAge, inDocBytes = wire.FilledClaimLimits(boot.claimMaxAge, boot.claimMaxBytes)
+		}
 		check("claim-max-age", "NATSMCP_CLAIM_MAX_AGE", "claimCheck.maxAge",
-			c.ClaimMaxAge != 0 && c.ClaimMaxAge != defaultClaimMaxAge && c.ClaimMaxAge != boot.claimMaxAge,
-			c.ClaimMaxAge, boot.claimMaxAge)
+			c.ClaimMaxAge > 0 && c.ClaimMaxAge != wire.DefaultClaimMaxAge && c.ClaimMaxAge != inDocAge,
+			c.ClaimMaxAge, inDocAge)
 		check("claim-max-bytes", "NATSMCP_CLAIM_MAX_BYTES", "claimCheck.maxBytes",
-			c.ClaimMaxBytes != 0 && c.ClaimMaxBytes != defaultClaimMaxBytes && c.ClaimMaxBytes != boot.claimMaxBytes,
-			c.ClaimMaxBytes, boot.claimMaxBytes)
+			c.ClaimMaxBytes > 0 && c.ClaimMaxBytes != wire.DefaultClaimMaxBytes && c.ClaimMaxBytes != inDocBytes,
+			c.ClaimMaxBytes, inDocBytes)
 	}
 
 	if len(dropped) == 0 {

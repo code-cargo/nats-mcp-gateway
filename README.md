@@ -518,9 +518,20 @@ Note: only the **file** source reads connection settings (URL, prefix, queue
 group, inbox prefix, scope) from the document's `nats` block. The fetch and
 inline sources take those from flags/env — the document supplies only the
 server set. Passing one of those flags (or its `NATSMCP_*` env var) alongside
-`--config` is **rejected at boot** unless the document already carries that same
-value — the mirror of the inline source rejecting a `nats` block. A scope
+`--config` is **rejected at boot** unless it agrees with what the document puts
+in force — the mirror of the inline source rejecting a `nats` block. A scope
 injected as pod env is therefore never silently dropped, in either direction.
+
+Agreement is judged against the *effective* value, not the raw field, so
+pinning a flag to a default the document leaves unstated (the `mcpgw.{tenant}`
+queue group, the pool's `32`/`16`/`5m`/`1h`) changes nothing and boots. A flag
+still sitting at its own default is likewise not a conflict: `--nats-url`,
+`--subject-prefix`, `--claim-max-age` and `--claim-max-bytes` are the only
+settings with defaults, and `NATSMCP_NATS_URL` / `NATSMCP_SUBJECT_PREFIX` /
+`NATSMCP_INBOX_PREFIX` are shared with `shim` and `call`, so one exported value
+per deployment must not break a gateway it was never aimed at. The scope,
+credentials, inbox prefix and queue group have no defaults and so have no such
+exemption — the settings that matter for isolation are checked unconditionally.
 
 `--inbox-prefix` / `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`)
 sets the prefix for this process's own request/reply inboxes — the config
