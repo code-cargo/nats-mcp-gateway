@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1505,6 +1506,224 @@ func TestBuildBackendRefusesAPerUserServerKeyedWithoutAUser(t *testing.T) {
 	_, statErr := os.Stat(marker)
 	assert.True(t, os.IsNotExist(statErr),
 		"the resolver must not be asked for the placeholder identity at all")
+}
+
+// TestCredentialEnvCannotRedirectCodeExecution holds a credential resolver to
+// supplying credentials rather than code.
+//
+// The reply's env becomes the backend subprocess's whole environment, merged
+// last so it wins, so a loader or runtime startup variable in it is code
+// execution in the gateway pod at the gateway's uid. That promotes a
+// compromised cred controller (mode "nats") or whatever writes a mounted
+// credentials file (mode "file") from "supplies credentials" to "runs code
+// here" — and neither of those is the party that authored the config.
+func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
+	const secret = "tok-do-not-log"
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(context.Context, string, string, string) (*cred.Credentials, error) {
+			return &cred.Credentials{Env: map[string]string{
+				"GITHUB_TOKEN":          secret,
+				"LD_PRELOAD":            "/tmp/evil.so",
+				"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+				"PATH":                  "/tmp/evil/bin",
+				"HOME":                  "/tmp/evil",
+				"NODE_OPTIONS":          "--require /tmp/evil.js",
+				"PYTHONPATH":            "/tmp/evil",
+				"BASH_ENV":              "/tmp/evil.sh",
+				"PERL5OPT":              "-Mevil",
+				"BASH_FUNC_ls%%":        "() { evil; }",
+				"NOT=A KEY":             "x",
+			}}, nil
+		}), 0)
+	_, gen, err := resolver.ResolveGen(context.Background(), "acme", "u1", "github")
+	require.NoError(t, err)
+
+	// A modern server, so the backend is the StdioBackend itself rather than
+	// the legacy bridge wrapping it, and its env can be read directly.
+	srv := config.Server{
+		Protocol: mcpspec.ProtocolVersion, Command: "true",
+		// The config's own env is NOT filtered: a document that names the
+		// command already chooses what runs, and an operator tuning their own
+		// server's runtime must keep working.
+		Env:  map[string]string{"NODE_OPTIONS": "--max-old-space-size=4096", "AWS_REGION": "us-east-1"},
+		Auth: &config.Auth{Mode: config.AuthNATS},
+	}
+	b, err := buildBackend(
+		backend.Key{Server: "github", Tenant: "acme", CredSet: "u1", CredVersion: gen},
+		srv, resolver, log,
+	)
+	require.NoError(t, err)
+	sb, ok := b.(*backend.StdioBackend)
+	require.True(t, ok, "expected the stdio backend itself, got %T", b)
+
+	assert.Equal(t, secret, sb.Env["GITHUB_TOKEN"], "a credential must still reach the backend")
+	assert.Equal(t, "us-east-1", sb.Env["AWS_REGION"])
+	assert.Equal(t, "--max-old-space-size=4096", sb.Env["NODE_OPTIONS"],
+		"the resolver must not override what the config asked for, but the config's own value stands")
+	for _, key := range []string{
+		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME",
+		"PYTHONPATH", "BASH_ENV", "PERL5OPT", "BASH_FUNC_ls%%", "NOT=A KEY",
+	} {
+		assert.NotContains(t, sb.Env, key, "a resolver set %s on the backend subprocess", key)
+	}
+
+	out := buf.String()
+	assert.Contains(t, out, "LD_PRELOAD", "a refused key has to be named, or nobody can find the resolver that sent it")
+	assert.Contains(t, out, "NODE_OPTIONS")
+	assert.NotContains(t, out, secret, "the reply's values are credential material")
+	assert.NotContains(t, out, "/tmp/evil.so", "a refused value is as secret as an accepted one")
+}
+
+// TestBuildBackendRefusesThePlaceholderIdentity is the same refusal reached
+// through the other spelling of "no identity".
+//
+// The proxy leaves CredSet empty for a shared server, so the empty string is
+// what arrives today — but "_" is what the rest of the gateway calls an
+// unattributed caller, and a credential-identity boundary should not depend on
+// which of the two a caller happened to construct.
+func TestBuildBackendRefusesThePlaceholderIdentity(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "helper-ran")
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\ntouch \"$MARKER\"\necho '{\"headers\":{\"a\":\"b\"}}'\n"), 0o755))
+
+	resolver := cred.Cached(&cred.Exec{
+		Command: helper, Env: map[string]string{"MARKER": marker}, Timeout: 10 * time.Second,
+	}, 0)
+	srv := config.Server{
+		Transport: "stdio", Command: "true",
+		Auth: &config.Auth{Mode: config.AuthExec, Command: helper},
+	}
+	require.True(t, srv.Auth.PerUser(), "fixture must be a per-user server")
+
+	_, err := buildBackend(
+		backend.Key{Server: "aws", Tenant: "acme", CredSet: wire.UserUnattributed},
+		srv, resolver, testLogger(),
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, cred.ErrIdentityRequired)
+	_, statErr := os.Stat(marker)
+	assert.True(t, os.IsNotExist(statErr),
+		"the resolver must not be asked for the placeholder identity at all")
+}
+
+// TestBuildBackendCredentialFailureCarriesTheCredentialCode holds the
+// factory's resolve failure to the same wire code as the request path's.
+//
+// A bare error from here is the pool's error, which the proxy reports as
+// -32010 — "the stream broke, re-issue" (pkg/wire/frame.go) — so
+// CallerMessage's "do not retry" ended up inside the one code that promises
+// retrying helps, and a client switching on the code retry-loops a permanent
+// refusal. Reachable whenever the proxy's resolve hits the cache and this one
+// misses it: a TTL boundary, or a concurrent 401 Invalidate.
+func TestBuildBackendCredentialFailureCarriesTheCredentialCode(t *testing.T) {
+	const secret = "sts assume-role arn:aws:iam::918273:role/prod failed (token AKIAWOULDBEBAD)"
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755))
+
+	shared := false
+	srv := config.Server{
+		Transport: "stdio", Command: "true",
+		Auth: &config.Auth{Mode: config.AuthExec, Command: helper, PerUserOverride: &shared},
+	}
+	resolver := cred.Cached(&cred.Exec{Command: helper, Timeout: 10 * time.Second}, 0)
+
+	_, err := buildBackend(backend.Key{Server: "github", Tenant: "acme"}, srv, resolver, testLogger())
+	require.Error(t, err)
+
+	var credErr *proxy.CredentialError
+	require.ErrorAs(t, err, &credErr,
+		"the proxy maps this to -32014 by the type, not by reading the message")
+	assert.Contains(t, err.Error(), "acme/github")
+	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD", "the helper's stderr reached the caller")
+}
+
+// TestWarnPerUserGrainNamesTheServersOnce covers the boot diagnostic for the
+// grain that fails closed.
+//
+// A per-user server refuses every unattributed caller with -32014, and a
+// deployment without per-user NATS auth sends the documented "_" on every
+// request — so the whole server set can be unreachable with a valid config, a
+// clean boot log and no clue which servers are involved. It repeats only when
+// the set changes: the fetch source re-applies on every poll tick, and a
+// warning that re-fires forever is one operators filter out.
+func TestWarnPerUserGrainNamesTheServersOnce(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	parse := func(doc string) *config.Config {
+		t.Helper()
+		cfg, err := config.Parse([]byte(doc))
+		require.NoError(t, err)
+		return cfg
+	}
+
+	cfg := parse(`{"servers":{
+		"helper":{"command":"x","auth":{"mode":"exec","command":"/h"}},
+		"tenantwide":{"command":"x","auth":{"mode":"exec","command":"/h","perUser":false}},
+		"plain":{"command":"x"}}}`)
+
+	reported := warnPerUserGrain(log, cfg, "")
+	out := buf.String()
+	assert.Contains(t, out, "helper", "the operator has to learn WHICH servers refuse an unattributed caller")
+	assert.NotContains(t, out, "tenantwide", "an opted-out server serves every caller in the tenant")
+	assert.NotContains(t, out, "plain")
+	assert.Contains(t, out, "-32014", "the line has to be findable from the error a user reports")
+
+	buf.Reset()
+	assert.Equal(t, reported, warnPerUserGrain(log, cfg, reported))
+	assert.Empty(t, buf.String(), "an unchanged set must not re-warn on every poll tick")
+
+	// A reload that adds one warns again, naming the new set.
+	buf.Reset()
+	next := parse(`{"servers":{
+		"helper":{"command":"x","auth":{"mode":"exec","command":"/h"}},
+		"tokens":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/t/{user}"}}}}`)
+	warnPerUserGrain(log, next, reported)
+	assert.Contains(t, buf.String(), "tokens")
+
+	// Nothing to say when no server asks for it.
+	buf.Reset()
+	assert.Empty(t, warnPerUserGrain(log, parse(`{"servers":{"plain":{"command":"x"}}}`), ""))
+	assert.Empty(t, buf.String())
+}
+
+// TestBootParamsRejectsNegativeDurationFlags mirrors config.validate()'s
+// rejection onto the flag path.
+//
+// These flags are the fetch source's ONLY route to pool and claim sizing — its
+// document arrives after the pool is built — and every consumer substitutes
+// its own default for anything <= 0. So "-30m" is not a shorter TTL: it is the
+// default, silently, with nothing logged for the operator who asked for
+// something else.
+func TestBootParamsRejectsNegativeDurationFlags(t *testing.T) {
+	for _, tt := range []struct {
+		flag string
+		cmd  GatewayCmd
+	}{
+		{"--pool-idle-ttl", GatewayCmd{ConfigSubject: "cfg", PoolIdleTTL: -30 * time.Minute}},
+		{"--pool-max-lifetime", GatewayCmd{ConfigSubject: "cfg", PoolMaxLifetime: -time.Hour}},
+		{"--claim-max-age", GatewayCmd{ConfigSubject: "cfg", ClaimMaxAge: -time.Second}},
+		{"--claim-max-bytes", GatewayCmd{ConfigSubject: "cfg", ClaimMaxBytes: -1}},
+	} {
+		t.Run(tt.flag, func(t *testing.T) {
+			_, err := tt.cmd.bootParams(sourceFetch)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.flag)
+			assert.Contains(t, err.Error(), "negative")
+		})
+	}
+
+	// Zero stays legal on every one of them: it is the "use the default"
+	// sentinel each flag's help text advertises.
+	_, err := (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
+	require.NoError(t, err)
 }
 
 // TestTokenSourceDoesNotEchoTheResolverDetail covers the third resolve site,

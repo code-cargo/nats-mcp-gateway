@@ -29,6 +29,7 @@ package config
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -146,16 +147,18 @@ type Server struct {
 	Auth *Auth `json:"auth"`
 }
 
-// Auth mode names. Modes marked per-user resolve a distinct credential per
-// caller; the rest resolve one credential shared by the server's callers.
+// Auth mode names. Whether a mode resolves a distinct credential per caller or
+// one shared by the server's callers is Auth.PerUser's answer, not the mode's:
+// the file-reading modes take it from a {user} placeholder in the path they
+// read, and exec and nats default to per-user and take an explicit "perUser".
 const (
 	AuthStatic                 = "static"                   // config env/headers (default)
-	AuthExec                   = "exec"                     // per-user: credential-helper command
+	AuthExec                   = "exec"                     // credential-helper command
 	AuthFile                   = "file"                     // mounted/rotated credentials file
 	AuthOAuthClientCredentials = "oauth-client-credentials" // RFC 6749 service identity
-	AuthOAuthTokenExchange     = "oauth-token-exchange"     // per-user: RFC 8693
-	AuthOAuthRefresh           = "oauth-refresh"            // per-user: refresh_token grant
-	AuthNATS                   = "nats"                     // per-user: controller over request/reply
+	AuthOAuthTokenExchange     = "oauth-token-exchange"     // RFC 8693
+	AuthOAuthRefresh           = "oauth-refresh"            // refresh_token grant
+	AuthNATS                   = "nats"                     // controller over request/reply
 )
 
 // Auth configures a server's credential resolution (pkg/backend/cred). Only
@@ -188,6 +191,20 @@ type Auth struct {
 	// subject prefix ("{subjectPrefix}.cred"), so one configured prefix
 	// governs both the wire and the cred exchange.
 	Subject string `json:"subject,omitempty"`
+
+	// PerUserOverride declares the credential grain for the two modes that
+	// cannot derive one: exec and nats hand the resolver (tenant, user,
+	// server) and let it answer, so nothing in this document says whether what
+	// comes back is one credential per caller or one per tenant. The default
+	// stays per-user (fail closed); "perUser": false is how a tenant-level
+	// helper or controller says otherwise.
+	//
+	// Without it, a deployment with no per-user NATS auth — where every caller
+	// sends the documented "_" token — takes -32014 on every request to that
+	// server, and the remedy the refusal names (stand up per-user NATS auth) is
+	// not one a shared-credential deployment can reach. Rejected on the other
+	// modes, which read their grain off a {user}-templated path.
+	PerUserOverride *bool `json:"perUser,omitempty"`
 }
 
 // Dynamic reports whether credentials come from a resolver rather than the
@@ -198,12 +215,27 @@ func (a *Auth) Dynamic() bool {
 
 // PerUser reports whether resolved credentials differ per caller — these
 // servers are pooled per user, the rest stay shared per tenant.
+//
+// The grain is derived from the document wherever the document can answer it:
+// the three file-reading modes select their credential with a {user}
+// placeholder, so a path without one is a provably shared credential (a
+// projected service-account token, a fixed refresh token) and pooling it per
+// user would multiply processes over one file. Claiming per-user there also
+// costs the deployment everything: the proxy refuses an unattributed caller on
+// a per-user server, so a shared credential mislabelled per-user answers
+// -32014 to every request a deployment without per-user NATS auth can make.
+//
+// exec and nats cannot be read off the document — the resolver decides — so
+// they default to per-user and take PerUserOverride.
 func (a *Auth) PerUser() bool {
 	if a == nil {
 		return false
 	}
+	if a.PerUserOverride != nil {
+		return *a.PerUserOverride
+	}
 	switch a.Mode {
-	case AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh:
+	case AuthExec, AuthNATS:
 		return true
 	case AuthFile:
 		// A {user}-templated path is per-user by construction; without it
@@ -211,6 +243,16 @@ func (a *Auth) PerUser() bool {
 		// the grain truthful — a fixed shared grain here would silently
 		// resolve every caller's file as user "_".
 		return strings.Contains(a.Path, "{user}")
+	case AuthOAuthTokenExchange:
+		// The subject token IS the caller's identity assertion, and
+		// cred.OAuthTokenExchange expands the same placeholders as the file
+		// mode when it reads the file. One fixed file therefore exchanges one
+		// assertion for every caller.
+		return strings.Contains(a.SubjectTokenFile, "{user}")
+	case AuthOAuthRefresh:
+		// Likewise through cred.FileTokenStore, which both reads and rotates
+		// the token at the expanded path.
+		return strings.Contains(a.RefreshTokenFile, "{user}")
 	}
 	return false
 }
@@ -223,10 +265,17 @@ func (a *Auth) PerUser() bool {
 // An unparseable or non-http(s) URL is rejected here too: net/http is the only
 // thing that ever dials these, so anything else is a config error that would
 // otherwise surface as a failed request much later.
+//
+// Every rejection names the URL through redactURL. These messages travel much
+// further than a boot failure — Parse re-validates on every reload, and
+// pkg/configsource logs the error it keeps rejecting on each poll tick — so a
+// document carrying a secret in its userinfo or query string would re-emit it
+// for as long as it stayed broken.
 func requireHTTPS(server, field, raw string, allowPlaintext bool) error {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return fmt.Errorf("server %q: %s %q is not a valid URL: %w", server, field, raw, err)
+		return fmt.Errorf("server %q: %s %q is not a valid URL: %w",
+			server, field, redactURL(raw), parseReason(err))
 	}
 	switch u.Scheme {
 	case "https":
@@ -237,11 +286,66 @@ func requireHTTPS(server, field, raw string, allowPlaintext bool) error {
 		}
 		return fmt.Errorf(
 			"server %q: %s %q sends credentials in cleartext; use https, or set allowPlaintext if something outside the gateway encrypts this hop (a service mesh sidecar, a tunnel)",
-			server, field, raw,
+			server, field, redactURL(raw),
 		)
 	default:
-		return fmt.Errorf("server %q: %s %q must be https (or http to loopback)", server, field, raw)
+		return fmt.Errorf("server %q: %s %q must be https (or http to loopback)", server, field, redactURL(raw))
 	}
+}
+
+// redacted is spelled the way net/url.URL.Redacted spells it, so it reads as a
+// redaction rather than as somebody's actual password.
+const redacted = "xxxxx"
+
+// redactURL renders a URL for an error message with its credential-bearing
+// parts gone. Scheme, host and path survive, which is what identifies the
+// server being rejected; userinfo and query string do not, because that is
+// where a secret gets expanded into.
+//
+// u.Redacted() is not enough on either half: it masks a userinfo PASSWORD and
+// leaves a colon-less userinfo — the shape a bare token takes — verbatim, and
+// it never touches the query, which is where an api_key rides.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		// Unparseable is when a secret is most likely to be in there (an
+		// unescaped byte in a password is the usual cause) and nothing here can
+		// locate its parts, so keep the scheme and drop the rest.
+		if scheme, _, ok := strings.Cut(raw, "://"); ok && scheme != "" {
+			return scheme + "://" + redacted
+		}
+		return redacted
+	}
+	if u.User != nil {
+		if _, hasPass := u.User.Password(); hasPass {
+			// The username stays: "connecting as the wrong identity" is a
+			// diagnosis this line can deliver, and it is never the secret when
+			// a password sits beside it.
+			u.User = url.UserPassword(u.User.Username(), redacted)
+		} else {
+			u.User = url.User(redacted)
+		}
+	}
+	if u.RawQuery != "" {
+		// Whole, not per parameter: which key held the secret is not worth the
+		// second parse, and a query this gateway never reads has nothing else
+		// to say about which backend was rejected.
+		u.RawQuery = redacted
+	}
+	return u.String()
+}
+
+// parseReason unwraps a *url.Error to the reason it carries. Its own Error()
+// quotes the string it could not parse, and a password malformed enough to
+// break parsing is the likeliest kind to be mistyped — %w on it would put the
+// credential straight back beside the copy redactURL just removed. What
+// survives is bounded: an escape error quotes the two offending bytes.
+func parseReason(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		return uerr.Err
+	}
+	return err
 }
 
 // isLoopbackHost reports whether a URL host can only reach this machine.
@@ -290,6 +394,21 @@ func (a *Auth) validate(server string, allowPlaintext bool) error {
 		}
 	default:
 		return fmt.Errorf("server %q: unknown auth mode %q", server, a.Mode)
+	}
+	// Rejected rather than ignored, for the same reason cacheScope is: every
+	// other mode derives its grain from whether the path it reads carries
+	// {user}, so honoring an override that contradicts the path would pool per
+	// user against one shared file — and silently ignoring it would leave an
+	// operator believing they had shared a credential the gateway is still
+	// resolving per caller.
+	if a.PerUserOverride != nil {
+		switch a.Mode {
+		case AuthExec, AuthNATS:
+		default:
+			return fmt.Errorf(
+				"server %q: auth mode %q does not take perUser (only %q and %q do); the rest are per-user exactly when the path they read contains {user}",
+				server, a.Mode, AuthExec, AuthNATS)
+		}
 	}
 	if a.TTL != "" {
 		if err := validateDuration(fmt.Sprintf("server %q: auth ttl", server), a.TTL); err != nil {
@@ -442,11 +561,13 @@ func (c *Config) validate() error {
 			return err
 		}
 	}
-	// The wire prefix fronts every subscription this gateway binds, and it is
-	// the one setting nothing downstream re-checks: micro accepts "*" in an
-	// endpoint subject and NATS binds it, so an unvalidated "mcp.*" widens the
-	// authz-bearing subscription to every prefix in the account and never
-	// fails.
+	// The wire prefix fronts every subscription this gateway binds, and
+	// nothing below this layer objects to a wildcard in it: micro accepts "*"
+	// in an endpoint subject and NATS binds it, so an unvalidated "mcp.*"
+	// widens the authz-bearing subscription to every prefix in the account.
+	// wire.Serve makes the same check as the one place every config source
+	// reaches; this is what names the config field and fails before the
+	// connection is opened.
 	if c.NATS.SubjectPrefix != "" {
 		if err := wire.ValidateSubjectPrefix(c.NATS.SubjectPrefix); err != nil {
 			return fmt.Errorf("nats.subjectPrefix: %w", err)
@@ -460,11 +581,6 @@ func (c *Config) validate() error {
 	if c.NATS.InboxPrefix != "" {
 		if err := wire.ValidateSubjectPrefix(c.NATS.InboxPrefix); err != nil {
 			return fmt.Errorf("nats.inboxPrefix: %w", err)
-		}
-	}
-	if c.NATS.SubjectPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.NATS.SubjectPrefix); err != nil {
-			return fmt.Errorf("nats.subjectPrefix: %w", err)
 		}
 	}
 	if c.NATS.Tenant == "" && c.NATS.User != "" {

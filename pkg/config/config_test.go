@@ -222,6 +222,65 @@ func TestPlaintextURLsRejected(t *testing.T) {
 	}
 }
 
+// TestRejectedURLsAreRedacted keeps the credential out of the rejection.
+//
+// A URL that fails this check is the one most likely to be carrying a secret
+// in the clear, and the message naming it does not stop at the operator's
+// terminal: Parse re-validates on every reload, and pkg/configsource logs the
+// error it keeps rejecting on every poll tick, so a bad document re-emits the
+// secret for as long as it persists. Both halves of a URL carry one — the
+// userinfo password and the query string an api_key is expanded into — and the
+// unparseable case carries it through url.Error, which quotes the string it
+// could not parse.
+func TestRejectedURLsAreRedacted(t *testing.T) {
+	const (
+		pass  = "hunter2correcthorse"
+		query = "SECRET123apikey"
+	)
+	for _, tt := range []struct {
+		name, raw, wantIn string
+	}{
+		{
+			"cleartext backend url",
+			`{"servers":{"s":{"transport":"http","url":"http://svcacct:` + pass + `@internal.example.com/mcp?api_key=` + query + `"}}}`,
+			"internal.example.com",
+		},
+		{
+			"cleartext token url",
+			`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-refresh","tokenUrl":"http://svcacct:` + pass + `@idp.example.com/t?api_key=` + query + `","clientId":"c","refreshTokenFile":"/rt"}}}}`,
+			"idp.example.com",
+		},
+		{
+			"scheme net/http cannot speak",
+			`{"servers":{"s":{"transport":"http","url":"ftp://svcacct:` + pass + `@files.example.com/mcp?api_key=` + query + `"}}}`,
+			"files.example.com",
+		},
+		{
+			// url.Parse fails here, and its *url.Error prints the raw string —
+			// a password malformed enough to break parsing being exactly the
+			// kind that gets mistyped.
+			"unparseable",
+			`{"servers":{"s":{"transport":"http","url":"https://svcacct:` + pass + `@example.com:not-a-port/mcp?api_key=` + query + `"}}}`,
+			"is not a valid URL",
+		},
+		{
+			// A colon-less userinfo is the shape a bare token takes, and
+			// url.URL.Redacted leaves it verbatim.
+			"token in userinfo",
+			`{"servers":{"s":{"transport":"http","url":"http://` + pass + `@internal.example.com/mcp"}}}`,
+			"internal.example.com",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.raw))
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), pass, "the credential reached the rejection")
+			assert.NotContains(t, err.Error(), query, "a query-string secret reached the rejection")
+			assert.Contains(t, err.Error(), tt.wantIn, "the rejection must still say which URL it refused")
+		})
+	}
+}
+
 // The opt-out exists for the deployment where the gateway legitimately speaks
 // plaintext and something outside its view encrypts: a service mesh sidecar
 // intercepting the pod's traffic, an SSH tunnel. Without it, hardening the
@@ -250,7 +309,10 @@ func TestAllowPlaintextOptsOutPerServer(t *testing.T) {
 }
 
 func TestAuthGrain(t *testing.T) {
-	perUser := []string{AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh}
+	// exec and nats hand the resolver (tenant, user, server) and let it
+	// answer, so nothing in the document decides this: they default per-user,
+	// which is the fail-closed reading.
+	perUser := []string{AuthExec, AuthNATS}
 	for _, mode := range perUser {
 		a := &Auth{Mode: mode}
 		assert.True(t, a.PerUser(), mode)
@@ -271,6 +333,70 @@ func TestAuthGrain(t *testing.T) {
 	var nilAuth *Auth
 	assert.False(t, nilAuth.Dynamic())
 	assert.False(t, nilAuth.PerUser())
+}
+
+// TestOAuthFileGrainFollowsTheTokenPath extends the file mode's rule to the two
+// oauth modes that select their input the same way.
+//
+// Both read a file per resolve through the same {tenant}/{user}/{server}
+// expansion (cred.OAuthTokenExchange's subject token, cred.FileTokenStore's
+// refresh token), so a path without {user} hands every caller the same
+// assertion and the exchange returns one credential for the whole tenant.
+// Calling that per-user is not a mislabel an operator can live with: the proxy
+// refuses an unattributed caller on a per-user server, and a deployment
+// without per-user NATS auth sends the documented "_" on every request — so a
+// projected service-account token or a fixed refreshTokenFile, both provably
+// shared, answered -32014 to every request with no way to opt out.
+func TestOAuthFileGrainFollowsTheTokenPath(t *testing.T) {
+	assert.True(t, (&Auth{Mode: AuthOAuthTokenExchange, SubjectTokenFile: "/run/tok/{user}.jwt"}).PerUser())
+	assert.False(t, (&Auth{Mode: AuthOAuthTokenExchange, SubjectTokenFile: "/var/run/secrets/sa/token"}).PerUser())
+	assert.True(t, (&Auth{Mode: AuthOAuthRefresh, RefreshTokenFile: "/rt/{tenant}/{user}"}).PerUser())
+	assert.False(t, (&Auth{Mode: AuthOAuthRefresh, RefreshTokenFile: "/rt/shared"}).PerUser())
+
+	// Through a document, because the grain has to survive the parse that
+	// deployments actually go through.
+	cfg, err := Parse([]byte(`{"servers":{
+		"shared":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/var/run/secrets/sa/token"}},
+		"peruser":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/run/tok/{user}.jwt"}}}}`))
+	require.NoError(t, err)
+	assert.False(t, cfg.Servers["shared"].Auth.PerUser())
+	assert.True(t, cfg.Servers["peruser"].Auth.PerUser())
+}
+
+// TestPerUserOptOut covers the escape hatch for the two modes that cannot
+// derive their grain.
+//
+// The README's tier-2 recipe is an exec helper handed NATSMCP_CRED_TENANT and
+// NATSMCP_CRED_SERVER that legitimately ignores the user, and a `nats`
+// controller may answer per tenant just as legitimately. Both were per-user
+// unconditionally, which under a deployment with no per-user NATS auth is a
+// total outage — every request refused with -32014, naming a remedy that
+// deployment cannot reach.
+func TestPerUserOptOut(t *testing.T) {
+	cfg, err := Parse([]byte(`{"servers":{
+		"tenantwide":{"command":"x","auth":{"mode":"exec","command":"/opt/creds.sh","perUser":false}},
+		"controller":{"command":"x","auth":{"mode":"nats","perUser":false}},
+		"default":{"command":"x","auth":{"mode":"exec","command":"/opt/creds.sh"}},
+		"explicit":{"command":"x","auth":{"mode":"exec","command":"/opt/creds.sh","perUser":true}}}}`))
+	require.NoError(t, err)
+	assert.False(t, cfg.Servers["tenantwide"].Auth.PerUser(), "an opted-out exec helper must resolve one credential per tenant")
+	assert.False(t, cfg.Servers["controller"].Auth.PerUser())
+	assert.True(t, cfg.Servers["default"].Auth.PerUser(), "the default stays fail-closed")
+	assert.True(t, cfg.Servers["explicit"].Auth.PerUser())
+
+	// Rejected on the modes that DO derive it, rather than silently ignored:
+	// honoring an override against a shared path would pool per user over one
+	// file, and dropping it quietly would leave an operator believing they had
+	// shared a credential the gateway still resolves per caller.
+	for _, raw := range []string{
+		`{"servers":{"s":{"command":"x","auth":{"mode":"file","path":"/creds/shared.json","perUser":true}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/t","perUser":false}}}}`,
+		`{"servers":{"s":{"command":"x","auth":{"mode":"static","perUser":false}}}}`,
+	} {
+		_, err := Parse([]byte(raw))
+		require.Error(t, err, raw)
+		assert.Contains(t, err.Error(), "does not take perUser")
+	}
 }
 
 func TestNATSScopingValidation(t *testing.T) {

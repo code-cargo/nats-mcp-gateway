@@ -32,6 +32,20 @@ import (
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
 
+// CredentialError marks a pool-path failure that is really a credential
+// failure. The pool's factory sits below the layer that owns wire error codes,
+// so everything it returns otherwise reaches the caller as ErrCodeStreamLost —
+// documented at pkg/wire/frame.go as "the stream broke, re-issue", which a
+// client switching on the code will do forever against a refusal that never
+// clears.
+//
+// Message is what the caller is told and nothing more: the factory renders it
+// with cred.CallerMessage, so it carries the category and a correlation ref
+// while the resolver's own text stays in the gateway's log.
+type CredentialError struct{ Message string }
+
+func (e *CredentialError) Error() string { return e.Message }
+
 // CredLookup returns the credential resolver for a server (nil when its
 // credentials are static — the config env/headers path needs no resolution
 // here) and whether they are per-user. Per-user servers are pooled per
@@ -179,7 +193,26 @@ func (p *Proxy) Handler() wire.Handler {
 				return fail(wire.ErrCodeCredentialUnavailable,
 					"backend credentials temporarily unavailable, retry later: "+err.Error(), nil)
 			}
-			return fail(wire.ErrCodeStreamLost, err.Error(), nil)
+			var credErr *CredentialError
+			if errors.As(err, &credErr) {
+				// The factory's resolve failed — the same failure the request
+				// path above answers, arriving one layer down because that
+				// resolve hit the cache and this one missed it (a TTL boundary,
+				// a concurrent 401 Invalidate). The factory has already logged
+				// the detail against the ref its message carries.
+				return fail(wire.ErrCodeCredentialUnavailable, credErr.Message, nil)
+			}
+			// Everything else the pool can fail with: the factory's own errors
+			// (which name the backend's executable and argv, a gateway-pod temp
+			// path, or a server this instance does not serve) and the pool's
+			// limits. None of that is the caller's, so it goes to the log under
+			// a ref and the caller gets the category — which is all -32010
+			// means to it anyway. cred mints the ref for every site that needs
+			// one: an operator holding a screenshot greps for one shape.
+			ref := cred.FailureRef()
+			reqLog.Warn("backend unavailable", "err", err, "ref", ref)
+			return fail(wire.ErrCodeStreamLost,
+				"backend unavailable, re-issue the request (gateway ref "+ref+")", nil)
 		}
 		defer release()
 
@@ -217,7 +250,13 @@ func (p *Proxy) Handler() wire.Handler {
 			return fail(wire.ErrCodeStreamLost,
 				"backend connection lost mid-request, re-issue the request", nil)
 		default:
-			return fail(wire.ErrCodeStreamLost, err.Error(), nil)
+			// As above: a mux failure carries the transport's own words (a
+			// broken pipe names the pipe, an HTTP write names the endpoint),
+			// and the caller acts on the code, not on them.
+			ref := cred.FailureRef()
+			reqLog.Warn("backend call failed", "err", err, "ref", ref)
+			return fail(wire.ErrCodeStreamLost,
+				"backend call failed, re-issue the request (gateway ref "+ref+")", nil)
 		}
 	}
 }

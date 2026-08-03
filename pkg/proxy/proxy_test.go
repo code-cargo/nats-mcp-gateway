@@ -17,6 +17,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -337,6 +338,134 @@ func TestFactoryIdentityRefusalIsACredentialFailure(t *testing.T) {
 		"a credential-grain refusal reported as a lost stream")
 	assert.Contains(t, m.Error.Message, "retry later",
 		"unlike the request-path refusal, this one clears once the reload lands")
+}
+
+// TestFactoryCredentialFailureIsACredentialFailure is the identity refusal's
+// sibling: the factory's RESOLVE failing, rather than its grain check.
+//
+// The proxy resolves for the pool key and the factory resolves again to build
+// the backend, so the second can miss a cache the first hit — a TTL boundary,
+// a concurrent 401 Invalidate — and fail where the request path succeeded.
+// That failure used to arrive as -32010, "the stream broke, re-issue", with
+// cred.CallerMessage's "do not retry" sitting inside it: a client switching on
+// the code (which is what codes are for) retry-loops a permanent refusal.
+func TestFactoryCredentialFailureIsACredentialFailure(t *testing.T) {
+	const detail = "helper stderr: sts assume-role failed (token AKIAWOULDBEBAD)"
+	_, wc := stackFactory(t, nil, nil, func(key backend.Key) (backend.Backend, error) {
+		ref := cred.FailureRef()
+		return nil, &CredentialError{Message: fmt.Sprintf("%s/%s: %s", key.Tenant, key.Server,
+			cred.CallerMessage(cred.Terminal(errors.New(detail)), ref))}
+	})
+
+	frames := doCollect(t, wc, mcpRequest("1", "tools/list", nil))
+	require.NotEmpty(t, frames)
+	last := frames[len(frames)-1]
+	require.Equal(t, wire.FrameErr, last.Kind)
+	m := decodeMsg(t, last.Body)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, wire.ErrCodeCredentialUnavailable, m.Error.Code,
+		"a terminal credential refusal reported as a lost stream")
+	assert.Contains(t, m.Error.Message, "do not retry")
+	assert.NotContains(t, m.Error.Message, "AKIAWOULDBEBAD",
+		"the resolver's error text must not travel to the caller")
+}
+
+// TestPoolFailureDetailStaysInTheGatewayLog covers the first of the two sites
+// that handed the pool's error to the caller verbatim.
+//
+// Everything the factory can fail with ends up here, and it is all
+// gateway-internal: the MCP server's executable path and argv, a gateway-pod
+// temp path, the name of a server this instance does not serve. The caller
+// acts on the code, so it gets the category and a ref; the detail goes to the
+// log the ref points at.
+func TestPoolFailureDetailStaysInTheGatewayLog(t *testing.T) {
+	const detail = `spawn: exec "/opt/acme/bin/mcp-github" --token AKIAWOULDBEBAD: no such file or directory`
+	log, records := newLogSink()
+	_, wc := stackFactory(t, nil, log, func(backend.Key) (backend.Backend, error) {
+		return nil, errors.New(detail)
+	})
+
+	frames := doCollect(t, wc, mcpRequest("1", "tools/list", nil))
+	require.NotEmpty(t, frames)
+	last := frames[len(frames)-1]
+	require.Equal(t, wire.FrameErr, last.Kind)
+	m := decodeMsg(t, last.Body)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, wire.ErrCodeStreamLost, m.Error.Code)
+	assert.NotContains(t, m.Error.Message, "/opt/acme/bin", "a backend path reached the caller")
+	assert.NotContains(t, m.Error.Message, "AKIAWOULDBEBAD", "a backend argv reached the caller")
+	assert.Contains(t, m.Error.Message, "re-issue", "-32010 still means the request can be retried")
+
+	line := waitLine(t, records, "backend unavailable", mcpspec.MethodToolsList)
+	assert.Contains(t, fmt.Sprint(line["err"]), "AKIAWOULDBEBAD",
+		"suppressed for the caller, not for the operator")
+	ref, _ := line["ref"].(string)
+	require.NotEmpty(t, ref, "the log line needs the ref the caller was given")
+	assert.Contains(t, m.Error.Message, ref, "the caller's ref must find the log line")
+}
+
+// writeFailBackend connects, then fails every write — a broken pipe to a
+// subprocess that is still running, which is the shape Mux.Call reports as
+// something other than ErrConnDead.
+type writeFailBackend struct{ detail string }
+
+func (b *writeFailBackend) Connect(context.Context) (backend.Conn, error) {
+	return &writeFailConn{detail: b.detail, closed: make(chan struct{})}, nil
+}
+
+type writeFailConn struct {
+	detail string
+	closed chan struct{}
+	once   sync.Once
+}
+
+// Read blocks until Close, so the mux's read loop does not declare the
+// connection dead before the write is attempted.
+func (c *writeFailConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
+	select {
+	case <-c.closed:
+		return nil, errors.New("connection closed")
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (c *writeFailConn) Write(context.Context, *jsonrpc.Message) error {
+	return errors.New(c.detail)
+}
+
+func (c *writeFailConn) Close() error {
+	c.once.Do(func() { close(c.closed) })
+	return nil
+}
+
+// TestBackendCallFailureDetailStaysInTheGatewayLog is the same suppression on
+// the second site: a mux failure that is neither cancellation nor a dead
+// connection, whose text is whatever the transport wrote about the pipe or the
+// endpoint it was talking to.
+func TestBackendCallFailureDetailStaysInTheGatewayLog(t *testing.T) {
+	const detail = `write /tmp/natsmcp-3f9a/acme-github.sock: broken pipe`
+	log, records := newLogSink()
+	_, wc := stackFactory(t, nil, log, func(backend.Key) (backend.Backend, error) {
+		return &writeFailBackend{detail: detail}, nil
+	})
+
+	frames := doCollect(t, wc, mcpRequest("1", "tools/list", nil))
+	require.NotEmpty(t, frames)
+	last := frames[len(frames)-1]
+	require.Equal(t, wire.FrameErr, last.Kind)
+	m := decodeMsg(t, last.Body)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, wire.ErrCodeStreamLost, m.Error.Code)
+	assert.NotContains(t, m.Error.Message, "/tmp/natsmcp-3f9a", "a gateway path reached the caller")
+	assert.Contains(t, m.Error.Message, "re-issue")
+
+	line := waitLine(t, records, "backend call failed", mcpspec.MethodToolsList)
+	assert.Contains(t, fmt.Sprint(line["err"]), "/tmp/natsmcp-3f9a",
+		"suppressed for the caller, not for the operator")
+	ref, _ := line["ref"].(string)
+	require.NotEmpty(t, ref)
+	assert.Contains(t, m.Error.Message, ref, "the caller's ref must find the log line")
 }
 
 func TestE2EToolsList(t *testing.T) {
