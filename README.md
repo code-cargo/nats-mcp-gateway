@@ -221,6 +221,16 @@ credential from being quietly mangled on its way to a backend:
 - `$$` is a literal `$`, which is how a value containing `${` is written:
   `$${TEMPLATE}` reaches the backend as `${TEMPLATE}`.
 
+> **Upgrading:** earlier builds expanded a bare `$VAR` as well, and no longer
+> do. That form is now the literal text `$VAR`, and — unlike an undefined
+> `${VAR}` — it does **not** fail the load, so a config relying on it ships
+> `$GITHUB_TOKEN` to the backend as a credential and comes back as a 401 with
+> nothing in the gateway's logs to explain it. Braces are not optional: grep
+> your configs for `$` not followed by `{` before upgrading. The bare form
+> stays literal on purpose — a `$` belongs to passwords (`s$cret`) and to
+> arguments meant for the backend's own shell (`--fmt=$HOME`), and eating
+> those would corrupt them just as silently in the other direction.
+
 ### Caching hints
 
 2026-07-28 requires `ttlMs` and `cacheScope` on every cacheable result

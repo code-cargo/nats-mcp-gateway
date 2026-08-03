@@ -19,7 +19,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -72,6 +72,14 @@ func refuseLookup(name string) (string, error) {
 // its expansion is the same silent failure this function exists to remove.
 // Keys are not expanded (see below), and the result of an expansion is never
 // re-scanned, so no value can smuggle in a second reference.
+//
+// Reflection makes that rule automatic for a field whose TYPE the walk can
+// reach, and silently false for one whose type it cannot — an interface, or a
+// json.RawMessage holding an undecoded subdocument. Such a field would keep
+// its ${VAR} literally on the file path, and would slip past the REFUSAL on
+// the fetch path, which is the security-relevant half. So an unreachable type
+// is an error rather than a skip, and TestExpandReachesEveryTypeInTheSchema
+// fails on one at build time rather than waiting for a document to contain it.
 func expand(cfg *Config, resolve lookup) error {
 	return expandValue(reflect.ValueOf(cfg).Elem(), "", resolve)
 }
@@ -99,7 +107,15 @@ func expandValue(v reflect.Value, path string, resolve lookup) error {
 				return err
 			}
 		}
-	case reflect.Slice:
+	case reflect.Slice, reflect.Array:
+		// A byte slice is an undecoded subdocument (json.RawMessage): its
+		// strings are not fields of the schema, walking it would iterate bytes
+		// and rewrite nothing, and the caller would never learn that the
+		// ${VAR} inside it was neither expanded nor refused.
+		if v.Type().Elem().Kind() == reflect.Uint8 {
+			return fmt.Errorf("%s: %s holds undecoded bytes, which ${VAR} expansion cannot reach; "+
+				"decode it into named fields instead", path, v.Type())
+		}
 		for i := range v.Len() {
 			if err := expandValue(v.Index(i), fmt.Sprintf("%s[%d]", path, i), resolve); err != nil {
 				return err
@@ -109,7 +125,7 @@ func expandValue(v reflect.Value, path string, resolve lookup) error {
 		// Decoded from JSON objects, so every key is a string. Sorted, so a
 		// document with two bad entries always names the same one.
 		keys := v.MapKeys()
-		sort.Slice(keys, func(i, j int) bool { return keys[i].String() < keys[j].String() })
+		slices.SortFunc(keys, func(a, b reflect.Value) int { return strings.Compare(a.String(), b.String()) })
 		for _, k := range keys {
 			key := k.String()
 			// A key names something the runtime looks up by name — an
@@ -129,6 +145,15 @@ func expandValue(v reflect.Value, path string, resolve lookup) error {
 			}
 			v.SetMapIndex(k, elem)
 		}
+	case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+		reflect.Float32, reflect.Float64:
+		// Numbers and booleans hold no strings, so there is nothing to expand.
+	default:
+		// Anything else (an interface, a channel, a func) is a type the walk
+		// cannot rewrite in place. Refused rather than skipped: see expand.
+		return fmt.Errorf("%s: config field of type %s is not reached by ${VAR} expansion; "+
+			"give it a concrete type the walk can rewrite", path, v.Type())
 	}
 	return nil
 }

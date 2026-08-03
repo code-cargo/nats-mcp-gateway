@@ -15,6 +15,7 @@
 package config
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -107,10 +108,15 @@ func TestFetchedKeepsEscapedLiteral(t *testing.T) {
 	assert.Equal(t, []string{"${TEMPLATE}"}, cfg.Servers["gh"].Args)
 }
 
-// Expansion reaches every string in the schema, not just the two the README
-// puts in its example: an operator writing a credential into a NATS URL or a
-// nested auth field is relying on the same mechanism.
-func TestExpandReachesEveryStringField(t *testing.T) {
+// Expansion reaches more than the two strings the README puts in its example:
+// an operator writing a credential into a NATS URL or a nested auth field is
+// relying on the same mechanism.
+//
+// These are representative fields, NOT the schema. Because the walk is
+// reflective, a new string field is covered without appearing here — so this
+// test cannot notice one that is not. Schema coverage is
+// TestExpandReachesEveryTypeInTheSchema's job; keep them distinct.
+func TestExpandReachesRepresentativeStringFields(t *testing.T) {
 	t.Setenv("TEST_VAL", "resolved")
 	cfg, err := Parse([]byte(`{
 		"nats": {"url": "nats://gw:${TEST_VAL}@nats:4222", "queueGroup": "${TEST_VAL}"},
@@ -151,4 +157,71 @@ func TestExpandRejectsMalformedReference(t *testing.T) {
 		require.Error(t, err, bad)
 		assert.Contains(t, err.Error(), `servers["gh"].env["K"]`, bad)
 	}
+}
+
+// The schema-coverage guard.
+//
+// The expander is reflective, so a new field is covered automatically — unless
+// its TYPE is one the walk cannot reach, in which case it opts out in silence.
+// This walks the TYPE graph rather than a decoded document, so a field is
+// caught whether or not any fixture happens to populate it, and reports the
+// path an operator would recognize.
+//
+// The stakes are not only that a ${VAR} stays literal on the file path. The
+// same blind spot skips the fetch path's REFUSAL, so a field the walk cannot
+// reach would let a controller-sent document carry a reference the gateway
+// promised to reject.
+func TestExpandReachesEveryTypeInTheSchema(t *testing.T) {
+	var unreachable []string
+	seen := map[reflect.Type]bool{}
+
+	var walk func(rt reflect.Type, path string)
+	walk = func(rt reflect.Type, path string) {
+		if seen[rt] {
+			return
+		}
+		seen[rt] = true
+		switch rt.Kind() {
+		case reflect.String,
+			reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+			reflect.Uint, reflect.Uint16, reflect.Uint32, reflect.Uint64,
+			reflect.Float32, reflect.Float64:
+		case reflect.Pointer:
+			walk(rt.Elem(), path)
+		case reflect.Struct:
+			for i := range rt.NumField() {
+				f := rt.Field(i)
+				if !f.IsExported() {
+					continue
+				}
+				walk(f.Type, joinPath(path, jsonName(f)))
+			}
+		case reflect.Slice, reflect.Array:
+			if rt.Elem().Kind() == reflect.Uint8 {
+				unreachable = append(unreachable, path+" ("+rt.String()+": undecoded bytes)")
+				return
+			}
+			walk(rt.Elem(), path+"[]")
+		case reflect.Map:
+			walk(rt.Elem(), path+"[key]")
+		default:
+			unreachable = append(unreachable, path+" ("+rt.String()+")")
+		}
+	}
+	walk(reflect.TypeOf(Config{}), "")
+
+	assert.Empty(t, unreachable,
+		"these config fields have a type ${VAR} expansion cannot reach, so they would keep a "+
+			"reference literally on the file path and slip past the refusal on the fetch path; "+
+			"give them a concrete type, or teach expandValue to walk it")
+}
+
+// The "never re-scanned" half of expand's contract. A resolved value is the
+// value, not a document to keep resolving: without this, a variable whose
+// content an attacker influences could name a SECOND variable and read it out.
+func TestExpandDoesNotRescanTheResult(t *testing.T) {
+	env := map[string]string{"OUTER": "${INNER}", "INNER": "must-not-appear"}
+	got, err := expandString("${OUTER}", func(n string) (string, error) { return env[n], nil })
+	require.NoError(t, err)
+	assert.Equal(t, "${INNER}", got, "the result of an expansion must not itself be expanded")
 }
