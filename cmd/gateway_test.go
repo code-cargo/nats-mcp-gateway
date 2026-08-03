@@ -1535,7 +1535,13 @@ func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
 				"BASH_ENV":              "/tmp/evil.sh",
 				"PERL5OPT":              "-Mevil",
 				"BASH_FUNC_ls%%":        "() { evil; }",
-				"NOT=A KEY":             "x",
+				// npx is the README's own stdio shape, and npm takes its whole
+				// config from the environment — folding case on the prefix, so
+				// no list of spellings would have covered it.
+				"npm_config_script_shell": "/tmp/evil.sh",
+				"NPM_CONFIG_NODE_OPTIONS": "--require /tmp/evil.js",
+				"NpM_cOnFiG_script_shell": "/tmp/evil.sh",
+				"NOT=A KEY":               "x",
 			}}, nil
 		}), 0)
 	_, gen, err := resolver.ResolveGen(context.Background(), "acme", "u1", "github")
@@ -1566,6 +1572,7 @@ func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
 	for _, key := range []string{
 		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME",
 		"PYTHONPATH", "BASH_ENV", "PERL5OPT", "BASH_FUNC_ls%%", "NOT=A KEY",
+		"npm_config_script_shell", "NPM_CONFIG_NODE_OPTIONS", "NpM_cOnFiG_script_shell",
 	} {
 		assert.NotContains(t, sb.Env, key, "a resolver set %s on the backend subprocess", key)
 	}

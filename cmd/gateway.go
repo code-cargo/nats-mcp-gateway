@@ -896,6 +896,12 @@ var (
 		"LD_",        // glibc/musl loader: LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH
 		"DYLD_",      // macOS loader: DYLD_INSERT_LIBRARIES and friends
 		"BASH_FUNC_", // exported shell functions, defined before the script runs
+		// npm reads its whole config from the environment, and the README's
+		// own stdio examples are npx. npm_config_script_shell picks the shell
+		// every lifecycle script runs under, and npm_config_node_options
+		// reaches node the same way NODE_OPTIONS does — both before any MCP
+		// code runs.
+		"NPM_CONFIG_",
 	}
 	credEnvBlocked = map[string]struct{}{
 		// Which binary "command" resolves to, and where every runtime looks
@@ -947,6 +953,16 @@ func credEnvRefused(key string) bool {
 	if key == "" || strings.ContainsAny(key, "=\x00") {
 		return true
 	}
+	// Case-insensitively, and the tables above are written upper-case to suit
+	// it. Unix environment variables ARE case-sensitive and most of these
+	// consumers read one exact spelling, so this is broader than it strictly
+	// has to be — but npm is not one of them: it folds case on its prefix, so
+	// npm_config_script_shell, NPM_CONFIG_SCRIPT_SHELL and NpM_cOnFiG_… are one
+	// setting to it and enumerating spellings would leave the rest through.
+	// Windows env vars are case-insensitive outright. What this costs is a
+	// resolver naming a credential that differs from a loader hook only in
+	// case, which is not a thing any of them is called.
+	key = strings.ToUpper(key)
 	if _, refused := credEnvBlocked[key]; refused {
 		return true
 	}

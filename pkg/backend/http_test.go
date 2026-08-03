@@ -722,6 +722,7 @@ func TestCloseWaitsForInflightExchange(t *testing.T) {
 	}
 
 	closed := make(chan struct{})
+	start := time.Now()
 	go func() {
 		defer close(closed)
 		assert.NoError(t, conn.Close())
@@ -738,10 +739,15 @@ func TestCloseWaitsForInflightExchange(t *testing.T) {
 	body.release()
 	select {
 	case <-closed:
-	case <-time.After(2 * time.Second):
-		// Anything this slow is Close outwaiting the grace, which is the
-		// timeout path, not the drain: the exchange finishes in microseconds
-		// once the body is released.
+		// Drained or timed out are the two ways to arrive here, and they are
+		// told apart by the clock rather than by a bound on the wait: the
+		// exchange finishes in microseconds once the body is released, while
+		// the timeout path cannot return before terminateGrace is up. Waiting
+		// generously and then asserting on elapsed keeps a loaded runner from
+		// reading as the failure it is supposed to detect.
+		assert.Less(t, time.Since(start), terminateGrace,
+			"Close returned no sooner than the grace deadline, so it timed out rather than drained")
+	case <-time.After(30 * time.Second):
 		t.Fatal("Close did not return once its exchange finished")
 	}
 }

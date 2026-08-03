@@ -176,6 +176,18 @@ func (r *Reconciler) evict(ev eviction) {
 func (r *Reconciler) transition(next *config.Config) (Delta, eviction, error) {
 	r.mu.Lock()
 	defer func() {
+		// The hand-off has to be total. evictMu is taken here and released by
+		// Apply, which cannot register its own deferred unlock until this
+		// function has RETURNED — so a panic unwinding through here would take
+		// evictMu with nothing left to release it, and every later Apply would
+		// block on it forever. Nothing in this repo recovers, so today that
+		// panic ends the process either way; the pairing is written out anyway
+		// because the day something does recover is not the day to discover
+		// this. Unwinding gives mu back and re-panics, untouched.
+		if p := recover(); p != nil {
+			r.mu.Unlock()
+			panic(p)
+		}
 		// Taken under mu and released by Apply once the pool work has run: the
 		// order two applies decide their evictions in is the order those
 		// evictions run in, while the next apply's state change goes ahead
@@ -186,10 +198,15 @@ func (r *Reconciler) transition(next *config.Config) (Delta, eviction, error) {
 
 	// A nil revision is a legitimate one — "every server removed" — and the
 	// package doc advertises a fetch returning (nil, nil) as the way to write
-	// one. Substituting an empty config covers every reader at once: this is
-	// the value Current publishes, and the pool factory dereferences that.
-	// warnNATSDrift still sees the original, because nil asserts nothing about
-	// the `nats` block where an empty document asserts an empty one.
+	// one. Substituting an empty config keeps the nil out of everything this
+	// apply goes on to do: the diff, ServerNames, and the value it publishes.
+	//
+	// It does NOT make Current non-nil in general — the rollback below restores
+	// prev, which is nil before anything has applied, and Current starts nil in
+	// any case. Callers still have to handle that; cmd's factory and registry
+	// do. warnNATSDrift sees the original for a different reason: nil asserts
+	// nothing about the `nats` block where an empty document asserts an empty
+	// one.
 	rev := next
 	if rev == nil {
 		rev = &config.Config{}

@@ -685,9 +685,17 @@ func (p *Pool) evictServer(server string, since time.Time) {
 	// same reason: a spawn whose definition was read before the window opened is
 	// provably from the config that is live again, and discarding it costs a
 	// waiting Get one of its getMaxAttempts and restarts a cold subprocess that
-	// was about to finish. An unstamped spawn has not finished reading a
-	// definition yet, so it may still read the one being undone — that one is
-	// stale whatever the cutoff.
+	// was about to finish.
+	//
+	// An unstamped spawn has not reached its factory yet, and is marked stale
+	// on purpose even though the caller's rollback has usually already restored
+	// the definition it is about to read. Nothing orders that read against this
+	// loop: the reconciler publishes and then evicts, but a third apply may
+	// publish again in between, and this package cannot see which config the
+	// factory will find. Paying a respawn for a spawn that would have been fine
+	// is the cheap side of that; installing one built from a definition nobody
+	// wants is the expensive side, and it is the side this eviction exists to
+	// prevent.
 	for k, sp := range p.spawning {
 		if k.Server == server && (sp.built.IsZero() || sp.built.After(since)) {
 			sp.stale = true

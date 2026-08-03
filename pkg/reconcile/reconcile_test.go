@@ -680,3 +680,32 @@ func fakeSrv(extraEnv map[string]string) config.Server {
 		Env:       extraEnv,
 	}
 }
+
+// evictMu is taken inside transition and released by Apply, which cannot
+// register its deferred unlock until transition has returned. A panic unwinding
+// through that hand-off would carry the lock off with it and every later Apply
+// would block on it forever. Nothing in this repo recovers, so such a panic
+// ends the process today — this pins the pairing against the day something
+// does, which is not the day to find out.
+func TestPanicInTransitionDoesNotStrandEvictMu(t *testing.T) {
+	r := New(nil, &recordingPool{}, nil)
+	func() {
+		defer func() {
+			require.NotNil(t, recover(), "the panic must still propagate, not be swallowed")
+		}()
+		// ws is nil, so SetServers panics once the diff is non-empty.
+		_, _ = r.Apply(&config.Config{Servers: map[string]config.Server{"a": {Command: "x"}}})
+	}()
+
+	locked := make(chan struct{})
+	go func() {
+		defer close(locked)
+		r.evictMu.Lock()
+		r.evictMu.Unlock()
+	}()
+	select {
+	case <-locked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("evictMu was stranded by the panic; every later Apply would block on it")
+	}
+}
