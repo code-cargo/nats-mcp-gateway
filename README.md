@@ -202,11 +202,34 @@ never share a process or a credential.
 }
 ```
 
-`protocol` defaults to `2025-11-25` (that is what exists in the wild).
+`protocol` defaults to `2025-11-25` (that is what exists in the wild). Set
+`max_payload: 8MB` on the NATS server: MCP results carry base64 blobs, and
+oversize messages fail with a legible `-32012` instead of a hang.
+
 `${VAR}` expands from the gateway's environment — the credential-injection
-point; clients never see backend secrets. Set `max_payload: 8MB` on the NATS
-server: MCP results carry base64 blobs, and oversize messages fail with a
-legible `-32012` instead of a hang.
+point; clients never see backend secrets. It applies to every string **value**
+in a document the operator authored (the file and inline sources; a *fetched*
+document is not expanded, see [Config
+sources](#config-sources--hot-reload)), and never to a key. Three rules keep a
+credential from being quietly mangled on its way to a backend:
+
+- An **undefined variable fails the load**, naming the field and the variable.
+  A typo'd `${GITHUB_TOKN}` that defaulted to empty would run the server with no
+  credential and surface hours later as an untraceable 401.
+- `${VAR}` is the **only** reference form, so a bare `$` is literal — `s$cret`
+  is the password you wrote, not `s`.
+- `$$` is a literal `$`, which is how a value containing `${` is written:
+  `$${TEMPLATE}` reaches the backend as `${TEMPLATE}`.
+
+> **Upgrading:** earlier builds expanded a bare `$VAR` as well, and no longer
+> do. That form is now the literal text `$VAR`, and — unlike an undefined
+> `${VAR}` — it does **not** fail the load, so a config relying on it ships
+> `$GITHUB_TOKEN` to the backend as a credential and comes back as a 401 with
+> nothing in the gateway's logs to explain it. Braces are not optional: grep
+> your configs for `$` not followed by `{` before upgrading. The bare form
+> stays literal on purpose — a `$` belongs to passwords (`s$cret`) and to
+> arguments meant for the backend's own shell (`--fmt=$HOME`), and eating
+> those would corrupt them just as silently in the other direction.
 
 ### Caching hints
 
@@ -442,12 +465,14 @@ provenance is attested per release
 
 The **server set reloads at runtime** — add, remove, or re-credential a fronted
 MCP server without restarting the gateway. (The NATS connection, subject
-prefix, and queue group are fixed at boot; only servers reload.) Reloads are
-safe: a malformed revision is rejected and the last good config keeps serving,
-a removed server stops answering (clients get `-32011` and re-issue), and a
-changed server's pooled processes are evicted so the next call spawns from the
-new definition. In-flight calls on a removed/changed server fail retryably
-(`-32010`); unchanged servers are never disturbed.
+prefix, queue group, and scope are fixed at boot; only servers reload. Editing
+the file's `nats` block and reloading logs a warning naming the fields that
+moved — the running connection keeps the boot values until you restart.)
+Reloads are safe: a malformed revision is rejected and the last good config
+keeps serving, a removed server stops answering (clients get `-32011` and
+re-issue), and a changed server's pooled processes are evicted so the next call
+spawns from the new definition. In-flight calls on a removed/changed server
+fail retryably (`-32010`); unchanged servers are never disturbed.
 
 Config comes from a **source**, selected by flag:
 
@@ -464,10 +489,24 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
   `--config-refetch`): requests the config JSON over NATS and re-fetches when a
   change event is published (with a periodic re-fetch as the missed-event safety
   net). Secrets stay in the controller and ride only the authenticated NATS
-  connection — nothing at rest in a ConfigMap or KV bucket. **Controller
-  contract:** respond to the request subject with the same config JSON the file
-  source parses, and publish any message to the events subject on change; NATS
-  permissions fence both subjects to the controller.
+  connection — nothing at rest in a ConfigMap or KV bucket. A fetched document
+  is therefore **not** `${VAR}`-expanded, and a reference in one is rejected:
+  the controller resolves credentials itself, and expanding here would make the
+  gateway pod's own environment a second secret source that whoever answers the
+  subject could read back out through a backend argument, `env` entry, or URL.
+  **Controller contract:** respond to the request subject with the same config
+  JSON the file source parses (with values resolved, not `${VAR}` references),
+  and publish any message to the events subject on change; NATS permissions
+  fence both subjects to the controller. The reply must carry **no `nats`
+  block** — the connection it arrives on is already open, so nothing in one can
+  be acted on, and a controller that emits `{"nats":{"tenant":"acme"},…}`
+  believing it scoped the fleet would leave every pod serving every tenant. A
+  reply carrying one is refused like any other unusable revision, which means
+  it depends on whether the pod is already serving: a running gateway keeps its
+  last good config and converges once the controller stops sending the block,
+  while a pod that has never served retries for the two-minute boot window and
+  then exits — so a controller emitting one from the start fails the rollout
+  rather than serving the wrong scope.
 - **Inline** (`--config-json` / `NATSMCP_CONFIG_JSON`): the whole config
   document as a string, applied once and never reloaded — for pods with no file
   mount and no config responder (the scoped stdio deployment injects its one

@@ -303,22 +303,31 @@ func (r *configResponder) set(servers ...string) {
 		body += fmt.Sprintf(`%q:{"transport":"stdio","command":"cmd"}`, s)
 	}
 	body += `}}`
+	r.setRaw(body)
+}
+
+func (r *configResponder) setRaw(body string) {
 	r.mu.Lock()
 	r.current = []byte(body)
 	r.mu.Unlock()
+}
+
+func (r *configResponder) serve(t *testing.T) {
+	t.Helper()
+	sub, err := r.nc.Subscribe("cfg.request", func(m *nats.Msg) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		_ = m.Respond(r.current)
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sub.Unsubscribe() })
 }
 
 func TestNATSSourceFetchAndEvent(t *testing.T) {
 	nc := runNATS(t)
 	r := &configResponder{nc: nc}
 	r.set("a")
-	sub, err := nc.Subscribe("cfg.request", func(m *nats.Msg) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		_ = m.Respond(r.current)
-	})
-	require.NoError(t, err)
-	defer func() { _ = sub.Unsubscribe() }()
+	r.serve(t)
 
 	src := &NATS{
 		Conn:           nc,
@@ -363,13 +372,7 @@ func TestNATSSourceRetriesUntilResponderUp(t *testing.T) {
 	time.Sleep(500 * time.Millisecond)
 	r := &configResponder{nc: nc}
 	r.set("late")
-	sub, err := nc.Subscribe("cfg.request", func(m *nats.Msg) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		_ = m.Respond(r.current)
-	})
-	require.NoError(t, err)
-	defer func() { _ = sub.Unsubscribe() }()
+	r.serve(t)
 
 	select {
 	case u := <-ch:
@@ -377,6 +380,117 @@ func TestNATSSourceRetriesUntilResponderUp(t *testing.T) {
 		assert.Equal(t, []string{"late"}, names(u.Config), "source converges once the responder is up")
 	case <-time.After(5 * time.Second):
 		t.Fatal("source never converged after responder came up")
+	}
+}
+
+// The controller holds the secrets and sends resolved values; the gateway pod's
+// own environment is not a second credential source for the documents it
+// fetches. Were it one, whoever can answer the config subject could name any
+// variable the pod happens to carry — its cloud role credentials, its NATS
+// password — and read it back out through a backend argument, environment
+// entry, or URL.
+func TestNATSSourceDoesNotExpandGatewayEnvironment(t *testing.T) {
+	t.Setenv("GATEWAY_SECRET", "leak-me-not")
+	nc := runNATS(t)
+	r := &configResponder{nc: nc}
+	r.setRaw(`{"servers":{"gh":{"transport":"stdio","command":"cmd",` +
+		`"env":{"TOKEN":"${GATEWAY_SECRET}"}}}}`)
+	r.serve(t)
+
+	src := &NATS{
+		Conn:           nc,
+		RequestSubject: "cfg.request",
+		RequestTimeout: 200 * time.Millisecond,
+		BootTimeout:    time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	u := <-src.Watch(ctx)
+	require.Error(t, u.Err, "a fetched document reaching for the gateway's environment is refused")
+	assert.NotContains(t, u.Err.Error(), "leak-me-not", "and the refusal does not echo the value")
+	assert.Nil(t, u.Config)
+}
+
+// The connection is established before the fetch can happen, so nothing in a
+// fetched `nats` block can be acted on. Dropping it silently is the dangerous
+// direction: a controller emitting {"nats":{"tenant":"acme"},…} believes it has
+// scoped the fleet, while every pod goes on serving every tenant and reporting
+// healthy.
+func TestNATSSourceRejectsFetchedNatsBlock(t *testing.T) {
+	nc := runNATS(t)
+	r := &configResponder{nc: nc}
+	r.setRaw(`{"nats":{"tenant":"acme"},"servers":{"a":{"transport":"stdio","command":"cmd"}}}`)
+	r.serve(t)
+
+	src := &NATS{
+		Conn:           nc,
+		RequestSubject: "cfg.request",
+		RequestTimeout: 200 * time.Millisecond,
+		BootTimeout:    time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	u := <-src.Watch(ctx)
+	require.Error(t, u.Err, `a fetched "nats" block must be refused, not dropped`)
+	assert.ErrorIs(t, u.Err, ErrNATSBlock, "and stays distinguishable through the boot wrapping")
+	assert.Contains(t, u.Err.Error(), `"nats"`, "the refusal names the block")
+	assert.Nil(t, u.Config)
+}
+
+// The refusal is per REVISION, not per process: a controller that starts
+// emitting a `nats` block against a live fleet must not take it down. The bad
+// revision is refused, the last good config keeps serving, and the next fetch
+// converges on its own once the controller stops sending it — the same handling
+// any other unusable revision gets.
+func TestNATSSourceNatsBlockLeavesLastGoodServing(t *testing.T) {
+	nc := runNATS(t)
+	r := &configResponder{nc: nc}
+	r.set("a")
+	r.serve(t)
+
+	src := &NATS{
+		Conn:           nc,
+		RequestSubject: "cfg.request",
+		EventSubject:   "cfg.changed",
+		Refetch:        time.Hour, // isolate the event path
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	applied := make(chan []string, 8)
+	go func() {
+		_ = Run(ctx, nil, src, func(c *config.Config) error {
+			applied <- names(c)
+			return nil
+		})
+	}()
+
+	select {
+	case got := <-applied:
+		require.Equal(t, []string{"a"}, got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial config never applied")
+	}
+
+	r.setRaw(`{"nats":{"tenant":"acme"},"servers":{` +
+		`"a":{"transport":"stdio","command":"cmd"},` +
+		`"b":{"transport":"stdio","command":"cmd"}}}`)
+	require.NoError(t, nc.Publish("cfg.changed", nil))
+	select {
+	case got := <-applied:
+		t.Fatalf("a revision carrying a nats block was applied: %v", got)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	r.set("a", "b")
+	require.NoError(t, nc.Publish("cfg.changed", nil))
+	select {
+	case got := <-applied:
+		assert.Equal(t, []string{"a", "b"}, got, "the source recovers once the block is gone")
+	case <-time.After(5 * time.Second):
+		t.Fatal("source never recovered after the controller dropped the block")
 	}
 }
 

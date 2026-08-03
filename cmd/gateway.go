@@ -407,12 +407,8 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 
 	if kind == sourceInline {
 		// Parse up front so a malformed NATSMCP_CONFIG_JSON fails the boot
-		// loudly instead of leaving the gateway serving nothing. Parsed
-		// forward-compatibly for the same reason the fetch source is: an
-		// inline document is machine-generated (the controller mints the pod
-		// spec), so a newer controller's additive field must not crash-loop an
-		// older gateway through a rollback.
-		cfg, err := config.ParseForwardCompatible([]byte(c.ConfigJSON))
+		// loudly instead of leaving the gateway serving nothing.
+		cfg, err := config.ParseInline([]byte(c.ConfigJSON))
 		if err != nil {
 			return bootParams{}, fmt.Errorf("config-json: %w", err)
 		}

@@ -14,11 +14,20 @@
 
 // Package config loads the gateway's JSON configuration. JSON (not YAML)
 // because .mcp.json and claude_desktop_config.json already are, and because
-// encoding/json costs no new dependency. ${VAR} references are expanded from
-// the gateway's environment at load time.
+// encoding/json costs no new dependency.
+//
+// There is one entry point per config source, because the two properties that
+// distinguish them are security-relevant and must be visible at the call site:
+// whether unknown fields are rejected, and whether ${VAR} is expanded from the
+// gateway's environment. Expansion is the credential-injection point for a
+// document the OPERATOR authored (Parse, ParseInline); a document the
+// controller sends is not expanded (ParseFetched), because the controller
+// resolves secrets itself and must not be able to read the gateway pod's
+// environment back out through one.
 package config
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -248,42 +257,65 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// Parse env-expands, decodes STRICTLY (unknown fields rejected), and
-// validates config bytes. Use for human-authored config (the file source),
-// where an unknown key almost certainly means a typo.
+// Parse expands ${VAR} from the gateway's environment, decodes STRICTLY
+// (unknown fields rejected), and validates config bytes. Use for
+// human-authored config (the file source), where an unknown key almost
+// certainly means a typo.
 //
 // A config with zero servers is valid: it is the legitimate steady state of a
 // gateway whose servers have all been removed.
 func Parse(raw []byte) (*Config, error) {
-	return parse(raw, true)
+	return parse(raw, true, envLookup)
 }
 
-// ParseForwardCompatible parses config bytes IGNORING unknown fields, so a
-// gateway can consume a config emitted by a NEWER controller that added
-// fields this build does not know yet. This is the fleet forward-compat path
-// (the NATS/fetch source): during a rolling upgrade the whole fleet reads the
-// same controller-emitted config, and an older gateway must not reject it
-// wholesale just because a newer field appeared.
+// ParseInline parses the inline document (--config-json / NATSMCP_CONFIG_JSON).
+// ${VAR} expands from the gateway's environment: the document is plain-only and
+// whatever creates the pod injects that pod's credentials beside it, so
+// expansion is how they meet.
+//
+// Unknown fields are ignored, for the reason described on ParseFetched — an
+// inline document is machine-generated (the controller mints the pod spec), so
+// a newer controller's additive field must not crash-loop an older gateway
+// through a rollback.
+func ParseInline(raw []byte) (*Config, error) {
+	return parse(raw, false, envLookup)
+}
+
+// ParseFetched parses a config the controller served over NATS. ${VAR} is
+// REFUSED rather than expanded: the controller holds the secrets and sends
+// resolved values, and a document from the control plane must not be able to
+// name a variable in the gateway pod's environment and read it back out
+// through a backend argument (see refuseLookup).
+//
+// Unknown fields are ignored, so a gateway can consume a config emitted by a
+// NEWER controller that added fields this build does not know yet. During a
+// rolling upgrade the whole fleet reads the same controller-emitted config, and
+// an older gateway must not reject it wholesale just because a newer field
+// appeared.
 //
 // Discipline this implies: new config fields must be ADDITIVE and safe for an
 // older gateway to ignore. A change that an old gateway ignoring would make
 // UNSAFE (e.g. a mandatory sandbox flag) must instead be gated behind an
 // explicit, rejected version bump — never a silently-dropped field.
-func ParseForwardCompatible(raw []byte) (*Config, error) {
-	return parse(raw, false)
+func ParseFetched(raw []byte) (*Config, error) {
+	return parse(raw, false, refuseLookup)
 }
 
-func parse(raw []byte, strict bool) (*Config, error) {
-	expanded := os.Expand(string(raw), func(key string) string {
-		return os.Getenv(key)
-	})
-	dec := json.NewDecoder(strings.NewReader(expanded))
+func parse(raw []byte, strict bool, resolve lookup) (*Config, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
 	if strict {
 		dec.DisallowUnknownFields()
 	}
 	var cfg Config
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse: %w", err)
+	}
+	// Decode, then expand, then validate. Expanding the document text instead
+	// would let a variable's value close its JSON string and splice in fields;
+	// validating before expansion would judge the placeholder rather than the
+	// value that actually reaches the backend.
+	if err := expand(&cfg, resolve); err != nil {
+		return nil, err
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
