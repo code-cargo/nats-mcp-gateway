@@ -524,14 +524,24 @@ injected as pod env is therefore never silently dropped, in either direction.
 
 Agreement is judged against the *effective* value, not the raw field, so
 pinning a flag to a default the document leaves unstated (the `mcpgw.{tenant}`
-queue group, the pool's `32`/`16`/`5m`/`1h`) changes nothing and boots. A flag
-still sitting at its own default is likewise not a conflict: `--nats-url`,
-`--subject-prefix`, `--claim-max-age` and `--claim-max-bytes` are the only
-settings with defaults, and `NATSMCP_NATS_URL` / `NATSMCP_SUBJECT_PREFIX` /
-`NATSMCP_INBOX_PREFIX` are shared with `shim` and `call`, so one exported value
-per deployment must not break a gateway it was never aimed at. The scope,
-credentials, inbox prefix and queue group have no defaults and so have no such
-exemption — the settings that matter for isolation are checked unconditionally.
+queue group, the pool's `32`/`16`/`5m`/`1h`) changes nothing and boots.
+
+A flag still sitting at its **own** default is likewise not a conflict, because
+it says nothing about what the operator wanted. Only `--nats-url`,
+`--subject-prefix`, `--claim-max-age` and `--claim-max-bytes` have defaults, so
+only they can be exempt this way — and it matters for the first two, whose
+`NATSMCP_NATS_URL` and `NATSMCP_SUBJECT_PREFIX` are shared with `shim` and
+`call`: exporting the stock value once per deployment must not break a gateway
+it was never aimed at.
+
+Every other setting is checked whenever it is non-empty, which is the whole
+point — scope, credentials, queue group and inbox prefix are what isolation
+rests on. `NATSMCP_INBOX_PREFIX` is shared with `shim` too but has no default,
+so any value it carries is taken as deliberate: a deployment exporting it
+fleet-wide **must** also set `nats.inboxPrefix` in the document, or that
+gateway will refuse to boot rather than run with the identity fencing silently
+off. Unset it for the gateway, or state it in the document — both are a
+one-line fix, and the error names the value it expected.
 
 `--inbox-prefix` / `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`)
 sets the prefix for this process's own request/reply inboxes — the config

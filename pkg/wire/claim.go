@@ -52,19 +52,27 @@ const (
 )
 
 // DefaultClaimMaxAge and DefaultClaimMaxBytes are what a claim bucket gets for
-// a limit left unset. They live here, beside the code that substitutes them,
-// so a caller validating configuration cannot drift from the value that will
-// actually be in force — see FilledClaimLimits.
+// a limit it is not given — meaning any value <= 0, not just the zero. They
+// live here, beside the code that substitutes them, so a caller validating
+// configuration cannot drift from the value that will actually be in force —
+// see FilledClaimLimits.
 const (
 	DefaultClaimMaxAge   = 5 * time.Minute
 	DefaultClaimMaxBytes = 1 << 30 // 1GiB
 )
 
 // FilledClaimLimits returns the bucket limits in force for the given pair,
-// substituting the default for anything unset. It is the claim-check analogue
+// substituting the default for anything <= 0. It is the claim-check analogue
 // of backend.PoolConfig.Filled, exported for the same reason: a caller
 // checking configuration has to compare against what the bucket will actually
 // get, not against the zero an operator left behind.
+//
+// The bound is <= 0 rather than == 0 because a negative limit is not a request
+// for a bucket that expires instantly or holds nothing — it is meaningless, and
+// meaningless is what the default exists for. A caller checking configuration
+// has to fold negatives the same way or it will report a conflict against a
+// value the bucket is never going to use: hence the > 0 guards in
+// GatewayCmd.checkFileSourceFlags.
 func FilledClaimLimits(maxAge time.Duration, maxBytes int64) (time.Duration, int64) {
 	if maxAge <= 0 {
 		maxAge = DefaultClaimMaxAge
@@ -85,9 +93,9 @@ func FilledClaimLimits(maxAge time.Duration, maxBytes int64) (time.Duration, int
 type ObjectClaims struct {
 	// JS is the JetStream context (jetstream.New(nc)).
 	JS jetstream.JetStream
-	// MaxAge is the bucket TTL (DefaultClaimMaxAge if unset). Gateway-side only.
+	// MaxAge is the bucket TTL (DefaultClaimMaxAge if <= 0). Gateway-side only.
 	MaxAge time.Duration
-	// MaxBytes caps each tenant bucket (DefaultClaimMaxBytes if unset).
+	// MaxBytes caps each tenant bucket (DefaultClaimMaxBytes if <= 0).
 	// Gateway-side only.
 	MaxBytes int64
 
