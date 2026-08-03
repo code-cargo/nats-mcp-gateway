@@ -599,6 +599,15 @@ func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
 			want: []string{`--subject-prefix="other.mcp"`, `nats.subjectPrefix="acme.mcp"`},
 		},
 		{
+			// A silent document is not asking for the empty prefix, so the
+			// message names what the wire will bind rather than the blank the
+			// field holds — the same courtesy the queue group and the pool get.
+			name: "wire prefix dropped for the wire default",
+			doc:  `{"servers":{}}`,
+			cmd:  GatewayCmd{SubjectPrefix: "acme.mcp"},
+			want: []string{`--subject-prefix="acme.mcp"`, `nats.subjectPrefix="mcp.v1"`},
+		},
+		{
 			name: "pool limits",
 			doc:  `{"pool":{"maxProcsPerTenant":16},"servers":{}}`,
 			cmd: GatewayCmd{
@@ -612,6 +621,9 @@ func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
 			},
 		},
 		{
+			// The whole feature is being dropped, so the sizing is reported
+			// raw: there is no bucket, and naming wire's 5m/1GiB here would
+			// describe limits nothing is going to apply.
 			name: "claim-check enabled by flag, absent from the document",
 			doc:  `{"servers":{}}`,
 			cmd:  GatewayCmd{ClaimCheck: true, ClaimMaxAge: 9 * time.Minute, ClaimMaxBytes: 5},
@@ -619,6 +631,18 @@ func TestBootParamsFileSourceRejectsIgnoredFlags(t *testing.T) {
 				"--claim-check=true", "claimCheck=false",
 				"--claim-max-age=9m0s", "claimCheck.maxAge=0s",
 				"--claim-max-bytes=5", "claimCheck.maxBytes=0",
+			},
+		},
+		{
+			// Here the document DOES enable it, so an unsized block is asking
+			// for wire's substituted limits and the message names those — the
+			// zero it literally holds is not what the bucket is about to get.
+			name: "claim sizing disagreeing with an unsized document block",
+			doc:  `{"claimCheck":{},"servers":{}}`,
+			cmd:  GatewayCmd{ClaimMaxAge: 10 * time.Minute, ClaimMaxBytes: 7},
+			want: []string{
+				"--claim-max-age=10m0s", "claimCheck.maxAge=5m0s",
+				"--claim-max-bytes=7", "claimCheck.maxBytes=1073741824",
 			},
 		},
 	} {
@@ -693,27 +717,37 @@ func TestFileSourceGuardAgainstKongDefaults(t *testing.T) {
 	clearNATSMCPEnv(t)
 	path := writeConfig(t, `{"servers":{}}`)
 
-	parse := func(t *testing.T) *GatewayCmd {
+	parse := func(t *testing.T, cfgPath string) *GatewayCmd {
 		t.Helper()
 		var cli CLI
 		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
 		require.NoError(t, err)
-		_, err = parser.Parse([]string{"gateway", "--config", path})
+		_, err = parser.Parse([]string{"gateway", "--config", cfgPath})
 		require.NoError(t, err)
 		return &cli.Gateway
 	}
 
 	// Defaults only: the ordinary file-source boot, which must survive.
-	boot, err := parse(t).bootParams(sourceFile)
+	boot, err := parse(t, path).bootParams(sourceFile)
 	require.NoError(t, err)
 	assert.Equal(t, nats.DefaultURL, boot.url)
 	assert.Empty(t, boot.tenant)
+
+	// And again against a document that ENABLES claim-check, because the sizing
+	// comparison is skipped entirely when neither side asks for it — a
+	// defaults-only document alone would leave --claim-max-age and
+	// --claim-max-bytes free to drift from wire's substituted limits, and the
+	// first operator to mount a claimCheck block would be refused a boot they
+	// had asked nothing of. The block is left unsized deliberately: that is what
+	// makes the flag defaults meet wire.FilledClaimLimits head-on.
+	_, err = parse(t, writeConfig(t, `{"claimCheck":{},"servers":{}}`)).bootParams(sourceFile)
+	require.NoError(t, err, "a claimCheck document must not be refused over untouched sizing flags")
 
 	// The reported failure: scope injected as env, mounted file with no nats
 	// block. Before the guard this booted unscoped, serving every tenant.
 	t.Setenv("NATSMCP_SCOPE_TENANT", "acme")
 	t.Setenv("NATSMCP_SCOPE_USER", "u_9f3a")
-	_, err = parse(t).bootParams(sourceFile)
+	_, err = parse(t, path).bootParams(sourceFile)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "NATSMCP_SCOPE_TENANT")
 	assert.Contains(t, err.Error(), "nats.tenant")
@@ -1296,18 +1330,29 @@ func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
 			`{"servers":{}}`,
 			GatewayCmd{ClaimMaxAge: 10 * time.Minute, ClaimMaxBytes: 1 << 20},
 		},
+		{
+			// An unsized claimCheck block gets wire's substituted limits, so a
+			// chart materializing those numbers into env agrees with the
+			// gateway and must not be refused for saying so out loud.
+			"claim sizing pinned to the limits an unsized block receives",
+			`{"claimCheck":{},"servers":{}}`,
+			GatewayCmd{ClaimMaxAge: 5 * time.Minute, ClaimMaxBytes: 1 << 30},
+		},
+		{
+			// As with the pool, a sizing flag <= 0 is not a request for a
+			// zero-length TTL: FilledClaimLimits substitutes the default, so it
+			// asks for exactly what the unsized block already gets. The guard
+			// reads > 0 for that reason, and nothing else pins the difference.
+			"claim sizing given as zero and negative",
+			`{"claimCheck":{"maxAge":"9m","maxBytes":5},"servers":{}}`,
+			GatewayCmd{ClaimMaxAge: -time.Second, ClaimMaxBytes: 0},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "gateway.json")
-			require.NoError(t, os.WriteFile(path, []byte(tt.doc), 0o600))
 			cmd := tt.cmd
-			cmd.Config = path
-			cfg, err := config.Load(path)
-			require.NoError(t, err)
-			_ = cfg
-			_, err = cmd.bootParams(sourceFile)
+			cmd.Config = writeConfig(t, tt.doc)
+			_, err := cmd.bootParams(sourceFile)
 			assert.NoError(t, err, "a flag that changes nothing must not refuse the boot")
 		})
 	}
