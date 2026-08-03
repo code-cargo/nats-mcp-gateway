@@ -234,3 +234,47 @@ func TestE2ECredentialFailureMapsToWireError(t *testing.T) {
 	assert.Equal(t, wire.ErrCodeCredentialUnavailable, m.Error.Code)
 	assert.Contains(t, m.Error.Message, "do not retry", "authoritative refusals must say so")
 }
+
+func TestE2ECredentialFailureDoesNotEchoTheResolverDetail(t *testing.T) {
+	// A resolver's error text is whatever its source emitted: the helper's
+	// stderr, the IdP's response body, the expanded path of an assertion file.
+	// The caller is precisely the party the gateway exists to keep that
+	// material away from, and it can reach this path at will — a request for a
+	// server whose credentials it is not entitled to is enough.
+	const detail = "helper stderr: sts assume-role arn:aws:iam::918273:role/prod " +
+		"failed reading /var/run/secrets/acme/u1.jwt (token AKIAWOULDBEBAD)"
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(_ context.Context, _, user, _ string) (*cred.Credentials, error) {
+			if user == "denied" {
+				return nil, cred.Terminal(errors.New(detail))
+			}
+			return nil, errors.New(detail)
+		},
+	), 0)
+	// Per-user, because the resolver above answers on the caller's identity:
+	// under the shared grain both loop iterations would resolve as
+	// wire.UserUnattributed and the terminal refusal would never be reached,
+	// leaving half of what this test covers silently uncovered.
+	nc := credStack(t, resolver, true)
+
+	for _, user := range []string{"someone", "denied"} {
+		wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: "acme", User: user, Inactivity: 5 * time.Second})
+		require.NoError(t, err)
+		frames := doCollect(t, wc, mcpRequest("1", "tools/call",
+			map[string]any{"name": "env", "arguments": map[string]any{"name": "TOKEN"}}))
+		require.NotEmpty(t, frames)
+		f := frames[len(frames)-1]
+		require.Equal(t, wire.FrameErr, f.Kind)
+		m := decodeMsg(t, f.Body)
+		require.NotNil(t, m.Error)
+
+		assert.NotContains(t, m.Error.Message, "arn:aws",
+			"the resolver's error text must not travel to the caller")
+		assert.NotContains(t, m.Error.Message, "u1.jwt")
+		assert.NotContains(t, m.Error.Message, "AKIAWOULDBEBAD")
+		// The category still has to reach the caller — it is what tells a client
+		// whether re-issuing can help — and a reference has to, or an operator
+		// holding a user's screenshot cannot find the log line that says why.
+		assert.Contains(t, m.Error.Message, "gateway ref ")
+	}
+}

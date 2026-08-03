@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,6 +352,144 @@ func TestPoolTenantQuota(t *testing.T) {
 	_, release, err := p.Get(context.Background(), Key{Server: "s0", Tenant: "bravo"})
 	require.NoError(t, err)
 	release()
+}
+
+// A new credential generation supersedes the entries keyed on the old one.
+// Leaving them to the 5m IdleTTL is what turns a backend that keeps rejecting
+// a caller's credentials into a tenant-wide outage: every request keys a
+// fresh entry, the superseded ones count toward MaxProcsPerTenant, and once
+// they fill it every OTHER server of that tenant is refused too.
+func TestNewGenerationRetiresTheEntryItSupersedes(t *testing.T) {
+	p := NewPool(PoolConfig{MaxProcsPerTenant: 2, IdleTTL: time.Hour}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+	firstMux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	release()
+
+	for gen := 2; gen <= 8; gen++ {
+		k := key
+		k.CredVersion = gen
+		_, release, err := p.Get(context.Background(), k)
+		require.NoError(t, err, "generation %d must still get a backend", gen)
+		release()
+	}
+
+	p.mu.Lock()
+	live := len(p.entries)
+	p.mu.Unlock()
+	assert.Equal(t, 1, live, "only the newest generation may hold a pool entry")
+
+	require.Eventually(t, firstMux.Dead, 10*time.Second, 10*time.Millisecond,
+		"the superseded backend must be closed, not merely unmapped")
+
+	// An unrelated server for the same tenant must still fit under the cap.
+	_, release, err = p.Get(context.Background(), Key{Server: "other", Tenant: "acme"})
+	require.NoError(t, err, "one server's credential churn must not lock out the tenant")
+	release()
+}
+
+// TestRotationIsNotRefusedByTheCapItsPredecessorOccupies is the same failure
+// as above met from the other side: not a tenant filling its cap with dead
+// generations, but a tenant already at the cap for legitimate reasons trying
+// to rotate one credential.
+//
+// Retiring after the spawn cannot help there, because the cap is measured
+// BEFORE the spawn — so the entry that is about to be superseded is still
+// counted, and the rotation is refused by the predecessor it was about to
+// replace. Nothing recovers it until the IdleTTL reaps an entry that was
+// already unreachable: the proxy resolves before it keys, so no later request
+// can carry the old generation.
+func TestRotationIsNotRefusedByTheCapItsPredecessorOccupies(t *testing.T) {
+	p := NewPool(PoolConfig{MaxProcsPerTenant: 1, IdleTTL: time.Hour}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+	_, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	release()
+
+	rotated := key
+	rotated.CredVersion = 2
+	_, release, err = p.Get(context.Background(), rotated)
+	require.NoError(t, err,
+		"a rotation must not be refused by the cap its own superseded entry is holding")
+	release()
+
+	p.mu.Lock()
+	live := len(p.entries)
+	p.mu.Unlock()
+	assert.Equal(t, 1, live, "the superseded entry must not have survived the rotation")
+}
+
+// gatedBackend holds Connect open until released, so every racing Get sits
+// inside the window between the tenant check and the insert at the same time.
+// Connect really does take that long in production — it spawns an npx or uvx
+// subprocess — so this is the normal shape of the race, not a contrived one.
+type gatedBackend struct {
+	Backend
+	arrived *atomic.Int32
+	gate    <-chan struct{}
+}
+
+func (b *gatedBackend) Connect(ctx context.Context) (Conn, error) {
+	b.arrived.Add(1)
+	<-b.gate
+	return b.Backend.Connect(ctx)
+}
+
+// MaxProcsPerTenant is the guard against a tenant's fan-out OOMing the host,
+// so it has to hold against the fan-out itself. Per-user stdio servers make
+// concurrent Gets on distinct keys for one tenant the normal traffic shape.
+func TestTenantQuotaHoldsAgainstConcurrentGets(t *testing.T) {
+	const (
+		limit = 2
+		burst = 8
+	)
+	var arrived, refused atomic.Int32
+	gate := make(chan struct{})
+	p := NewPool(PoolConfig{MaxProcsPerTenant: limit}, func(Key) (Backend, error) {
+		return &gatedBackend{Backend: fakeBackend(nil), arrived: &arrived, gate: gate}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+
+	var wg sync.WaitGroup
+	releases := make(chan func(), burst)
+	for i := range burst {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, release, err := p.Get(context.Background(), Key{
+				Server: fmt.Sprintf("s%d", i), Tenant: "acme",
+			})
+			if err != nil {
+				refused.Add(1)
+				return
+			}
+			releases <- release
+		}(i)
+	}
+
+	// Everyone has either been refused or is holding at the gate: the whole
+	// burst is now past the check, which is the state the quota has to survive.
+	require.Eventually(t, func() bool {
+		return arrived.Load()+refused.Load() == burst
+	}, 10*time.Second, time.Millisecond, "the burst never settled")
+	close(gate)
+	wg.Wait()
+	close(releases)
+	for release := range releases {
+		release()
+	}
+
+	assert.LessOrEqual(t, arrived.Load(), int32(limit),
+		"the tenant cap must be spent before the spawns happen, not counted after")
+	p.mu.Lock()
+	live := p.tenantCountLocked("acme")
+	p.mu.Unlock()
+	assert.LessOrEqual(t, live, limit, "a burst must not leave the tenant over its cap")
+	assert.Positive(t, burst-int(refused.Load()), "the cap must not refuse everything either")
 }
 
 func TestPoolCircuitBreaker(t *testing.T) {

@@ -22,9 +22,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -74,6 +78,112 @@ func TestExecFailureIncludesStderr(t *testing.T) {
 	_, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not authorized")
+}
+
+// startResolve runs one Exec.Resolve in the background, so a test can act on
+// the helper — cancel it, watch for it — while the resolve is in flight.
+func startResolve(ctx context.Context, r *Exec) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(ctx, "acme", "u1", "srv")
+		done <- err
+	}()
+	return done
+}
+
+// awaitResolve fails the test if the resolve has not finished within d. The
+// hangs these tests provoke are unbounded, so waiting on the channel directly
+// would stall the whole package until the go test panic timeout instead of
+// naming the invariant that broke.
+func awaitResolve(t *testing.T, done <-chan error, d time.Duration, what string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		t.Fatalf("Exec.Resolve did not return within %s: %s", d, what)
+		return nil
+	}
+}
+
+func TestExecCancellationKillsTheWholeHelperTree(t *testing.T) {
+	// Wrapper-script helpers fork, the same shape StdioBackend deals with in
+	// npx/uvx. Killing the helper alone leaves that child running and still
+	// holding the write end of stdout, so Wait sits on a pipe that will never
+	// reach EOF and no remaining deadline can rescue it — all under
+	// CachedResolver's per-key mutex, which no context can interrupt. The
+	// (tenant, user, server) key is then wedged for the life of the gateway:
+	// later requests for it park on the lock forever instead of failing and
+	// backing off. Cancelling here is the helper's own Timeout expiring on a
+	// slower clock; os/exec runs the identical path for both.
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+# The long-lived child is forked BEFORE the marker is written, so waiting for
+# the marker proves the process which will hold stdout past the kill already
+# exists. Written the other way round the marker proves only that the
+# marker-WRITER exists, and the cancel can arrive before that writer has forked
+# the sleep — leaving the test asserting the death of a child that was never
+# born.
+sleep 60 &
+echo $! > "$READY"
+sleep 60
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startResolve(ctx, r)
+
+	// The child writes this itself, so its existence proves a forked process
+	// is running and holding stdout — without it the assertions below would
+	// hold trivially on a helper that never forked at all.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(ready)
+		return err == nil
+	}, 30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
+
+	childPID := readPID(t, ready)
+	cancel()
+	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"),
+		"a cancelled helper must fail, not hang")
+	assertReaped(t, childPID)
+}
+
+func TestExecReturnsWhenAChildOutlivesTheHelper(t *testing.T) {
+	// Here the helper prints its credentials and exits cleanly, so nothing
+	// ever cancels the command and its timeout is irrelevant — but a child it
+	// left behind still holds stdout open. os/exec stops watching the context
+	// the moment the process is reaped, so the read that follows is bounded by
+	// WaitDelay alone: without one, Resolve never returns at all, and no
+	// configured timeout changes that.
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sleep 60 &
+echo $! > "$READY"
+echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
+`), 0o755))
+
+	// A generous timeout, to show it is not what ends the wait.
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	err := awaitResolve(t, startResolve(context.Background(), r), 30*time.Second,
+		"a child of the exited helper still holds stdout")
+	// Abandoning the credentials is deliberate. A helper that hands our stdout
+	// to a process outliving it has broken its side of the contract, and a
+	// resolve that fails feeds the backoff and reaches the caller as -32014,
+	// where one that blocks forever reaches nobody.
+	require.ErrorIs(t, err, exec.ErrWaitDelay)
+
+	// Returning is only half of it. Nothing cancelled this command, so the
+	// group kill never ran, and all os/exec does at WaitDelay is close OUR end
+	// of the pipe — the child is still out there, reparented to init, still in
+	// the group. Backoff brings the gateway back down this path for as long as
+	// the helper keeps the habit, so a child left behind here is a child left
+	// behind per attempt.
+	assertReaped(t, readPID(t, ready))
 }
 
 func TestFile(t *testing.T) {
@@ -180,6 +290,53 @@ func TestOAuthRefreshRotation(t *testing.T) {
 	rotated, err := os.ReadFile(tokFile)
 	require.NoError(t, err)
 	assert.Equal(t, "refresh-2", string(rotated), "a rotated refresh token must be persisted")
+}
+
+func TestFileTokenStoreReplacesAtomically(t *testing.T) {
+	// A refresh token is the one credential the gateway cannot re-derive: lose
+	// it and the user goes back through consent. Truncate-then-write leaves a
+	// window in which the file holds neither the old token nor the new one,
+	// and anything landing inside that window — a crash, a full disk, a second
+	// writer — leaves it holding nothing at all.
+	//
+	// The token here is deliberately large, because that is what makes the
+	// window wide enough to catch from another goroutine in a test. Real ones
+	// are smaller and the window is narrower, not absent; a process that dies
+	// inside it loses the token whatever its size.
+	dir := t.TempDir()
+	store := &FileTokenStore{Path: filepath.Join(dir, "{user}.refresh")}
+	tokens := []string{strings.Repeat("a", 64<<10), strings.Repeat("b", 64<<10)}
+	require.NoError(t, store.Save("acme", "u1", "srv", tokens[0]))
+
+	stop := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			assert.NoError(t, store.Save("acme", "u1", "srv", tokens[i%2]))
+		}
+	}()
+
+	for range 3000 {
+		got, err := store.Load("acme", "u1", "srv")
+		require.NoError(t, err, "the token file must never be missing")
+		require.Contains(t, tokens, got,
+			"a reader must see one whole token or the other, never a half-written file")
+	}
+	close(stop)
+	writer.Wait()
+
+	// And nothing left behind: the replacement is one file, not a growing
+	// litter of partial ones beside it.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	assert.Len(t, entries, 1, "the write must not leave temporary files in the token directory")
 }
 
 func TestNATSResolver(t *testing.T) {
@@ -429,6 +586,70 @@ func TestCachedNegativeCacheAndInvalidate(t *testing.T) {
 	assert.Equal(t, 2, inner.count())
 }
 
+func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {
+	// A backend that rejects a credential the source keeps re-issuing (wrong
+	// audience, revoked upstream, clock skew) drives Invalidate on every
+	// request. The generation keys the backend pool, so advancing it for
+	// material that did not change spawns a second backend identical to the
+	// one it supersedes — once per request, until the tenant's cap is spent.
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": "Bearer constant"},
+			ExpiresAt: time.Now().Add(time.Hour),
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, gen1, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	for range 5 {
+		c.Invalidate("t", "u", "s")
+		_, gen, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+		require.NoError(t, err)
+		assert.Equal(t, gen1, gen,
+			"re-resolving the same material after a 401 must not mint a new generation")
+	}
+	assert.Equal(t, 6, inner.count(), "each invalidation must still re-resolve")
+}
+
+func TestInvalidateDoesNotCollapseTheRefreshCadence(t *testing.T) {
+	// Remembering what Invalidate dropped answers one question — did the
+	// material move — and must not be mistaken for an answer to the other. A
+	// refresh returning an unchanged ExpiresAt is unproductive and re-arms at a
+	// fixed skew cadence; a refetch after a 401 returning the same credential
+	// is not a refresh at all, and re-arming it that way would put an hour-long
+	// credential into a resolve every 30s for the rest of its life — trading a
+	// backend spawned per request for a credential source called per skew.
+	exp := time.Now().Add(time.Hour)
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": "Bearer constant"},
+			ExpiresAt: exp,
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	e := c.entry("t", "u", "s")
+	e.mu.Lock()
+	primed := e.refreshAt
+	e.mu.Unlock()
+	require.WithinDuration(t, exp, primed, 2*DefaultSkew,
+		"the lead window opens just before expiry, not just after the resolve")
+
+	c.Invalidate("t", "u", "s")
+	_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	e.mu.Lock()
+	refetched := e.refreshAt
+	e.mu.Unlock()
+	assert.WithinDuration(t, primed, refetched, 2*DefaultSkew,
+		"a refetch after a 401 must leave the refresh-ahead where the credential's expiry put it")
+}
+
 func TestFailBackoffCaps(t *testing.T) {
 	assert.Equal(t, failBackoffBase, failBackoff(1))
 	assert.Equal(t, 2*failBackoffBase, failBackoff(2))
@@ -529,20 +750,97 @@ func TestStaleRefreshResultDiscarded(t *testing.T) {
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return slowStarted.Load() }, 2*time.Second, time.Millisecond)
 
-	// Invalidate (as a 401 would) and re-resolve: fresh material, new gen.
+	// Invalidate, as a 401 would: whatever the refresh is about to return
+	// answers a question about credentials this entry no longer holds.
 	c.Invalidate("t", "u", "s")
+
+	// Let it land, then resolve. The caller joins the refresh already in
+	// flight rather than opening a second one, so this single call covers
+	// both halves: it returns only once that refresh is done, and what it
+	// returns must come from a NEW resolve rather than from the superseded
+	// result that landed while it waited.
+	close(release)
 	fresh, genFresh, err := c.ResolveGen(ctxT(t), "t", "u", "s")
 	require.NoError(t, err)
-	assert.Equal(t, "fresh", fresh.Env["T"])
+	assert.Equal(t, "fresh", fresh.Env["T"], "a superseded refresh must not overwrite fresher credentials")
 	assert.Greater(t, genFresh, gen0)
 
-	// Let the stale refresh land: it must be discarded.
-	close(release)
-	time.Sleep(50 * time.Millisecond)
 	got, genAfter, err := c.ResolveGen(context.Background(), "t", "u", "s")
 	require.NoError(t, err)
-	assert.Equal(t, "fresh", got.Env["T"], "a superseded refresh must not overwrite fresher credentials")
+	assert.Equal(t, "fresh", got.Env["T"])
 	assert.Equal(t, genFresh, genAfter)
+}
+
+func TestExpiredMissWaitsForTheRefreshInFlight(t *testing.T) {
+	// The refresh-ahead deliberately resolves without holding e.mu, so callers
+	// with still-valid credentials are not blocked behind it. A refresh slower
+	// than the lead window outlives those credentials, and the next caller
+	// then takes the expired path — which single-flights against other
+	// foreground callers but knows nothing about the refresh already running.
+	//
+	// Two resolves against one source at once is not merely wasteful for the
+	// refresh_token grant: both load the same refresh token, and an IdP with
+	// one-time-use rotation and reuse detection (the Auth0 and Okta defaults)
+	// answers the second use by revoking the whole token family. The user's
+	// grant is then dead until they consent again.
+	const ttl = 600 * time.Millisecond // lead clamps to ttl/2 = 300ms
+	var live, peak, calls atomic.Int32
+	release := make(chan struct{})
+	refreshStarted := make(chan struct{})
+	inner := ResolveFunc(func(context.Context, string, string, string) (*Credentials, error) {
+		n := live.Add(1)
+		defer live.Add(-1)
+		for {
+			was := peak.Load()
+			if n <= was || peak.CompareAndSwap(was, n) {
+				break
+			}
+		}
+		if calls.Add(1) == 2 { // the refresh-ahead: slower than the lead window
+			close(refreshStarted)
+			select {
+			case <-release:
+			case <-time.After(30 * time.Second): // never block the suite forever
+			}
+		}
+		return &Credentials{
+			Env:       map[string]string{"T": fmt.Sprint(calls.Load())},
+			ExpiresAt: time.Now().Add(ttl),
+		}, nil
+	})
+	c := Cached(inner, time.Hour)
+
+	primed, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	time.Sleep(2 * ttl / 3) // inside the lead window, comfortably before expiry
+	served, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	require.Equal(t, primed.Env["T"], served.Env["T"],
+		"this caller must have been served from cache and merely kicked the refresh")
+	select {
+	case <-refreshStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refresh-ahead never ran")
+	}
+
+	time.Sleep(2 * ttl / 3) // the credentials expire under the running refresh
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+		done <- err
+	}()
+
+	time.Sleep(200 * time.Millisecond) // long enough for a second grant to fire
+	close(release)
+	select {
+	case err := <-done:
+		require.NoError(t, err, "the waiting caller must be served, not failed")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the expired-path caller never returned")
+	}
+	assert.Equal(t, int32(1), peak.Load(),
+		"an expired miss must join the refresh already in flight, not open a second grant")
 }
 
 func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
@@ -568,4 +866,55 @@ func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	assert.LessOrEqual(t, inner.count(), 6, "unchanged ExpiresAt must refresh at fixed cadence, not accelerate")
+}
+
+// TestCancelHelperDoesNotSignalAReapedPid guards the pid the cancel is aimed
+// at.
+//
+// Cmd.Wait reaps the child before it reads the cancel result, so cancelHelper
+// runs after the pid is free often enough to matter. The pid it signals is a
+// process GROUP id, so aimed at a freed one it is a SIGKILL delivered to
+// whatever now holds that pgid. Asking os.Process first is what catches that:
+// it declines to signal a pid it has already reaped, where the raw
+// syscall.Kill behind it consults nothing.
+//
+// Asserted against cancelHelper rather than by racing a real helper — the
+// window is too narrow to hit on purpose, so the test has to be about the
+// property that narrows it. ErrProcessDone and not some other error, because
+// os/exec reads exactly that one as "nothing was interrupted" and so declines
+// to report a helper that finished a hair early as cancelled.
+func TestCancelHelperDoesNotSignalAReapedPid(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, cmd.Start())
+	require.NoError(t, cmd.Wait(), "the child is now reaped and its pid is free")
+
+	assert.ErrorIs(t, cancelHelper(cmd.Process), os.ErrProcessDone,
+		"cancel must ask os.Process before signalling a pid as a process group")
+}
+
+// readPID reads the pid the helper's forked child published for itself.
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err, "helper published %q as its child pid", raw)
+	return pid
+}
+
+// assertReaped waits for a pid to stop existing.
+//
+// Asserted directly rather than inferred from how long the resolve took. The
+// timing form — "it returned in under WaitDelay, so the group kill must have
+// worked" — is a race against the very grace period it is trying to prove
+// unnecessary, and it fails on a machine fast enough to reach the kill before
+// the group has settled. What the group kill promises is that the child is
+// gone; that is what this checks.
+func assertReaped(t *testing.T, pid int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return syscall.Kill(pid, syscall.Signal(0)) != nil
+	}, 10*time.Second, 20*time.Millisecond,
+		"pid %d survived the group kill and still holds the helper's stdout", pid)
 }

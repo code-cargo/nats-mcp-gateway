@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -113,9 +114,41 @@ func (s *FileTokenStore) Load(tenant, user, server string) (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-// Save implements TokenStore.
+// Save implements TokenStore: write a temp file, flush it, rename it over the
+// destination. A refresh token is the one credential the gateway cannot
+// re-derive — losing it costs the user another trip through consent — and
+// truncate-then-write leaves a window where the file holds neither the old
+// token nor the new one. A crash, a full disk, or a second writer landing
+// inside that window leaves it holding nothing. A rename is one directory
+// operation, so a reader sees one whole token or the other and a writer that
+// dies leaves the previous one intact.
 func (s *FileTokenStore) Save(tenant, user, server, refreshToken string) error {
-	return os.WriteFile(expandPath(s.Path, tenant, user, server), []byte(refreshToken), 0o600)
+	path := expandPath(s.Path, tenant, user, server)
+	// Beside the destination, because rename is only atomic within one
+	// filesystem and the token file is routinely a mounted secret volume.
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".*")
+	if err != nil {
+		return fmt.Errorf("cred: refresh token: %w", err)
+	}
+	defer func() { _ = os.Remove(f.Name()) }() // a no-op once the rename lands
+	if _, err := f.WriteString(refreshToken); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("cred: refresh token: %w", err)
+	}
+	// Durability before visibility: a rename can reach the disk ahead of the
+	// bytes it points at, and a token file that survives a crash as zero bytes
+	// is the same loss as no file at all.
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("cred: refresh token: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("cred: refresh token: %w", err)
+	}
+	if err := os.Rename(f.Name(), path); err != nil {
+		return fmt.Errorf("cred: refresh token: %w", err)
+	}
+	return nil
 }
 
 // OAuthRefresh performs the refresh_token grant over a TokenStore: per-user

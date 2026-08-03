@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -1315,6 +1316,29 @@ func TestBuildBackendRejectsGenerationMismatch(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// The factory's own resolve is a second conduit for the same material: its
+// error becomes the pool's error, which the proxy hands the caller as -32010
+// with the text intact.
+func TestBuildBackendDoesNotEchoTheResolverDetail(t *testing.T) {
+	const detail = "helper stderr: no grant for /var/run/secrets/acme/u1.jwt (token AKIAWOULDBEBAD)"
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(context.Context, string, string, string) (*cred.Credentials, error) {
+			return nil, cred.Terminal(errors.New(detail))
+		},
+	), 0)
+
+	key := backend.Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 7}
+	_, err := buildBackend(key, config.Server{Command: "true"}, resolver, testLogger())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "u1.jwt", "the resolver's error text must not travel to the caller")
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD")
+	assert.Contains(t, err.Error(), "gateway ref ")
+	// A pool failure reaches the client as -32010, which means "re-issue". A
+	// refusal that re-issuing cannot fix has to say so, or the contract of the
+	// code the caller sees is the only advice it gets.
+	assert.Contains(t, err.Error(), "do not retry", "an authoritative refusal must survive the suppression")
+}
+
 // A server removed from config must not leave its resolver (and cached
 // credential material) behind in the registry.
 func TestCredRegistryPrunesRemovedServers(t *testing.T) {
@@ -1481,4 +1505,37 @@ func TestBuildBackendRefusesAPerUserServerKeyedWithoutAUser(t *testing.T) {
 	_, statErr := os.Stat(marker)
 	assert.True(t, os.IsNotExist(statErr),
 		"the resolver must not be asked for the placeholder identity at all")
+}
+
+// TestTokenSourceDoesNotEchoTheResolverDetail covers the third resolve site,
+// and the only one on the request path.
+//
+// The proxy's resolve and the pool factory's both suppress the resolver's own
+// error text. credTokenSource did not — and an HTTP backend answering 401
+// makes doWithAuthRetry invalidate and resolve AGAIN, so this path runs at
+// exactly the moment the credential source is failing and saying why. From
+// there the text is wrapped by newRequest, turned into a -32603 by
+// roundTripOnce, and forwarded to the caller verbatim, because forwarding a
+// backend's JSON-RPC error unchanged is what the proxy is for.
+func TestTokenSourceDoesNotEchoTheResolverDetail(t *testing.T) {
+	const secret = "sts assume-role arn:aws:iam::918273:role/prod failed reading " +
+		"/var/run/secrets/acme/u1.jwt (token AKIAWOULDBEBAD)"
+
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755))
+
+	resolver := cred.Cached(&cred.Exec{Command: helper, Timeout: 10 * time.Second}, 0)
+	ts := &credTokenSource{
+		resolver: resolver, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		tenant: "acme", user: "u1", server: "aws",
+	}
+
+	_, err := ts.Headers(context.Background())
+	require.Error(t, err)
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD", "the helper's stderr reached the caller")
+	assert.NotContains(t, err.Error(), "/var/run/secrets", "a pod path reached the caller")
+	assert.NotContains(t, err.Error(), "arn:aws:iam", "an internal identity reached the caller")
+	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
 }
