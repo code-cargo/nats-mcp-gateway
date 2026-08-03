@@ -9,7 +9,8 @@ end users never hold them.
 > The wire (subjects, framing, headers) is versioned `Mcp-Wire: 1` but may
 > still change incompatibly, and MCP 2026-07-28 — the revision the wire
 > carries — was itself only finalized on 2026-07-28. Pin a commit, expect
-> breaking changes, and read the git log before upgrading.
+> breaking changes, and read [Upgrading](#upgrading) and the git log before
+> moving one.
 
 ```
 [MCP client]           [gateway fleet, queue group]       [real MCP servers]
@@ -70,12 +71,12 @@ gateway learns from the connection handshake (`nc.MaxPayload()`) — there is
 no size config to keep in sync. A response that doesn't fit normally fails
 with a legible `-32012`. With **claim-check** enabled, the gateway instead
 parks the oversize body in a JetStream Object Store and sends only a
-reference (`Mcp-Claim` header on an empty `end` frame); the client fetches,
-digest-verifies, and deletes it before the MCP client sees anything:
+reference (`Mcp-Claim` header on an empty `end` frame); the client fetches
+and digest-verifies it before the MCP client sees anything:
 
 ```
 gateway: body > max_payload → put MCP_CLAIMS_{tenant}/{random-id} → end + Mcp-Claim: id
-client:  end + Mcp-Claim     → fetch (SHA-256 verified) → delete → deliver inline
+client:  end + Mcp-Claim     → fetch (SHA-256 verified) → best-effort delete → inline
 ```
 
 Both ends opt in — the feature is **off by default** and requires JetStream:
@@ -88,21 +89,66 @@ natsmcp shim --server aws --accept-claims          # client side (also: natsmcp 
 
 The gateway only claims for requests carrying `Mcp-Accept-Claim: 1` (a
 claimed frame's empty body would read as "cancelled" to an unaware client),
-so mixed fleets are safe. One bucket per tenant (`MCP_CLAIMS_{tenant}`)
-keeps the fencing in NATS permissions, same as request subjects — the
-callout grants clients read on their own bucket:
+so mixed fleets are safe. One bucket per tenant (`MCP_CLAIMS_{tenant}`,
+backed by the stream `OBJ_MCP_CLAIMS_{tenant}`) keeps the fencing in NATS
+permissions, same as request subjects. An object store is *read* through the
+JetStream API, so what the callout mints for a client is four publish grants
+there — nothing under `$O`:
 
 ```
-allow: ["$O.MCP_CLAIMS_acme.>"]   # object-store subjects for tenant acme
+# client (shim, call) for tenant acme — read-only
+publish: [
+  "$JS.API.STREAM.INFO.OBJ_MCP_CLAIMS_acme",        # bind the bucket
+  "$JS.API.DIRECT.GET.OBJ_MCP_CLAIMS_acme.>",       # the object's metadata
+  "$JS.API.CONSUMER.CREATE.OBJ_MCP_CLAIMS_acme.>",  # read its chunks
+  "$JS.API.CONSUMER.DELETE.OBJ_MCP_CLAIMS_acme.>"   # drop that consumer after
+]
 ```
 
-Objects live until fetched (client deletes eagerly) or until the bucket TTL
-(`maxAge`, default 5m) reaps them — a client that dies mid-fetch can
-re-issue and still succeed. `maxBytes` (default 1GiB) caps each tenant's
-bucket; single objects cap at 64MiB. Every failure degrades to the status
-quo: store unreachable at put time → `-32012`; fetch failure → `-32010`,
-re-issue. Within a tenant, claim secrecy rests on unguessable random ids and
-the privacy of reply inboxes. Cost: a claimed result takes roughly one extra
+`$O.MCP_CLAIMS_acme.>` is the opposite of that grant, despite reading like
+it: those subjects are the bucket stream's *ingest*, so it is write access
+that can read nothing. A client holding it fails its first fetch on
+`$JS.API.STREAM.INFO.…` — and can meanwhile publish a rollup metadata
+message over `$O.MCP_CLAIMS_acme.M.{base64url(claim-id)}`, a subject
+derivable from a claim id alone, turning a co-tenant's in-flight fetch into
+a digest mismatch; and can fill that tenant's bucket to `maxBytes` with
+chunk traffic nobody asked for.
+
+The gateway's own identity needs the write side. `$JS.API.>` would cover it
+and grants far too much — every other tenant's bucket, and `STREAM.DELETE`
+on anything in the account. Per bucket it needs exactly:
+
+```
+# gateway for tenant acme
+publish: [
+  "$JS.API.STREAM.CREATE.OBJ_MCP_CLAIMS_acme",   # the bucket is made on first claim
+  "$JS.API.STREAM.UPDATE.OBJ_MCP_CLAIMS_acme",
+  "$JS.API.STREAM.INFO.OBJ_MCP_CLAIMS_acme",
+  "$JS.API.STREAM.PURGE.OBJ_MCP_CLAIMS_acme",
+  "$JS.API.DIRECT.GET.OBJ_MCP_CLAIMS_acme.>",
+  "$O.MCP_CLAIMS_acme.>"                         # chunks and metadata
+]
+```
+
+Both blocks are per tenant and there is no shortening them: NATS wildcards
+match whole tokens, so `OBJ_MCP_CLAIMS_*` is a literal token that matches no
+bucket at all. A scoped instance has one tenant and this is exact; a central
+fleet generates the blocks from the tenant list the callout already keeps.
+
+The client's eager delete is what a read-only grant gives up: deleting needs
+a metadata write plus `$JS.API.STREAM.PURGE.…`, and that purge would equally
+let any client wipe the tenant's live claims. So the delete is best-effort
+by design — objects live until the bucket TTL (`maxAge`, default 5m) reaps
+them, which is the same reason a client that dies mid-fetch can re-issue and
+still succeed. The fetch itself is unaffected; the client's NATS library
+notes the refused delete on stderr, one line per claimed response, which is
+expected under a read-only grant rather than a fault. Keep `maxAge` short
+where you leave the delete ungranted, and size `maxBytes` (default 1GiB, per
+tenant) for a whole TTL window of claims; single objects cap at 64MiB. Every
+failure degrades to the status quo: store unreachable at put time →
+`-32012`; fetch failure → `-32010`, re-issue.
+Within a tenant, claim secrecy rests on unguessable random ids and the
+privacy of reply inboxes. Cost: a claimed result takes roughly one extra
 disk round-trip on the JetStream node (~300ms for 8MB) — keep `max_payload`
 at 8MB so claims stay the rare tail, not the steady path.
 
@@ -247,7 +293,10 @@ credential from being quietly mangled on its way to a backend:
 > do. That form is now the literal text `$VAR`, and — unlike an undefined
 > `${VAR}` — it does **not** fail the load, so a config relying on it ships
 > `$GITHUB_TOKEN` to the backend as a credential and comes back as a 401 with
-> nothing in the gateway's logs to explain it. Braces are not optional: grep
+> nothing in the gateway's logs to explain it. The reverse case was quieter
+> still: the old form took the longest name it could, so `$HOME_ISH/x`
+> resolved to `/x` — a path with its prefix deleted, nothing named
+> `HOME_ISH` — where it now stays `$HOME_ISH/x`. Braces are not optional: grep
 > your configs for `$` not followed by `{` before upgrading. The bare form
 > stays literal on purpose — a `$` belongs to passwords (`s$cret`) and to
 > arguments meant for the backend's own shell (`--fmt=$HOME`), and eating
@@ -265,8 +314,13 @@ covers that one server's `url` and `tokenUrl` only.
 > the fetch source revalidates on every reload — so one un-migrated `http://`
 > url takes down every other server on that gateway. Fix the config before
 > rolling the binary: add `allowPlaintext` where the hop is genuinely
-> encrypted elsewhere, `https` everywhere else. An older gateway ignores
-> `allowPlaintext`, so the config change is safe to land first.
+> encrypted elsewhere, `https` everywhere else. On the **fetch and inline**
+> sources an older gateway ignores `allowPlaintext`, so there the config
+> change is safe to land first and safe to sit under a rollback. The **file**
+> source parses strictly, and an older binary meeting the new key fails with
+> `unknown field "allowPlaintext"` and crash-loops — so on a file-source
+> gateway the config edit and the binary have to move together, and back
+> together.
 
 Redirects are refused unless the hop changes nothing but the path. Go's
 default policy is written for a browser: it keeps `Authorization` across an
@@ -662,6 +716,73 @@ Client side (`.mcp.json`):
 tools/list and a tool call through a real `server-everything` subprocess,
 then the same call as a permission-restricted user failing **with no gateway
 code running**. See `demo/README-steps` inside `demo/run.sh`.
+
+## Upgrading
+
+Changes that alter a working deployment's behavior rather than adding to it.
+Two more are called out where they are configured: the [`${VAR}` reference
+form](#configuration) and [`allowPlaintext`](#configuration).
+
+- **`${VAR}` reaches string values only.** Expansion runs on the decoded
+  document now, not on its text, so a reference outside a JSON string no
+  longer works by any spelling: unquoted (`"maxConcurrent": ${POOL_MAX}`)
+  fails the parse, quoted (`"maxConcurrent": "${POOL_MAX}"`) fails the type
+  check. That is every non-string field — `pool.maxConcurrent`,
+  `pool.maxProcsPerTenant`, `claimCheck.maxBytes`, `discoverTtlMs`,
+  `allowPlaintext`. For the first four the unquoted form used to work,
+  because substitution happened before the parse saw it; `allowPlaintext` is
+  new and never took one. The duration and size fields that are strings
+  (`pool.idleTtl`, `pool.maxLifetime`, `claimCheck.maxAge`) are unaffected.
+- **`${VAR}` in a key is rejected**, naming the key. It used to expand, so a
+  templated server name (`"servers": {"${POD_SERVER}": …}` — plausible for
+  the per-user pod shape in [Local and remote
+  servers](#local-and-remote-servers)) or a templated `env`/`headers` key was
+  expressible and is not now. Like any parse failure this rejects the whole
+  document: the file source crash-loops the pod, the fetch source freezes the
+  fleet on its last good config.
+- **`$$` in a value changed meaning, silently.** It is now the escape for one
+  literal `$`; it used to be read as the shell's `$$` variable and replaced
+  with nothing. So `a$$b` was `ab` and is now `a$b`, and a password written
+  `pa$$word` was `paword` and is now `pa$word` — neither of which is the
+  value on the page. Write `$$$$` for two literal dollars. Nothing errors
+  either way; the backend just receives a different secret.
+- **The `exec` credential helper gets a private, empty `HOME`** — a scratch
+  directory made per resolve and removed after — in place of the gateway's.
+  A helper reading `~/.aws/config`, `~/.config/gcloud` or
+  `~/.docker/config.json` now finds an empty directory and fails, surfacing
+  as a credential-resolution failure on every call to that server, with the
+  helper's own stderr in the message. Naming `HOME` in that server's
+  `auth.env` overrides it, which is what a wrapper around `aws` or `gcloud`
+  wants.
+- **`exec` resolution needs a writable temp directory on every resolve**,
+  because that scratch `HOME` is created under `TMPDIR` (`/tmp` when unset).
+  stdio backends already made their workdir the same way, but a pod with a
+  read-only root filesystem fronting only HTTP backends never touched one.
+  Mount an `emptyDir`, or point `TMPDIR` at one.
+- **A helper's stdout must close within 3s of the helper itself exiting.**
+  Anything it left running that inherited that pipe — a daemon it starts on
+  demand, an agent — holds it open, and reaching the delay fails the resolve
+  and SIGKILLs the helper's process group rather than waiting out `Timeout`.
+  The bound is fixed; no config field raises it. Give such a child its own
+  stdout (`>/dev/null 2>&1` in the wrapper).
+- **Claim-check store operations do not observe the drain.** Parking an
+  oversize body, and deleting one whose stream ended before its reference
+  went out, each run on the request's own goroutine under a private 30s bound
+  rather than the caller's context or the shutdown's. `Shutdown` waits for
+  those goroutines, so a burst of oversize replies against a slow or
+  unreachable JetStream can hold the drain 30s per store operation and push
+  `Shutdown` into its "drain timed out" path. Size the pod's termination
+  grace period past that, or keep `max_payload` at 8MB so claims stay rare.
+- **The claim-check client grant this file used to give was wrong**, and a
+  client still holding it cannot fetch anything while being able to write
+  into its tenant's bucket. See [Large results](#large-results-claim-check)
+  for what to grant instead.
+- **`wire.ClaimStore` gained a `Delete` method** — source-breaking for an
+  embedder supplying its own store through `ServerConfig.Claims` or
+  `ClientConfig.Claims`. It removes a body whose claim id was never handed
+  out, because the stream ended between the put and the frame that would have
+  carried the reference. Returning nil and doing nothing is safe; those
+  objects then wait for the bucket TTL like any other.
 
 ## Known v1 limits
 
