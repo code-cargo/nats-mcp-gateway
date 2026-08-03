@@ -569,14 +569,38 @@ func TestPoolCircuitBreaker(t *testing.T) {
 	assert.Contains(t, err.Error(), "circuit open", "after threshold failures the breaker must fail fast without spawning")
 }
 
-// blockingBackend hangs in Connect until the caller's context ends, standing
-// in for the slow spawn a real one is: a legacy backend's Connect runs the
-// initialize handshake, and a cold `npx` server can take seconds to answer it.
-type blockingBackend struct{}
+// slowBackend stands in for the spawn a real backend is: a legacy backend
+// runs the initialize handshake inside Connect, and a cold `npx` server can
+// take seconds to answer it.
+//
+// spawns counts Connect ATTEMPTS, not successes, and the difference is the
+// whole point: a spawn that was killed and re-run leaves one success behind
+// just like a spawn that was inherited, so counting successes cannot tell the
+// two apart. Counting entries can.
+type slowBackend struct {
+	Backend
+	delay  time.Duration
+	spawns *atomic.Int32
+}
 
-func (blockingBackend) Connect(ctx context.Context) (Conn, error) {
-	<-ctx.Done()
-	return nil, ctx.Err()
+func (s slowBackend) Connect(ctx context.Context) (Conn, error) {
+	s.spawns.Add(1)
+	select {
+	case <-time.After(s.delay):
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return s.Backend.Connect(ctx)
+}
+
+func slowPool(t *testing.T, delay time.Duration, cfg PoolConfig) (*Pool, *atomic.Int32) {
+	t.Helper()
+	spawns := &atomic.Int32{}
+	p := NewPool(cfg, func(Key) (Backend, error) {
+		return slowBackend{Backend: fakeBackend(nil), delay: delay, spawns: spawns}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+	return p, spawns
 }
 
 // The breaker exists to stop the gateway hammering a backend that cannot
@@ -584,11 +608,12 @@ func (blockingBackend) Connect(ctx context.Context) (Conn, error) {
 // start — and counting it means impatient clients, not a broken server, are
 // what opens the circuit. Three of them (the default threshold) and every
 // other caller of that server is refused for the whole cooldown, including
-// the ones prepared to wait.
+// the ones prepared to wait. Clients timing out on a cold spawn is the NORMAL
+// case, not a pathological one: a legacy backend handshakes inside Connect,
+// so `npx` fetching a package on first use routinely outlasts a client.
 func TestCallerCancellationDoesNotOpenTheCircuit(t *testing.T) {
-	p := NewPool(PoolConfig{BreakerThreshold: 3, BreakerCooldown: time.Minute},
-		func(Key) (Backend, error) { return blockingBackend{}, nil }, nil)
-	t.Cleanup(p.Shutdown)
+	p, _ := slowPool(t, time.Second,
+		PoolConfig{BreakerThreshold: 3, BreakerCooldown: time.Minute})
 
 	key := Key{Server: "s", Tenant: "acme"}
 	for range 3 {
@@ -602,9 +627,65 @@ func TestCallerCancellationDoesNotOpenTheCircuit(t *testing.T) {
 	br := p.broken[key]
 	p.mu.Unlock()
 	assert.Nil(t, br, "a caller that stopped waiting was counted as a spawn failure")
+}
 
-	// The breaker still opens on the failure it is actually for.
-	p.factory = func(Key) (Backend, error) { return &StdioBackend{Command: "/nonexistent/binary-xyz"}, nil }
+// The spawn belongs to the pool, not to whoever happened to trigger it.
+// Tearing the subprocess down when that caller gives up means the next
+// request starts the same cold spawn from zero — so a backend slower to boot
+// than its clients are patient never finishes coming up, however many times
+// it is asked for. Not counting the cancellation only stops that from being
+// reported as a broken backend; inheriting the spawn is what fixes it.
+func TestASlowSpawnOutlivesTheCallerThatTriggeredIt(t *testing.T) {
+	p, spawns := slowPool(t, 300*time.Millisecond, PoolConfig{})
+
+	key := Key{Server: "s", Tenant: "acme"}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, _, err := p.Get(ctx, key)
+	cancel()
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	mux, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	defer release()
+	resp, err := mux.Call(context.Background(), callTool("c1", "echo", `{"hello":"world"}`, ""), nil)
+	require.NoError(t, err)
+	assert.Contains(t, string(resp.Result), "hello")
+	assert.Equal(t, int32(1), spawns.Load(),
+		"the abandoned spawn was killed and started over instead of being inherited")
+}
+
+// Concurrent Gets for one key share a subprocess. Without that, moving the
+// spawn off the caller's context would only relocate the churn: ten
+// simultaneous callers for a cold server would start ten `npx` processes and
+// throw nine away.
+func TestConcurrentGetsShareOneSpawn(t *testing.T) {
+	p, spawns := slowPool(t, 100*time.Millisecond, PoolConfig{})
+
+	key := Key{Server: "s", Tenant: "acme"}
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, release, err := p.Get(context.Background(), key)
+			if assert.NoError(t, err) {
+				release()
+			}
+		}()
+	}
+	wg.Wait()
+	assert.Equal(t, int32(1), spawns.Load(), "each concurrent Get started its own subprocess")
+}
+
+// The breaker still opens on the failure it is actually for — and with the
+// spawn on the pool's own deadline there is nothing left to disambiguate:
+// every error that reaches recordFailure is the backend failing to start.
+func TestGenuineSpawnFailureStillOpensTheCircuit(t *testing.T) {
+	p := NewPool(PoolConfig{BreakerThreshold: 3, BreakerCooldown: time.Minute},
+		func(Key) (Backend, error) { return &StdioBackend{Command: "/nonexistent/binary-xyz"}, nil }, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme"}
 	for range 3 {
 		_, _, err := p.Get(context.Background(), key)
 		require.Error(t, err)
@@ -613,6 +694,51 @@ func TestCallerCancellationDoesNotOpenTheCircuit(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "circuit open",
 		"a backend that genuinely cannot start must still open the circuit")
+}
+
+// unstoppableBackend ignores cancellation, so a spawn can be landed on a pool
+// that shut down while it ran — the race Shutdown's closed flag exists for,
+// made deterministic. Cancelling spawnCtx handles every backend that honours
+// its context; this covers the one that does not.
+type unstoppableBackend struct {
+	Backend
+	started chan struct{}
+	release chan struct{}
+}
+
+func (u unstoppableBackend) Connect(context.Context) (Conn, error) {
+	close(u.started)
+	<-u.release
+	return u.Backend.Connect(context.Background())
+}
+
+// A spawn that lands after Shutdown must close what it built. Installing it
+// would leak the subprocess outright: Shutdown has already walked the entries,
+// and nothing walks them again.
+func TestSpawnLandingAfterShutdownIsClosedNotInstalled(t *testing.T) {
+	started, release := make(chan struct{}), make(chan struct{})
+	p := NewPool(PoolConfig{}, func(Key) (Backend, error) {
+		return unstoppableBackend{Backend: fakeBackend(nil), started: started, release: release}, nil
+	}, nil)
+
+	key := Key{Server: "s", Tenant: "acme"}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	_, _, err := p.Get(ctx, key)
+	cancel()
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+
+	<-started
+	p.Shutdown()
+	close(release)
+
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return len(p.spawning) == 0
+	}, 10*time.Second, time.Millisecond, "the spawn never finished")
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	assert.Empty(t, p.entries, "a spawn landed in a pool that had already been drained")
 }
 
 func TestPoolReplacesDeadConn(t *testing.T) {

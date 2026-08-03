@@ -52,6 +52,10 @@ type PoolConfig struct {
 	// (default 30s).
 	BreakerThreshold int
 	BreakerCooldown  time.Duration
+	// SpawnTimeout bounds one backend creation (default 60s). It is the
+	// POOL's deadline and not the requesting caller's, which is the whole
+	// point of it — see runSpawn.
+	SpawnTimeout time.Duration
 }
 
 // Filled returns c with every unset field replaced by the value the pool
@@ -78,6 +82,11 @@ func (c *PoolConfig) fill() {
 	}
 	if c.BreakerCooldown <= 0 {
 		c.BreakerCooldown = 30 * time.Second
+	}
+	// Longer than the legacy bridge's own 30s handshake timeout, so a stalled
+	// initialize is reported by the layer that can say what stalled.
+	if c.SpawnTimeout <= 0 {
+		c.SpawnTimeout = 60 * time.Second
 	}
 }
 
@@ -114,14 +123,36 @@ type Pool struct {
 	// starting — and a burst wide enough to matter is entirely in flight by
 	// then.
 	pending map[string]int
+	// spawning holds the in-flight creation for a key. Concurrent Gets attach
+	// to it instead of each starting a subprocess and discarding all but one.
+	spawning map[Key]*spawn
 	// orphans are past-deadline entries replaced by Get while they still had
 	// in-flight calls: the calls run to completion and the reaper closes the
 	// mux once they drain. Closing immediately would kill live work for an
 	// age-out — worse than letting it finish.
 	orphans []*entry
+	// closed is set by Shutdown, so a spawn still in flight when it lands
+	// closes what it built instead of installing it into a drained pool.
+	closed bool
 
 	stop chan struct{}
-	once sync.Once
+	// spawnCtx is the lifetime every spawn runs under. Shutdown cancels it,
+	// which is the only thing that may interrupt one.
+	spawnCtx    context.Context
+	spawnCancel context.CancelFunc
+	once        sync.Once
+}
+
+// spawn is one in-flight backend creation, shared by every Get waiting for
+// that key. e and err are written before done is closed and read only after
+// receiving from it.
+type spawn struct {
+	done chan struct{}
+	e    *entry
+	err  error
+	// stale is set (under p.mu) when EvictServer retires the key while this
+	// spawn runs: what it produces was built from the superseded definition.
+	stale bool
 }
 
 type entry struct {
@@ -155,14 +186,16 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 		log = slog.Default()
 	}
 	p := &Pool{
-		cfg:     cfg,
-		factory: factory,
-		log:     log,
-		entries: make(map[Key]*entry),
-		broken:  make(map[Key]*breaker),
-		pending: make(map[string]int),
-		stop:    make(chan struct{}),
+		cfg:      cfg,
+		factory:  factory,
+		log:      log,
+		entries:  make(map[Key]*entry),
+		broken:   make(map[Key]*breaker),
+		pending:  make(map[string]int),
+		spawning: make(map[Key]*spawn),
+		stop:     make(chan struct{}),
 	}
+	p.spawnCtx, p.spawnCancel = context.WithCancel(context.Background())
 	go p.reapLoop()
 	return p
 }
@@ -171,6 +204,9 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 // to use while that Get was queued for a call slot. Internal to Get's retry;
 // it never reaches a caller.
 var errEntryRetired = errors.New("backend: pooled entry retired while queued")
+
+// errPoolClosed ends a spawn whose pool shut down while it was starting.
+var errPoolClosed = errors.New("backend: pool is shut down")
 
 // getMaxAttempts bounds that retry. Each attempt spawns at most one backend,
 // so a pathological case — credentials already expired the moment they are
@@ -195,6 +231,10 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 // start over.
 func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return nil, nil, errPoolClosed
+	}
 	e := p.entries[key]
 	// Past-deadline entries are replaced here, not only by the reaper: its
 	// 30s tick must never hand a request credentials that expired between
@@ -230,78 +270,46 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 			return nil, nil, fmt.Errorf("backend: circuit open for %s/%s until %s (%d consecutive spawn failures)",
 				key.Tenant, key.Server, br.openUntil.Format(time.RFC3339), br.fails)
 		}
-		if p.tenantCountLocked(key.Tenant) >= p.cfg.MaxProcsPerTenant {
-			p.mu.Unlock()
-			return nil, nil, fmt.Errorf("backend: tenant %q at max live backends (%d)",
-				key.Tenant, p.cfg.MaxProcsPerTenant)
+		sp := p.spawning[key]
+		if sp == nil {
+			if p.tenantCountLocked(key.Tenant) >= p.cfg.MaxProcsPerTenant {
+				p.mu.Unlock()
+				return nil, nil, fmt.Errorf("backend: tenant %q at max live backends (%d)",
+					key.Tenant, p.cfg.MaxProcsPerTenant)
+			}
+			// Claim the slot while we still hold the lock. The spawn below is
+			// the resource the cap is about, and it begins here, not when the
+			// entry lands in the map.
+			p.pending[key.Tenant]++
+			sp = &spawn{done: make(chan struct{})}
+			p.spawning[key] = sp
+			go p.runSpawn(key, sp)
 		}
-		// Claim the slot while we still hold the lock. The spawn below is the
-		// resource the cap is about, and it begins here, not when the entry
-		// lands in the map.
-		p.pending[key.Tenant]++
 		p.mu.Unlock()
 
-		// Connect outside the lock: spawning can take seconds.
-		b, err := p.factory(key)
-		if err != nil {
-			p.releasePending(key.Tenant)
-			return nil, nil, err
+		select {
+		case <-sp.done:
+		case <-ctx.Done():
+			// Leaving is this caller's business alone. The spawn belongs to
+			// the pool and runs on, because a legacy backend handshakes
+			// inside Connect and a cold `npx` server routinely takes longer
+			// to come up than one client will wait: tearing the subprocess
+			// down on the way out would make the next request start that same
+			// cold spawn from zero, and a server slower to boot than its
+			// clients are patient would never finish coming up at all.
+			return nil, nil, ctx.Err()
 		}
-		conn, err := b.Connect(ctx)
-		if err != nil {
-			// A Connect the CALLER ended (its context cancelled or its deadline
-			// passed) is not evidence the backend cannot start, and the breaker
-			// exists only to stop us hammering one that cannot. Counting it means
-			// impatient clients open the circuit: a legacy backend handshakes
-			// inside Connect, so a cold `npx` server routinely takes longer to
-			// come up than a client is willing to wait, and three such clients
-			// would refuse the server to everyone — including the callers content
-			// to wait for it — for the whole cooldown.
-			if ctx.Err() == nil {
-				p.recordFailure(key)
-			}
-			p.releasePending(key.Tenant)
-			return nil, nil, err
+		if sp.err != nil {
+			return nil, nil, sp.err
 		}
 		p.mu.Lock()
-		// The entry counts for itself from here, whichever branch below wins.
-		p.releasePendingLocked(key.Tenant)
-		delete(p.broken, key)
-		// Lost the race with another Get? Adopt the entry that landed first
-		// and close the connection we just opened. Keeping both would put a
-		// second subprocess under one key with nothing to reach it — the cap
-		// counts it, the reaper collects it, and the tenant pays for it in
-		// between.
-		if cur := p.entries[key]; cur != nil && !cur.mux.Dead() {
-			e = cur
-			go func(c Conn) { _ = c.Close() }(conn)
-		} else {
-			born := time.Now()
-			deadline := born.Add(p.cfg.MaxLifetime)
-			if exp, ok := b.(Expiring); ok {
-				if t := exp.CredExpiresAt(); !t.IsZero() {
-					d := t.Add(-credExpirySkew)
-					if d.Before(born) {
-						// Credentials already inside the skew window at
-						// spawn: a skewed deadline would be born-dead and
-						// every Get would tear down and respawn. Live to
-						// the literal expiry instead; the cost is the
-						// documented in-flight -32010 at expiry.
-						d = t
-					}
-					if d.Before(deadline) {
-						deadline = d
-					}
-				}
-			}
-			e = &entry{
-				key:      key,
-				mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
-				born:     born,
-				deadline: deadline,
-				sem:      make(chan struct{}, p.cfg.MaxConcurrent),
-			}
-			p.entries[key] = e
+		// The spawn installed this entry, but a Get that waited on it can wake
+		// arbitrarily later — long enough for EvictServer, the reaper or a
+		// credential rotation to have retired it. Same re-check, for the same
+		// reason, as the one after the sem wait below.
+		if e = sp.e; p.entries[key] != e {
+			p.mu.Unlock()
+			return nil, nil, errEntryRetired
 		}
 	}
 	e.lastUsed = time.Now()
@@ -341,6 +349,118 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 		p.mu.Unlock()
 	}
 	return mux, release, nil
+}
+
+// runSpawn creates one backend for a key and wakes every Get waiting on it.
+//
+// The context is the POOL's, deliberately, and that is the whole reason this
+// runs off the request path. A spawn bound to the caller that happened to
+// trigger it dies when that caller loses patience, and since nothing is
+// retained the next request starts the same cold subprocess from zero — so a
+// backend slower to boot than its clients are patient never comes up, however
+// many times it is asked for. The same binding makes the breaker unreadable:
+// a caller that gave up and a backend that cannot start both surface as a
+// cancelled Connect, so counting cancellations opens the circuit on
+// impatience while not counting them leaves a genuinely hung backend
+// uncounted. A deadline the pool owns separates the two — no caller's
+// cancellation reaches Connect, and every failure that arrives here is the
+// backend's.
+func (p *Pool) runSpawn(key Key, sp *spawn) {
+	ctx, cancel := context.WithTimeout(p.spawnCtx, p.cfg.SpawnTimeout)
+	defer cancel()
+
+	e, err := p.spawnEntry(ctx, key, sp)
+
+	// Written before done is closed, so every waiter's receive sees finished
+	// values; unmapped under the lock, so a Get arriving a moment too late
+	// starts a fresh spawn instead of attaching to this finished one.
+	sp.e, sp.err = e, err
+	p.mu.Lock()
+	if p.spawning[key] == sp {
+		delete(p.spawning, key)
+	}
+	p.mu.Unlock()
+	close(sp.done)
+}
+
+// spawnEntry resolves the backend for a key, connects it, and installs the
+// pooled entry.
+func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, error) {
+	b, err := p.factory(key)
+	if err != nil {
+		p.releasePending(key.Tenant)
+		return nil, err
+	}
+	conn, err := b.Connect(ctx)
+	if err != nil {
+		// Unconditional: ctx is the pool's, so nothing in this count is a
+		// caller's impatience — every failure reaching here is the backend
+		// failing to start, which is exactly what the breaker is for.
+		p.recordFailure(key)
+		p.releasePending(key.Tenant)
+		return nil, err
+	}
+
+	p.mu.Lock()
+	// The entry counts for itself from here, whichever branch below wins.
+	p.releasePendingLocked(key.Tenant)
+	// Shutdown drained the pool, or a reload retired this server, while the
+	// subprocess was still starting: what came up was built from a definition
+	// nobody wants installed now.
+	if p.closed || sp.stale {
+		closed := p.closed
+		p.mu.Unlock()
+		go func() { _ = conn.Close() }()
+		if closed {
+			return nil, errPoolClosed
+		}
+		return nil, errEntryRetired
+	}
+	delete(p.broken, key)
+	e := p.entries[key]
+	if e != nil && !e.mux.Dead() {
+		// Lost the race with a spawn that overlapped ours (evict-and-respawn
+		// can start a second one under this key). Adopt the entry that landed
+		// first and close the connection we just opened. Keeping both would
+		// put a second subprocess under one key with nothing to reach it — the
+		// cap counts it, the reaper collects it, and the tenant pays for it in
+		// between.
+		go func() { _ = conn.Close() }()
+	} else {
+		born := time.Now()
+		deadline := born.Add(p.cfg.MaxLifetime)
+		if exp, ok := b.(Expiring); ok {
+			if t := exp.CredExpiresAt(); !t.IsZero() {
+				d := t.Add(-credExpirySkew)
+				if d.Before(born) {
+					// Credentials already inside the skew window at spawn: a
+					// skewed deadline would be born-dead and every Get would
+					// tear down and respawn. Live to the literal expiry
+					// instead; the cost is the documented in-flight -32010 at
+					// expiry.
+					d = t
+				}
+				if d.Before(deadline) {
+					deadline = d
+				}
+			}
+		}
+		e = &entry{
+			key:      key,
+			mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			born:     born,
+			deadline: deadline,
+			sem:      make(chan struct{}, p.cfg.MaxConcurrent),
+		}
+		p.entries[key] = e
+		// No retireSupersededLocked here: Get does it on the way in, before
+		// the cap is measured, because entries this generation supersedes must
+		// not be counted against a tenant that is trying to rotate. Retiring
+		// again here would be redundant, and doing it ONLY here would put the
+		// retirement back after the measurement it has to precede.
+	}
+	p.mu.Unlock()
+	return e, nil
 }
 
 func (p *Pool) recordFailure(key Key) {
@@ -533,14 +653,29 @@ func (p *Pool) evictServer(server string, since time.Time) {
 			delete(p.broken, k)
 		}
 	}
+	// A spawn already running for this server captured the OLD definition.
+	// Marking it stale makes it close what it produces rather than install
+	// it, so the Get waiting behind it retries onto the new definition.
+	for k, sp := range p.spawning {
+		if k.Server == server {
+			sp.stale = true
+		}
+	}
 	p.mu.Unlock()
 	closeAll(victims)
 }
 
 // Shutdown closes every pooled connection.
 func (p *Pool) Shutdown() {
-	p.once.Do(func() { close(p.stop) })
+	// Cancelling spawnCtx is what interrupts a backend still starting; closed
+	// is what stops one that finishes anyway from installing itself into a
+	// pool that has already been drained.
+	p.once.Do(func() {
+		close(p.stop)
+		p.spawnCancel()
+	})
 	p.mu.Lock()
+	p.closed = true
 	victims := make([]*Mux, 0, len(p.entries)+len(p.orphans))
 	for k, e := range p.entries {
 		victims = append(victims, e.mux)
