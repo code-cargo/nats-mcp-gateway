@@ -161,6 +161,94 @@ func TestAuthValidation(t *testing.T) {
 	}
 }
 
+// Every credential the gateway holds for an http server rides one of these two
+// URLs: the backend url carries the injected Authorization header on every
+// call, the token url carries the client secret, the RFC 8693 subject token
+// and the refresh token. A one-character typo dropping the "s" put all of them
+// on the wire in the clear, and nothing anywhere said so.
+func TestPlaintextURLsRejected(t *testing.T) {
+	rejected := []struct{ name, raw, wantIn string }{
+		{
+			"backend url",
+			`{"servers":{"s":{"transport":"http","url":"http://weather.internal/mcp"}}}`,
+			`server "s": url`,
+		},
+		{
+			"token url",
+			`{"servers":{"s":{"command":"x","auth":{"mode":"oauth-client-credentials","tokenUrl":"http://idp/t","clientId":"c","clientSecret":"sec"}}}}`,
+			`server "s": auth tokenUrl`,
+		},
+		{
+			"scheme net/http cannot speak",
+			`{"servers":{"s":{"transport":"http","url":"ftp://weather.internal/mcp"}}}`,
+			"must be https",
+		},
+		{
+			"no scheme at all",
+			`{"servers":{"s":{"transport":"http","url":"weather.internal:8080/mcp"}}}`,
+			"must be https",
+		},
+	}
+	for _, tt := range rejected {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.raw))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantIn)
+		})
+	}
+
+	// Loopback is exempt: the traffic never reaches a network anyone can read,
+	// and `http://127.0.0.1:3000/mcp` is what every local MCP server serves.
+	accepted := []struct{ name, raw string }{
+		{"127.0.0.1", `{"servers":{"s":{"transport":"http","url":"http://127.0.0.1:3000/mcp"}}}`},
+		{"other 127/8", `{"servers":{"s":{"transport":"http","url":"http://127.9.9.9:3000/mcp"}}}`},
+		{"ipv6 loopback", `{"servers":{"s":{"transport":"http","url":"http://[::1]:3000/mcp"}}}`},
+		{"localhost", `{"servers":{"s":{"transport":"http","url":"http://localhost:3000/mcp"}}}`},
+		{"reserved .localhost", `{"servers":{"s":{"transport":"http","url":"http://mcp.localhost:3000/"}}}`},
+		// url.Parse lowercases the scheme and leaves the host as written, so
+		// the check has to do it: DNS does not distinguish these, and a
+		// rejection that turns on the shift key is how allowPlaintext ends up
+		// set fleet-wide.
+		{"LOCALHOST", `{"servers":{"s":{"transport":"http","url":"http://LOCALHOST:3000/mcp"}}}`},
+		{"mixed-case .localhost", `{"servers":{"s":{"transport":"http","url":"http://MCP.Localhost:3000/"}}}`},
+		{"loopback token url", `{"servers":{"s":{"command":"x","auth":{"mode":"oauth-refresh","tokenUrl":"http://localhost:8080/t","clientId":"c","refreshTokenFile":"/rt/{user}"}}}}`},
+		{"https anywhere", `{"servers":{"s":{"transport":"http","url":"https://weather.internal/mcp"}}}`},
+	}
+	for _, tt := range accepted {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := Parse([]byte(tt.raw))
+			assert.NoError(t, err)
+		})
+	}
+}
+
+// The opt-out exists for the deployment where the gateway legitimately speaks
+// plaintext and something outside its view encrypts: a service mesh sidecar
+// intercepting the pod's traffic, an SSH tunnel. Without it, hardening the
+// default would leave those deployments no way to run at all.
+func TestAllowPlaintextOptsOutPerServer(t *testing.T) {
+	cfg, err := Parse([]byte(`{"servers":{"s":{
+		"transport":"http","url":"http://mesh.svc.cluster.local/mcp","allowPlaintext":true,
+		"auth":{"mode":"oauth-client-credentials","tokenUrl":"http://idp.svc/t","clientId":"c","clientSecret":"sec"}}}}`))
+	require.NoError(t, err)
+	assert.True(t, cfg.Servers["s"].AllowPlaintext)
+
+	// The flag reaches auth.tokenUrl and not only url. Asserted on a server
+	// with no url of its own, because the case above passes either way — a
+	// tokenUrl nothing checks looks exactly like a tokenUrl the flag licensed.
+	_, err = Parse([]byte(`{"servers":{"s":{"command":"x","allowPlaintext":true,
+		"auth":{"mode":"oauth-client-credentials","tokenUrl":"http://idp.svc/t","clientId":"c","clientSecret":"sec"}}}}`))
+	require.NoError(t, err)
+
+	// It licenses plaintext for the one server that declares it, and says
+	// nothing about any other.
+	_, err = Parse([]byte(`{"servers":{
+		"meshed":{"transport":"http","url":"http://a.svc/mcp","allowPlaintext":true},
+		"plain":{"transport":"http","url":"http://b.svc/mcp"}}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `server "plain"`)
+}
+
 func TestAuthGrain(t *testing.T) {
 	perUser := []string{AuthExec, AuthNATS, AuthOAuthTokenExchange, AuthOAuthRefresh}
 	for _, mode := range perUser {

@@ -30,6 +30,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -96,6 +98,19 @@ type Server struct {
 	// http transport.
 	URL     string            `json:"url"`
 	Headers map[string]string `json:"headers"`
+
+	// AllowPlaintext permits an http:// url and auth.tokenUrl for this server.
+	// Both carry credentials — the injected Authorization header on every call,
+	// and the client secret / subject token / refresh token respectively — so
+	// plaintext is rejected by default and loopback is the only automatic
+	// exemption.
+	//
+	// The case this exists for is the deployment where something outside the
+	// gateway's view encrypts: a service mesh sidecar intercepting the pod's
+	// traffic, an SSH tunnel. Those are legitimate and invisible from here, and
+	// without a way to say so the check would simply be removed by the people
+	// running them.
+	AllowPlaintext bool `json:"allowPlaintext"`
 
 	// DiscoverTTLMs is the freshness hint served as ttlMs on the results this
 	// gateway synthesizes or bridges for a legacy server (default 300000).
@@ -200,8 +215,57 @@ func (a *Auth) PerUser() bool {
 	return false
 }
 
+// requireHTTPS rejects a URL that would carry credentials in the clear.
+// allowPlaintext is the server's opt-out; loopback is exempt unconditionally,
+// because that traffic reaches no network anyone can read and http://127.0.0.1
+// is what a local MCP server serves.
+//
+// An unparseable or non-http(s) URL is rejected here too: net/http is the only
+// thing that ever dials these, so anything else is a config error that would
+// otherwise surface as a failed request much later.
+func requireHTTPS(server, field, raw string, allowPlaintext bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("server %q: %s %q is not a valid URL: %w", server, field, raw, err)
+	}
+	switch u.Scheme {
+	case "https":
+		return nil
+	case "http":
+		if allowPlaintext || isLoopbackHost(u.Hostname()) {
+			return nil
+		}
+		return fmt.Errorf(
+			"server %q: %s %q sends credentials in cleartext; use https, or set allowPlaintext if something outside the gateway encrypts this hop (a service mesh sidecar, a tunnel)",
+			server, field, raw,
+		)
+	default:
+		return fmt.Errorf("server %q: %s %q must be https (or http to loopback)", server, field, raw)
+	}
+}
+
+// isLoopbackHost reports whether a URL host can only reach this machine.
+// "localhost" and anything under .localhost count: RFC 6761 reserves them to
+// resolve to a loopback address, and rejecting the name every developer types
+// while accepting the literal address it resolves to would just teach people
+// to switch the check off.
+//
+// Lowercased first, because url.Parse lowercases the SCHEME and leaves the
+// host exactly as written — so "http://Localhost:3000/mcp" arrives here
+// spelled differently from the same host, and DNS does not distinguish them.
+// A rejection that turns on the shift key is the surest way to get
+// allowPlaintext set fleet-wide.
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(host)
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 // validate rejects unknown modes and missing per-mode parameters.
-func (a *Auth) validate(server string) error {
+func (a *Auth) validate(server string, allowPlaintext bool) error {
 	switch a.Mode {
 	case "", AuthStatic, AuthNATS:
 	case AuthExec:
@@ -240,6 +304,11 @@ func (a *Auth) validate(server string) error {
 	if a.Subject != "" {
 		if err := wire.ValidateSubjectPrefix(a.Subject); err != nil {
 			return fmt.Errorf("server %q: auth subject: %w", server, err)
+		}
+	}
+	if a.TokenURL != "" {
+		if err := requireHTTPS(server, "auth tokenUrl", a.TokenURL, allowPlaintext); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -457,11 +526,14 @@ func (c *Config) validate() error {
 			if s.URL == "" {
 				return fmt.Errorf("server %q: http transport requires url", name)
 			}
+			if err := requireHTTPS(name, "url", s.URL, s.AllowPlaintext); err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("server %q: unknown transport %q", name, s.Transport)
 		}
 		if s.Auth != nil {
-			if err := s.Auth.validate(name); err != nil {
+			if err := s.Auth.validate(name, s.AllowPlaintext); err != nil {
 				return err
 			}
 		}

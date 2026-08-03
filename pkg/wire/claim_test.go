@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +149,54 @@ func TestClaimRoundTripOverWire(t *testing.T) {
 	assert.Contains(t, string(frames[0].Body), fmt.Sprint(ErrCodePayloadTooLarge))
 }
 
+// Parking the body and claiming the stream are two steps, and the stream can
+// be terminated in between — by a cancellation, or by whatever else answered
+// first. The claim id then goes nowhere, so the object it names can never be
+// fetched, and so never deleted by the fetch that would have deleted it. It
+// sat in the tenant's bucket, against that bucket's size cap, until the TTL
+// swept it.
+func TestClaimIsDeletedWhenTheTerminalRaceIsLost(t *testing.T) {
+	nc := jsNATS(t, 64*1024)
+	js, err := jetstream.New(nc)
+	require.NoError(t, err)
+	claims := &ObjectClaims{JS: js}
+
+	// The caller is answered by the Err frame and stops listening, so the
+	// handler outlives the exchange the client sees. Everything asserted below
+	// happens after it.
+	parked := make(chan struct{})
+	serve(t, nc, ServerConfig{Claims: claims}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		defer close(parked)
+		// Something terminates the stream first: what a cancellation landing
+		// mid-response does, made deterministic.
+		_ = w.Err(ErrCodeStreamLost, "terminated first", nil)
+		return w.End(bigEndBody())
+	})
+
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", Claims: claims, Inactivity: 5 * time.Second})
+	require.NoError(t, err)
+	s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	assert.Equal(t, FrameErr, frames[0].Kind, "the first terminal frame is the one the caller gets")
+
+	select {
+	case <-parked:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never finished parking the body")
+	}
+
+	obs, err := js.ObjectStore(context.Background(), "MCP_CLAIMS_acme")
+	require.NoError(t, err)
+	objs, err := obs.List(context.Background())
+	if err == nil {
+		assert.Empty(t, objs, "a claim nobody can ever fetch must not be left behind")
+	} else {
+		assert.ErrorIs(t, err, jetstream.ErrNoObjectsFound)
+	}
+}
+
 func TestClaimFallbackWhenJetStreamDisabled(t *testing.T) {
 	// JetStream OFF: Put fails, and the gateway must degrade to -32012 —
 	// never a hang, never a claim frame pointing nowhere.
@@ -172,8 +221,10 @@ func TestClaimFallbackWhenJetStreamDisabled(t *testing.T) {
 
 // failingClaims scripts ClaimStore behavior for failure-path tests.
 type failingClaims struct {
-	putID    string
-	fetchErr error
+	putID     string
+	fetchErr  error
+	deleteErr error
+	deletes   atomic.Int32
 }
 
 func (f *failingClaims) Put(context.Context, string, []byte) (string, error) {
@@ -182,6 +233,45 @@ func (f *failingClaims) Put(context.Context, string, []byte) (string, error) {
 
 func (f *failingClaims) Fetch(context.Context, string, string) ([]byte, error) {
 	return nil, f.fetchErr
+}
+
+func (f *failingClaims) Delete(context.Context, string, string) error {
+	f.deletes.Add(1)
+	return f.deleteErr
+}
+
+// The delete behind a lost terminal race is best effort — the bucket TTL is
+// the backstop and the stream is already answered, so there is nobody to tell.
+// A store that refuses it (read-only permissions on the claim bucket, a
+// bucket already gone) must not turn that into a second terminal frame on a
+// stream that has one, or into an error the handler's caller sees.
+func TestClaimDeleteFailureIsSwallowed(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: 64 * 1024})
+	claims := &failingClaims{putID: "deadbeef", deleteErr: errors.New("no delete permission")}
+
+	handlerErr := make(chan error, 1)
+	serve(t, nc, ServerConfig{Claims: claims}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		_ = w.Err(ErrCodeStreamLost, "terminated first", nil)
+		err := w.End(bigEndBody())
+		handlerErr <- err
+		return err
+	})
+
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", Claims: claims, Inactivity: 5 * time.Second})
+	require.NoError(t, err)
+	s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1, "the caller must still see exactly one terminal frame")
+	assert.Equal(t, FrameErr, frames[0].Kind)
+
+	select {
+	case err := <-handlerErr:
+		assert.NoError(t, err, "a best-effort delete failing must not fail End")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the handler never returned")
+	}
+	assert.Equal(t, int32(1), claims.deletes.Load(), "the orphaned claim was never deleted")
 }
 
 func TestClaimFetchFailureIsStreamLost(t *testing.T) {

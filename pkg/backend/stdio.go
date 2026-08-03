@@ -70,7 +70,39 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 		return nil, fmt.Errorf("backend: temp workdir: %w", err)
 	}
 
-	cmd := exec.Command(b.Command, b.Args...)
+	// Undo everything this function allocated on every path that returns
+	// without a live subprocess to own it. What fails a pipe below is
+	// descriptor exhaustion, and that is a condition the gateway sits in
+	// rather than passes through: leaving a workdir (and the descriptors of
+	// whichever pipes already succeeded) behind on each attempt compounds
+	// exactly the shortage that caused it.
+	spawned := false
+	var opened []io.Closer
+	var cmd *exec.Cmd
+	defer func() {
+		if spawned {
+			return
+		}
+		for _, p := range opened {
+			_ = p.Close()
+		}
+		// Each *Pipe call allocates TWO descriptors: the one it returns, which
+		// `opened` collects, and the child's end it parks in cmd.Stdin/Stdout/
+		// Stderr. os/exec closes that half only inside Start, so a connect
+		// that fails during pipe setup never reaches the code that would
+		// release it — and releasing half of what was allocated compounds the
+		// shortage at half the rate rather than not at all.
+		if cmd != nil {
+			for _, end := range []any{cmd.Stdin, cmd.Stdout, cmd.Stderr} {
+				if f, ok := end.(*os.File); ok {
+					_ = f.Close()
+				}
+			}
+		}
+		_ = os.RemoveAll(workDir)
+	}()
+
+	cmd = exec.Command(b.Command, b.Args...)
 	cmd.Dir = workDir
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
@@ -89,19 +121,25 @@ func (b *StdioBackend) Connect(ctx context.Context) (Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("backend: stdin pipe: %w", err)
 	}
+	opened = append(opened, stdin)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, fmt.Errorf("backend: stdout pipe: %w", err)
 	}
+	opened = append(opened, stdout)
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
 		return nil, fmt.Errorf("backend: stderr pipe: %w", err)
 	}
+	opened = append(opened, stderr)
 
+	// Start takes over the parent ends from here — closing them itself if it
+	// fails, and handing them to the loops below if it does not.
+	opened = nil
 	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(workDir)
 		return nil, fmt.Errorf("backend: start %s: %w", b.Command, err)
 	}
+	spawned = true
 
 	c := &stdioConn{
 		cmd:     cmd,
@@ -273,8 +311,19 @@ func (c *stdioConn) waitDead(d time.Duration) bool {
 }
 
 // signalGroup signals the whole process group so grandchildren die too.
+//
+// The group is addressed by the leader's pid, and a pid stops being ours the
+// moment the kernel reaps it — after which this call can reach a group
+// belonging to something else entirely. Close only escalates to here when the
+// process was still alive a grace period ago, so the exposure is a subprocess
+// exiting just as that period expires; declining once the exit is known keeps
+// the signal in that window from being sent at all.
+//
+// It narrows the race rather than closing it. Closing it would need the pid
+// held against reuse until we are done with it, and the reap happens inside
+// os/exec's Wait, which tells us nothing until it returns.
 func (c *stdioConn) signalGroup(sig syscall.Signal) {
-	if c.cmd.Process == nil {
+	if c.cmd.Process == nil || c.Dead() {
 		return
 	}
 	// Negative pid = the process group created by Setpgid.

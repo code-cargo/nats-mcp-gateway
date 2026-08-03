@@ -15,10 +15,44 @@
 package cmd
 
 import (
+	"os"
 	"time"
 
 	"github.com/alecthomas/kong"
 )
+
+// credsEnvNames is the credentials env var under each subcommand's own
+// documented name, followed by the other subcommand's, which is accepted as
+// an alias. Setting the one you had read about on the wrong subcommand used
+// not to fail — it was ignored, and the process connected with no credentials
+// at all, which against a server permitting anonymous connections means a
+// shim that runs and quietly has no identity. Neither name is renamed:
+// a documented variable that stops working is a broken deployment.
+var (
+	gatewayCredsEnv = []string{"NATSMCP_NATS_CREDS", "NATSMCP_CREDS"}
+	clientCredsEnv  = []string{"NATSMCP_CREDS", "NATSMCP_NATS_CREDS"}
+)
+
+// credsFromEnv resolves the credentials path the tag-level env list could not.
+//
+// Kong takes the first name in an `env:"A,B"` list that is SET — it calls
+// os.LookupEnv and stops on ok, empty value or not. Set-but-empty is a shape
+// deployments produce by accident (a Kubernetes env entry sourced from a
+// secret key that is not populated yet, a shell exporting an unset variable),
+// and under it a blank primary shadows the alias this pair exists for, which
+// is the credential-less connect all over again. First NON-EMPTY is what the
+// pair was always meant to mean.
+func credsFromEnv(current string, names ...string) string {
+	if current != "" {
+		return current
+	}
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return current
+}
 
 // Globals holds flags shared by every subcommand.
 type Globals struct {
@@ -68,7 +102,7 @@ type GatewayCmd struct {
 	ConfigEventsSubject string        `help:"NATS subject that signals a config change (fetch source)." default:"mcp.v1.cfg.changed" env:"NATSMCP_CONFIG_EVENTS_SUBJECT"`
 	ConfigRefetch       time.Duration `help:"Fetch source: periodic re-fetch as the missed-event safety net." default:"60s" env:"NATSMCP_CONFIG_REFETCH"`
 	NatsURL             string        `help:"NATS URL (fetch + inline sources)." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS"`
+	NatsCreds           string        `help:"NATS credentials file (fetch + inline sources)." env:"NATSMCP_NATS_CREDS,NATSMCP_CREDS"`
 	SubjectPrefix       string        `help:"Wire subject prefix (fetch + inline sources)." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix         string        `help:"Custom NATS inbox prefix for this process's own request/reply (fetch + inline sources; the file source uses nats.inboxPrefix). A scoped instance should set it so its identity can be granted a narrow inbox instead of _INBOX.>." env:"NATSMCP_INBOX_PREFIX"`
 	QueueGroup          string        `help:"Wire queue group (fetch + inline sources; default mcpgw, or mcpgw.{tenant}[.{user}] for scoped instances)." env:"NATSMCP_QUEUE_GROUP"`
@@ -94,6 +128,12 @@ type GatewayCmd struct {
 	Version string `kong:"-"`
 }
 
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *GatewayCmd) AfterApply() error {
+	c.NatsCreds = credsFromEnv(c.NatsCreds, gatewayCredsEnv...)
+	return nil
+}
+
 func (c *GatewayCmd) Run(g *Globals) error {
 	return runGateway(c, g, c.Version)
 }
@@ -103,12 +143,18 @@ func (c *GatewayCmd) Run(g *Globals) error {
 type ShimCmd struct {
 	Server        string `help:"Name of the MCP server to front." required:"" env:"NATSMCP_SERVER"`
 	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS,NATSMCP_NATS_CREDS"`
 	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
 	User          string `help:"User subject token for attribution ('_' if unset). Must match the token this caller's NATS creds are scoped to under per-user auth." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
 	AcceptClaims  bool   `help:"Accept claim-checked oversize responses (needs read access to this tenant's claim bucket)." env:"NATSMCP_ACCEPT_CLAIMS"`
+}
+
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *ShimCmd) AfterApply() error {
+	c.Creds = credsFromEnv(c.Creds, clientCredsEnv...)
+	return nil
 }
 
 func (c *ShimCmd) Run(g *Globals) error {
@@ -126,12 +172,18 @@ type CallCmd struct {
 	Method        string `help:"MCP method (e.g. tools/list)." required:""`
 	Params        string `help:"JSON params." default:"{}"`
 	NatsURL       string `help:"NATS server URL." default:"nats://127.0.0.1:4222" env:"NATSMCP_NATS_URL"`
-	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS"`
+	Creds         string `help:"Path to NATS credentials file." env:"NATSMCP_CREDS,NATSMCP_NATS_CREDS"`
 	Tenant        string `help:"Tenant subject token." default:"default" env:"NATSMCP_TENANT"`
 	User          string `help:"User subject token for attribution." default:"_" env:"NATSMCP_USER"`
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
 	AcceptClaims  bool   `help:"Accept claim-checked oversize responses." env:"NATSMCP_ACCEPT_CLAIMS"`
+}
+
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *CallCmd) AfterApply() error {
+	c.Creds = credsFromEnv(c.Creds, clientCredsEnv...)
+	return nil
 }
 
 func (c *CallCmd) Run(g *Globals) error {

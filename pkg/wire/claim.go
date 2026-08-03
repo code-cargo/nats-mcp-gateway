@@ -38,6 +38,9 @@ type ClaimStore interface {
 	Put(ctx context.Context, tenant string, body []byte) (id string, err error)
 	// Fetch retrieves (and best-effort deletes) a claimed body.
 	Fetch(ctx context.Context, tenant, id string) ([]byte, error)
+	// Delete removes a claim whose id was never handed out, so a body nobody
+	// can ever fetch does not occupy the tenant's bucket until the TTL.
+	Delete(ctx context.Context, tenant, id string) error
 }
 
 const (
@@ -224,6 +227,25 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 	// Eager cleanup; TTL is the backstop when this is denied or we die here.
 	_ = obs.Delete(ctx, id)
 	return body, nil
+}
+
+// Delete implements ClaimStore. It never creates a bucket: a claim can only
+// exist in one that already does.
+func (o *ObjectClaims) Delete(ctx context.Context, tenant, id string) error {
+	ctx, cancel := context.WithTimeout(ctx, claimOpTimeout)
+	defer cancel()
+
+	if !TokenSafe(tenant) || !TokenSafe(id) {
+		return fmt.Errorf("wire: invalid claim reference %q/%q", tenant, id)
+	}
+	obs, err := o.JS.ObjectStore(ctx, claimBucketPrefix+tenant)
+	if err != nil {
+		return fmt.Errorf("wire: claim bucket: %w", err)
+	}
+	if err := obs.Delete(ctx, id); err != nil {
+		return fmt.Errorf("wire: claim delete: %w", err)
+	}
+	return nil
 }
 
 func (o *ObjectClaims) bucket(ctx context.Context, tenant string) (jetstream.ObjectStore, error) {

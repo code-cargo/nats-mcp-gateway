@@ -186,6 +186,50 @@ echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
 	assertReaped(t, readPID(t, ready))
 }
 
+// The scrubbing the environment gets is worth nothing if HOME still points at
+// the gateway's own home directory: a helper is third-party code by
+// construction (that is the entire premise of the mode), and the dotfiles it
+// can reach from there include the NATS creds file the gateway authenticates
+// with.
+func TestExecDoesNotInheritTheGatewaysHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".nats.creds"),
+		[]byte("gateway-operator-creds"), 0o600))
+
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+echo "{\"env\":{\"HOME\":\"$HOME\",\"STOLEN\":\"$(cat "$HOME/.nats.creds" 2>/dev/null)\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	c, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Empty(t, c.Env["STOLEN"], "the helper read a dotfile out of the gateway's home directory")
+	assert.NotEqual(t, home, c.Env["HOME"], "the helper was handed the gateway's own HOME")
+	// The scratch home is per-run, so nothing a helper leaves in it survives to
+	// be read by the next one — including the next one resolving for a
+	// different user.
+	_, err = os.Stat(c.Env["HOME"])
+	assert.True(t, os.IsNotExist(err), "the helper's scratch home outlived the run")
+}
+
+// The escape hatch for helpers that genuinely need a populated home (an `aws`
+// or `gcloud` wrapper reading its own config): naming HOME in auth.env is how
+// an operator opts back in, deliberately and per server.
+func TestExecHomeCanBeSetExplicitly(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	real := t.TempDir()
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+echo "{\"env\":{\"HOME\":\"$HOME\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"HOME": real}}
+	c, err := r.Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, real, c.Env["HOME"])
+}
+
 func TestFile(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "u1.json"),
@@ -290,6 +334,41 @@ func TestOAuthRefreshRotation(t *testing.T) {
 	rotated, err := os.ReadFile(tokFile)
 	require.NoError(t, err)
 	assert.Equal(t, "refresh-2", string(rotated), "a rotated refresh token must be persisted")
+}
+
+// A public client has a client id and no secret — the shape of every
+// authorization-code/refresh registration for a client that cannot keep one,
+// and oauth-refresh with no clientSecret is a configuration the gateway
+// accepts. RFC 6749 §3.2.1 says such a client identifies itself with client_id
+// in the request BODY. Authenticating instead as (id, empty password) over
+// Basic is not the same claim, and Okta, Auth0 and Keycloak all answer it with
+// a terminal invalid_client — so the mode failed on every attempt, forever,
+// with a backoff that never expires it.
+func TestOAuthPublicClientSendsClientIDInTheBody(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "u1.refresh"), []byte("refresh-1"), 0o600))
+	srv, form := tokenEndpoint(t, http.StatusOK, `{"access_token":"at-p","expires_in":60}`)
+
+	r := &OAuthRefresh{
+		TokenURL: srv.URL, ClientID: "public-cid",
+		Store: &FileTokenStore{Path: filepath.Join(dir, "{user}.refresh")},
+	}
+	c, err := r.Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, "Bearer at-p", c.Headers["Authorization"])
+	assert.Equal(t, "public-cid", form.Get("client_id"))
+	assert.Empty(t, form.Get("_basic_user"), "a public client must not send an Authorization header at all")
+}
+
+// A confidential client keeps Basic — it is what RFC 6749 §2.3.1 prefers and
+// what every IdP the gateway has been pointed at expects.
+func TestOAuthConfidentialClientKeepsBasic(t *testing.T) {
+	srv, form := tokenEndpoint(t, http.StatusOK, `{"access_token":"at-c","expires_in":60}`)
+	_, err := (&OAuthClientCredentials{TokenURL: srv.URL, ClientID: "cid", ClientSecret: "cs"}).
+		Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.Equal(t, "cid", form.Get("_basic_user"))
+	assert.Empty(t, form.Get("client_id"), "a secret-bearing client authenticates in the header, not the body")
 }
 
 func TestFileTokenStoreReplacesAtomically(t *testing.T) {
@@ -584,6 +663,36 @@ func TestCachedNegativeCacheAndInvalidate(t *testing.T) {
 	_, err = c.Resolve(ctxT(t), "t", "u", "s")
 	require.NoError(t, err)
 	assert.Equal(t, 2, inner.count())
+}
+
+// Invalidate promises the next resolve refetches immediately, "any failure
+// backoff cleared too". It cleared the deadline but not the count the next
+// deadline is computed from, so the promise only held for one attempt: every
+// 401-driven invalidation that met a still-unhealthy source doubled the wait
+// again, and after six rounds a key that should retry in a second was pinned
+// at the 30s cap. The rounds cost nothing to reach because Invalidate is what
+// admits each one — a backend rejecting credentials on every request drives
+// them at request rate.
+func TestInvalidateRestartsTheFailureBackoff(t *testing.T) {
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return nil, errors.New("controller down")
+	}}
+	c := Cached(inner, 0)
+
+	for range 6 {
+		_, err := c.Resolve(ctxT(t), "t", "u", "s")
+		require.Error(t, err)
+		c.Invalidate("t", "u", "s")
+	}
+	_, err := c.Resolve(ctxT(t), "t", "u", "s")
+	require.Error(t, err)
+
+	e := c.entry("t", "u", "s")
+	e.mu.Lock()
+	backoff := time.Until(e.retryAt)
+	e.mu.Unlock()
+	assert.InDelta(t, failBackoffBase, backoff, float64(500*time.Millisecond),
+		"an invalidated key must retry at the first backoff step, not wherever the old count had reached")
 }
 
 func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {

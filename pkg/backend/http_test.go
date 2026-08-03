@@ -985,3 +985,229 @@ func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
 	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
 	assert.Equal(t, before, listPages.Load())
 }
+
+// TestRedirectCannotCarryTheCredentialAway covers the four things Go's default
+// redirect policy will do with an injected credential.
+//
+// requireHTTPS constrains the URL an operator wrote; the URL actually dialled
+// is chosen by the backend. Go follows ten hops, keeps Authorization across a
+// scheme downgrade and across a subdomain hop (isDomainOrSubdomain never looks
+// at the scheme), never strips the BODY, and hands the final response back to
+// the caller — so a redirect is at once credential theft, cleartext downgrade,
+// and a read primitive into the pod's network.
+func TestRedirectCannotCarryTheCredentialAway(t *testing.T) {
+	var stolen atomic.Int32
+	thief := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			stolen.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	}))
+	t.Cleanup(thief.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, thief.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	b := &HTTPBackend{URL: redirector.URL, Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"}}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	// However it surfaces — a transport error or a synthesized JSON-RPC error —
+	// what must not happen is the hop being followed.
+	assert.Equal(t, int32(0), stolen.Load(), "the credential reached the redirect target")
+	if err == nil && resp != nil {
+		assert.NotContains(t, string(resp.Result), "internal",
+			"the redirect target's body reached the caller")
+	}
+}
+
+// A client is injected for the TRANSPORT — a proxy, a custom TLS config, a
+// test hook — and nothing about that says the caller meant to opt out of
+// redirect policy. Guarding only the nil case left the protection on a
+// default nobody had to keep: the first caller to pass a client for an
+// unrelated reason would silently get Go's browser rules back, carrying this
+// backend's injected Authorization wherever a hop pointed.
+func TestInjectedClientStillRefusesUnsafeRedirects(t *testing.T) {
+	var stolen atomic.Int32
+	thief := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			stolen.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	}))
+	t.Cleanup(thief.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, thief.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	caller := &http.Client{} // no CheckRedirect: Go's default would follow
+	b := &HTTPBackend{
+		URL:     redirector.URL,
+		Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"},
+		Client:  caller,
+	}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	_, _ = m.Call(context.Background(), jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	assert.Equal(t, int32(0), stolen.Load(), "the credential reached the redirect target")
+	assert.Nil(t, caller.CheckRedirect, "the caller's own client was mutated instead of copied")
+}
+
+// TestRedirectCannotRewriteTheMethod covers the hop that changes what the
+// exchange IS rather than where it goes.
+//
+// Go rewrites POST to GET on 301/302/303 and drops the body. Every authority
+// check still passes on a same-origin hop, so nothing else here stops it: the
+// injected credential rides along and the reply reaches the caller as an MCP
+// result, making an MCP route that can be made to redirect a read of every
+// GET-able path beside it. 307/308 preserve the method and stay allowed.
+func TestRedirectCannotRewriteTheMethod(t *testing.T) {
+	mk := func(method, u string) *http.Request {
+		r, err := http.NewRequest(method, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	assert.Error(t, RefuseUnsafeRedirect(
+		mk(http.MethodGet, "https://h/admin"), []*http.Request{mk(http.MethodPost, "https://h/mcp")}),
+		"a 301/302/303 rewrite of the POST must not be followed, same origin or not")
+	assert.NoError(t, RefuseUnsafeRedirect(
+		mk(http.MethodPost, "https://h/mcp/v2"), []*http.Request{mk(http.MethodPost, "https://h/mcp")}),
+		"307/308 keep the method, and a same-origin path hop is the one thing allowed")
+	assert.NoError(t, RefuseUnsafeRedirect(
+		mk(http.MethodGet, "https://h/mcp/"), []*http.Request{mk(http.MethodGet, "https://h/mcp")}),
+		"the SSE stream is a GET to begin with; a GET->GET path hop is unchanged")
+}
+
+// TestSameOriginRedirectCannotReadAnotherPath is the end-to-end form: the hop
+// never leaves the backend's own host and port, so the authority checks are
+// satisfied and only the method rule stands between a 302 and another path's
+// body being returned as this call's result.
+func TestSameOriginRedirectCannotReadAnotherPath(t *testing.T) {
+	var readSecret atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/secret", func(w http.ResponseWriter, r *http.Request) {
+		readSecret.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/secret", http.StatusFound) // 302: Go rewrites POST to GET
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL + "/mcp", Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"}}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	assert.Equal(t, int32(0), readSecret.Load(),
+		"a same-origin 302 turned the POST into a GET of another path")
+	if err == nil && resp != nil {
+		assert.NotContains(t, string(resp.Result), "internal",
+			"the other path's body reached the caller as an MCP result")
+	}
+}
+
+func TestRefuseUnsafeRedirect(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	tests := []struct {
+		name, from, to string
+		ok             bool
+	}{
+		{"same host, path only", "https://h/mcp", "https://h/mcp/", true},
+		{"plain stays plain", "http://h/mcp", "http://h/other", true},
+		{"scheme downgrade", "https://h/mcp", "http://h/mcp", false},
+		{"different host", "https://h/mcp", "https://other/mcp", false},
+		{"subdomain", "https://mcp.example.com/x", "https://evil.mcp.example.com/x", false},
+		{"host case only", "https://H/mcp", "https://h/mcp", true},
+		{"explicit default port", "https://h/mcp", "https://h:443/mcp", true},
+		{"different port, same host", "http://h:8080/mcp", "http://h:9090/mcp", false},
+		{"upgrade is fine", "http://h/mcp", "https://h/mcp", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := RefuseUnsafeRedirect(req(tt.to), []*http.Request{req(tt.from)})
+			if tt.ok {
+				assert.NoError(t, err)
+			} else {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+// TestRedirectHostFoldingIsASCIIOnly guards the comparison that decides
+// whether a hop is "the same host".
+//
+// strings.EqualFold applies Unicode folding, under which U+212A KELVIN SIGN
+// folds to k and U+017F LONG S folds to s — so it would read
+// "ſlacK.example.com" as "slack.example.com". The name that goes on the wire
+// disagrees: Request.write emits it through Punycode with no UTS46 mapping,
+// producing a different DNS label. The TCP target is unchanged, so this is not
+// SSRF; what changes is the Host header, and the injected credential rides
+// along to what any Host-routed ingress treats as a different vhost.
+func TestRedirectHostFoldingIsASCIIOnly(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	for _, to := range []string{
+		"http://ſlacK.example.com/steal", // ſlacK
+		"http://slacK.example.com/steal", // slacK
+		"http://ſlack.example.com/steal", // ſlack
+	} {
+		assert.Error(t, RefuseUnsafeRedirect(req(to), []*http.Request{req("http://slack.example.com/mcp")}),
+			"a fold-equal spelling is a different DNS label on the wire: %q", to)
+	}
+	// ASCII case still folds, which is what the comparison is for.
+	assert.NoError(t, RefuseUnsafeRedirect(
+		req("http://SLACK.example.com/x"), []*http.Request{req("http://slack.example.com/mcp")},
+	))
+}
+
+// TestRedirectHopCapIsEnforced pins the only bound on a same-host loop.
+//
+// Setting CheckRedirect REPLACES Go's built-in 10-hop cap, the backend client
+// is built with Timeout 0 because response streams are long-lived, and the
+// wire handler's context carries no deadline of its own — so a backend that
+// redirects to itself would spin until something else gave out.
+func TestRedirectHopCapIsEnforced(t *testing.T) {
+	req := func(u string) *http.Request {
+		r, err := http.NewRequest(http.MethodPost, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	via := func(n int) []*http.Request {
+		out := make([]*http.Request, n)
+		for i := range out {
+			out[i] = req("https://h/mcp")
+		}
+		return out
+	}
+	assert.NoError(t, RefuseUnsafeRedirect(req("https://h/a"), via(5)),
+		"a legitimate same-host chain must still be followed")
+	assert.Error(t, RefuseUnsafeRedirect(req("https://h/a"), via(6)),
+		"nothing else bounds this loop")
+}

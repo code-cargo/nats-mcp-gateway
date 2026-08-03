@@ -298,7 +298,12 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 		e.gone = e.creds
 	}
 	e.creds = nil
-	e.retryAt = time.Time{}
+	// The count as well as the deadline, because the next deadline is computed
+	// from the count. Clearing only retryAt admits one immediate attempt and
+	// then resumes wherever the backoff had climbed to, so a key whose
+	// refresh-ahead had been failing waits out the 30s cap for a retry that
+	// should have come after one second.
+	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
 	e.epoch++ // any in-flight refresh launched before this is now stale
 	e.mu.Unlock()
 }

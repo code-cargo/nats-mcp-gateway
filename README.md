@@ -253,6 +253,31 @@ credential from being quietly mangled on its way to a backend:
 > arguments meant for the backend's own shell (`--fmt=$HOME`), and eating
 > those would corrupt them just as silently in the other direction.
 
+A server's `url` and its `auth.tokenUrl` must be `https`, because both carry
+credentials — the injected `Authorization` header on every call, and the
+client secret / subject token / refresh token respectively. Loopback
+(`127.0.0.0/8`, `::1`, `localhost`) is exempt, so local MCP servers need no
+ceremony. Set `"allowPlaintext": true` on a server when something outside the
+gateway's view encrypts the hop — a service mesh sidecar, a tunnel — and it
+covers that one server's `url` and `tokenUrl` only.
+
+> **Upgrading:** this rejects the WHOLE config, not the offending server, and
+> the fetch source revalidates on every reload — so one un-migrated `http://`
+> url takes down every other server on that gateway. Fix the config before
+> rolling the binary: add `allowPlaintext` where the hop is genuinely
+> encrypted elsewhere, `https` everywhere else. An older gateway ignores
+> `allowPlaintext`, so the config change is safe to land first.
+
+Redirects are refused unless the hop changes nothing but the path. Go's
+default policy is written for a browser: it keeps `Authorization` across an
+`https`→`http` downgrade and across a hop to a *subdomain*, never strips the
+request body (which for the OAuth client is the refresh token), and hands the
+final response back to the caller. A gateway holding someone else's
+credential cannot follow those rules, so a hop to a different host, a
+different port, or out of `https` fails the request instead. If a backend
+sits behind something that redirects to a canonical host, point `url` at
+where it lands.
+
 ### Caching hints
 
 2026-07-28 requires `ttlMs` and `cacheScope` on every cacheable result
@@ -352,8 +377,11 @@ Adding a credential source has the same three tiers as config reloading
 
 1. **Use a built-in** — the modes above, RFC 8693 included.
 2. **Wrap a script with `exec`** — the helper runs with a scrubbed
-   environment plus `NATSMCP_CRED_{TENANT,USER,SERVER}` and prints
-   `{"headers"|"env": {...}, "expiresAt": "RFC3339"}`. Any credential system
+   environment (`PATH`, `auth.env`, and a private empty `HOME` discarded when
+   the run ends) plus `NATSMCP_CRED_{TENANT,USER,SERVER}`, and prints
+   `{"headers"|"env": {...}, "expiresAt": "RFC3339"}`. A helper needing a
+   populated home — an `aws` or `gcloud` wrapper reading its own config —
+   names `HOME` in `auth.env`, which overrides it. Any credential system
    integrates in ~20 lines; e.g. AWS STS with no SDK in the gateway:
    ```sh
    #!/bin/sh

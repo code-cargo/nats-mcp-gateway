@@ -90,8 +90,10 @@ type Exec struct {
 	Args    []string
 	// Env is extra environment for the helper. The helper does NOT inherit
 	// the gateway's environment (which holds the gateway's own NATS secrets
-	// — the same hygiene as StdioBackend): it gets PATH and HOME, the
-	// identity variables NATSMCP_CRED_{TENANT,USER,SERVER}, and these.
+	// — the same hygiene as StdioBackend): it gets PATH, a private empty
+	// HOME, the identity variables NATSMCP_CRED_{TENANT,USER,SERVER}, and
+	// these. Naming HOME here overrides the private one, for a helper that
+	// genuinely needs a populated home directory.
 	Env map[string]string
 	// Timeout bounds one helper run (default 30s), plus helperWaitDelay when
 	// something the helper spawned is still holding its stdout open.
@@ -107,6 +109,20 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// A scratch HOME for this run, because scrubbing the environment is worth
+	// little while HOME still addresses the gateway's own home directory: a
+	// helper is third-party code by construction, and the dotfiles it reaches
+	// from there include the creds file the gateway authenticates to NATS
+	// with. StdioBackend points a spawned server's HOME at its workdir for
+	// exactly this reason; a helper handling credentials is no less deserving.
+	// Per run rather than per gateway, so nothing one helper leaves behind is
+	// readable by the next one resolving for a different user.
+	home, err := os.MkdirTemp("", "natsmcp-cred-*")
+	if err != nil {
+		return nil, fmt.Errorf("cred: helper home: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(home) }()
+
 	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
 	// The subprocess discipline StdioBackend uses, for the same reason:
 	// helpers are wrapper scripts that fork. New process group so the timeout
@@ -121,11 +137,13 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	cmd.WaitDelay = helperWaitDelay
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
-		"HOME=" + os.Getenv("HOME"),
+		"HOME=" + home,
 		"NATSMCP_CRED_TENANT=" + tenant,
 		"NATSMCP_CRED_USER=" + user,
 		"NATSMCP_CRED_SERVER=" + server,
 	}
+	// Appended last, so os/exec's dedup (last occurrence wins) lets a helper
+	// that needs a real home be given one by name.
 	for k, v := range e.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}

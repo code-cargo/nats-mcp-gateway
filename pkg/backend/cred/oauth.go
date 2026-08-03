@@ -25,6 +25,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 )
 
 // The OAuth resolvers speak RFC 6749 token endpoints with stdlib net/http
@@ -202,18 +204,38 @@ func tokenRequest(ctx context.Context, client *http.Client, tokenURL, clientID, 
 // Credentials, also returning any rotated refresh token.
 func tokenRequestFull(ctx context.Context, client *http.Client, tokenURL, clientID, clientSecret string, form url.Values) (*Credentials, string, error) {
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: 30 * time.Second, CheckRedirect: backend.RefuseUnsafeRedirect}
+	} else if client.CheckRedirect == nil {
+		// An injected client is for the transport, never for redirect policy:
+		// this request's BODY carries the client secret, the subject token or
+		// the refresh token, and 307/308 replay it verbatim to wherever the
+		// hop points. Copied rather than mutated — the client is the caller's.
+		withPolicy := *client
+		withPolicy.CheckRedirect = backend.RefuseUnsafeRedirect
+		client = &withPolicy
+	}
+	// A client with an id and no secret is a PUBLIC client, and RFC 6749 §3.2.1
+	// has it identify itself with client_id in the request BODY. Set before the
+	// body is encoded, obviously, and before the Basic decision below.
+	if clientID != "" && clientSecret == "" {
+		form.Set("client_id", clientID)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return nil, "", fmt.Errorf("cred: token request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	if clientID != "" {
+	if clientID != "" && clientSecret != "" {
 		// The escaping is deliberate, not a bug: RFC 6749 §2.3.1 requires
 		// the client id/secret to be form-urlencoded BEFORE they go into
 		// the Basic header (SetBasicAuth does no encoding of its own).
 		// golang.org/x/oauth2 does exactly this, so IdPs interop with it.
+		//
+		// Only when there IS a secret: Basic with an empty password claims the
+		// client authenticated, which is a different claim from a public
+		// client's, and Okta, Auth0 and Keycloak all reject it as
+		// invalid_client. That rejection is a Terminal 4xx, so it was never
+		// even retried — the mode simply never worked.
 		req.SetBasicAuth(url.QueryEscape(clientID), url.QueryEscape(clientSecret))
 	}
 	resp, err := client.Do(req)
