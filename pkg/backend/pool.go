@@ -377,6 +377,20 @@ func (p *Pool) releasePendingLocked(tenant string) {
 	}
 }
 
+// closeAll closes every mux, concurrently. One close is slow by design — a
+// stdio backend escalates through SIGTERM to SIGKILL, an http conn waits out
+// the exchanges still on its wire — so closing serially charges that grace
+// once per backend to whoever is collecting them: a reaper tick, a config
+// reload's eviction, or the whole of Shutdown.
+func closeAll(muxes []*Mux) {
+	var wg sync.WaitGroup
+	for _, m := range muxes {
+		wg.Add(1)
+		go func(m *Mux) { defer wg.Done(); _ = m.Close() }(m)
+	}
+	wg.Wait()
+}
+
 func (p *Pool) tenantCountLocked(tenant string) int {
 	n := 0
 	for k, e := range p.entries {
@@ -437,9 +451,7 @@ func (p *Pool) reap() {
 	}
 	p.orphans = kept
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }
 
 // EvictServer closes every pooled connection for the named server (across all
@@ -476,9 +488,7 @@ func (p *Pool) EvictServer(server string) {
 		}
 	}
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }
 
 // Shutdown closes every pooled connection.
@@ -495,7 +505,5 @@ func (p *Pool) Shutdown() {
 	}
 	p.orphans = nil
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }
