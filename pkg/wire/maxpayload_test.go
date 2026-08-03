@@ -307,3 +307,22 @@ func TestErrFrameNeverShedsTheID(t *testing.T) {
 	assert.Equal(t, ErrCodeStreamLost, frames[0].Err.Code)
 	assert.Empty(t, frames[0].Body, "a null-id body would be worse than none")
 }
+
+func TestOversizeCancelIsTypedTooLarge(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	// No gateway is served here: Cancel's guard is client-side and runs ahead
+	// of the publish, so the stream only has to exist.
+	s, err := client(t, nc, time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	defer s.Close()
+
+	// The control frame is the one publish on this wire that carries no
+	// headers, so max_payload exactly is still legal and the first illegal
+	// size is one byte past it.
+	require.NoError(t, s.Cancel(boundaryBody()), "a headerless publish gets the whole budget")
+
+	var werr *Error
+	require.ErrorAs(t, s.Cancel(bytes.Repeat([]byte("x"), boundaryMaxPayload+1)), &werr,
+		"the last unchecked publish must not surface as a bare nats.ErrMaxPayload")
+	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
+}

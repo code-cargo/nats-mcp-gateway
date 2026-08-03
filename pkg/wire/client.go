@@ -233,6 +233,17 @@ type Stream struct {
 // design: on an at-most-once bus a cancel can race the gateway's control
 // subscription and be lost; the request then simply completes or times out.
 func (s *Stream) Cancel(notification []byte) error {
+	// Sized for the same reason Do sizes its request: unchecked, this reaches
+	// Publish and comes back a bare nats.ErrMaxPayload, which a caller
+	// switching on our codes reads as an unclassified transport failure
+	// instead of the one thing it is. A control frame carries no headers, so
+	// here the body really is the whole budget.
+	if max := s.nc.MaxPayload(); int64(len(notification)) > max {
+		return &Error{
+			Code:    ErrCodePayloadTooLarge,
+			Message: fmt.Sprintf("cancel notification %d bytes exceeds NATS max_payload %d", len(notification), max),
+		}
+	}
 	return s.nc.Publish(s.reply+ctlSuffix, notification)
 }
 
