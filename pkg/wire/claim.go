@@ -168,14 +168,23 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 	defer func() { _ = r.Close() }()
 
 	// The declared size saves downloading a body that is already too big, but
-	// it is the producer's own number: the LimitReader is the real bound.
-	if info, ierr := r.Info(); ierr == nil && info.Size > claimMaxBody {
-		return nil, fmt.Errorf("wire: claim of %d bytes exceeds the %d byte limit", info.Size, claimMaxBody)
+	// it is the producer's own number: the LimitReader is the real bound. Once
+	// it has been checked against the cap it is also safe to size the buffer
+	// with, which keeps the read from doubling its way up to 64MiB — the peak
+	// allocation is the thing this whole path exists to bound.
+	var buf bytes.Buffer
+	if info, ierr := r.Info(); ierr == nil {
+		if info.Size > claimMaxBody {
+			return nil, fmt.Errorf("wire: claim of %d bytes exceeds the %d byte limit", info.Size, claimMaxBody)
+		}
+		buf.Grow(int(info.Size) + 1)
 	}
-	body, err := io.ReadAll(io.LimitReader(r, claimMaxBody+1)) // digest-verified by the client library
-	if err != nil {
+	// Digest-verified by the client library: a full read ends at the object's
+	// own EOF, inside the limit, which is where it checks the SHA-256.
+	if _, err := buf.ReadFrom(io.LimitReader(r, claimMaxBody+1)); err != nil {
 		return nil, fmt.Errorf("wire: claim fetch: %w", err)
 	}
+	body := buf.Bytes()
 	if len(body) > claimMaxBody {
 		return nil, fmt.Errorf("wire: claim exceeds the %d byte limit", claimMaxBody)
 	}
