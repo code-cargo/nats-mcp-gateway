@@ -24,9 +24,10 @@ jobs:
       matrix:
         # natsmcp cross-compiles anywhere (pure Go, CGO disabled). The gateway
         # runs on Linux; darwin covers the shim on developer laptops. Windows
-        # is intentionally absent until the stdio supervisor (Setpgid /
-        # kill(-pgid) in pkg/backend/stdio.go) is split by build tag — but the
-        # packaging below already handles the .exe suffix so adding a
+        # is intentionally absent until the Setpgid / kill(-pgid) subprocess
+        # supervision is split by build tag — pkg/backend/stdio.go and
+        # pkg/backend/cred/exec.go, plus their tests — but the packaging below
+        # already handles the .exe suffix so adding a
         # `{os: windows, arch: amd64}` row is then a drop-in.
         include:
           - { os: linux, arch: amd64 }

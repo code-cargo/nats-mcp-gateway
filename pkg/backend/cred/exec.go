@@ -21,8 +21,63 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 )
+
+// helperWaitDelay bounds how long Resolve waits for the helper's stdout to
+// close after the helper itself is gone. Nothing should still hold that pipe
+// once the process it belongs to has exited or been killed, so this is a
+// grace period and not a budget — the same role terminateGrace plays in
+// StdioBackend, and the same length.
+const helperWaitDelay = 3 * time.Second
+
+// killHelperGroup SIGKILLs the helper's process group — the helper and
+// everything it forked that is still holding our stdout.
+//
+// One signal to the whole group, leader included. Killing the leader first and
+// the group second would be the same two signals in the order that loses them:
+// os/exec is free to reap the leader in between, and the group kill then names
+// a pid the kernel has released, so the child this exists to reach survives.
+//
+// SIGKILL with no SIGTERM first, where StdioBackend escalates: a helper is a
+// short-lived script already past its deadline with no session to shut down,
+// and every grace period spent here is spent under CachedResolver's per-key
+// mutex. Callers must know the group is non-empty; on a group whose last
+// member has exited the pgid is free, and a raw kill consults nothing.
+func killHelperGroup(pgid int) error {
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return err
+	}
+	return nil
+}
+
+// cancelHelper is the Cmd.Cancel for a helper: kill the group, but only once
+// os.Process confirms the leader is still ours.
+//
+// The probe goes through os.Process, not syscall.Kill, because os.Process
+// declines to signal a pid it has already reaped — it marks the process done
+// under the lock its own Wait takes, and on Linux with pidfd it cannot be
+// fooled by reuse at all. Cmd.Wait reaps before it reads the cancel result, so
+// this runs after the reap often enough to matter, and the pid being signalled
+// is a process GROUP id: aimed at a freed one it is a SIGKILL delivered to
+// whatever now holds that pgid, which on this host is as likely as not another
+// backend's subprocess tree.
+//
+// This narrows that window rather than closing it — the group kill below is
+// still raw, and the leader can be reaped between the two calls. What closes
+// it in practice is that a pgid is reusable only once the whole group is
+// empty, and the child this cancel exists to reach is in that group.
+//
+// ErrProcessDone means the helper finished a hair before the deadline, which
+// os/exec reads as "nothing was interrupted" — the answer that keeps such a
+// helper from being reported as cancelled.
+func cancelHelper(p *os.Process) error {
+	if err := p.Signal(syscall.Signal(0)); err != nil {
+		return err
+	}
+	return killHelperGroup(p.Pid)
+}
 
 // Exec is the universal adapter: it runs a credential-helper command per
 // (tenant, user, server) and parses the credJSON it prints —
@@ -38,7 +93,8 @@ type Exec struct {
 	// — the same hygiene as StdioBackend): it gets PATH and HOME, the
 	// identity variables NATSMCP_CRED_{TENANT,USER,SERVER}, and these.
 	Env map[string]string
-	// Timeout bounds one helper run (default 30s).
+	// Timeout bounds one helper run (default 30s), plus helperWaitDelay when
+	// something the helper spawned is still holding its stdout open.
 	Timeout time.Duration
 }
 
@@ -52,6 +108,17 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
+	// The subprocess discipline StdioBackend uses, for the same reason:
+	// helpers are wrapper scripts that fork. New process group so the timeout
+	// reaches the children (killing the helper alone leaves them running and
+	// holding stdout); WaitDelay so a pipe a child still holds cannot outlast
+	// the timeout anyway. Both matter more here than there — this wait is
+	// taken under CachedResolver's per-key mutex, which no context can
+	// interrupt, so an unbounded one wedges that (tenant, user, server) for
+	// the life of the gateway instead of failing and backing off.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error { return cancelHelper(cmd.Process) }
+	cmd.WaitDelay = helperWaitDelay
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + os.Getenv("HOME"),
@@ -67,6 +134,28 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("cred: helper %s: %w: %s", e.Command, err, bytes.TrimSpace(exitErr.Stderr))
+		}
+		if errors.Is(err, exec.ErrWaitDelay) {
+			// The helper exited but left something holding stdout, so the read
+			// was cut short and what we captured may be a prefix.
+			//
+			// os/exec closes OUR end of that pipe and stops there, so the
+			// holder is still running — and still in the group made for it
+			// above. Reclaim it, or it outlives the gateway: this path is
+			// reached again on every backoff retry, so a helper with the habit
+			// leaks a process per attempt. Safe to signal raw here in a way it
+			// would not be on the paths above: reaching WaitDelay is itself
+			// the evidence that the group still has a member.
+			//
+			// This does kill a daemon a helper backgrounded on purpose. That
+			// is the same contract violation the error names — a helper with
+			// something to leave running owes it a stdout of its own.
+			if cmd.Process != nil {
+				_ = killHelperGroup(cmd.Process.Pid)
+			}
+			// Say which helper habit caused it: os/exec's own wording names the
+			// mechanism and gives an operator nothing to fix.
+			return nil, fmt.Errorf("cred: helper %s left a process holding its stdout open: %w", e.Command, err)
 		}
 		return nil, fmt.Errorf("cred: helper %s: %w", e.Command, err)
 	}

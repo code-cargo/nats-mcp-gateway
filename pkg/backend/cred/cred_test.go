@@ -22,9 +22,13 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -74,6 +78,112 @@ func TestExecFailureIncludesStderr(t *testing.T) {
 	_, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not authorized")
+}
+
+// startResolve runs one Exec.Resolve in the background, so a test can act on
+// the helper — cancel it, watch for it — while the resolve is in flight.
+func startResolve(ctx context.Context, r *Exec) <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		_, err := r.Resolve(ctx, "acme", "u1", "srv")
+		done <- err
+	}()
+	return done
+}
+
+// awaitResolve fails the test if the resolve has not finished within d. The
+// hangs these tests provoke are unbounded, so waiting on the channel directly
+// would stall the whole package until the go test panic timeout instead of
+// naming the invariant that broke.
+func awaitResolve(t *testing.T, done <-chan error, d time.Duration, what string) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(d):
+		t.Fatalf("Exec.Resolve did not return within %s: %s", d, what)
+		return nil
+	}
+}
+
+func TestExecCancellationKillsTheWholeHelperTree(t *testing.T) {
+	// Wrapper-script helpers fork, the same shape StdioBackend deals with in
+	// npx/uvx. Killing the helper alone leaves that child running and still
+	// holding the write end of stdout, so Wait sits on a pipe that will never
+	// reach EOF and no remaining deadline can rescue it — all under
+	// CachedResolver's per-key mutex, which no context can interrupt. The
+	// (tenant, user, server) key is then wedged for the life of the gateway:
+	// later requests for it park on the lock forever instead of failing and
+	// backing off. Cancelling here is the helper's own Timeout expiring on a
+	// slower clock; os/exec runs the identical path for both.
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+# The long-lived child is forked BEFORE the marker is written, so waiting for
+# the marker proves the process which will hold stdout past the kill already
+# exists. Written the other way round the marker proves only that the
+# marker-WRITER exists, and the cancel can arrive before that writer has forked
+# the sleep — leaving the test asserting the death of a child that was never
+# born.
+sleep 60 &
+echo $! > "$READY"
+sleep 60
+`), 0o755))
+
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := startResolve(ctx, r)
+
+	// The child writes this itself, so its existence proves a forked process
+	// is running and holding stdout — without it the assertions below would
+	// hold trivially on a helper that never forked at all.
+	require.Eventually(t, func() bool {
+		_, err := os.Stat(ready)
+		return err == nil
+	}, 30*time.Second, 10*time.Millisecond, "the helper never forked the child this test is about")
+
+	childPID := readPID(t, ready)
+	cancel()
+	require.Error(t, awaitResolve(t, done, 30*time.Second, "the helper's child still holds stdout"),
+		"a cancelled helper must fail, not hang")
+	assertReaped(t, childPID)
+}
+
+func TestExecReturnsWhenAChildOutlivesTheHelper(t *testing.T) {
+	// Here the helper prints its credentials and exits cleanly, so nothing
+	// ever cancels the command and its timeout is irrelevant — but a child it
+	// left behind still holds stdout open. os/exec stops watching the context
+	// the moment the process is reaped, so the read that follows is bounded by
+	// WaitDelay alone: without one, Resolve never returns at all, and no
+	// configured timeout changes that.
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sleep 60 &
+echo $! > "$READY"
+echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
+`), 0o755))
+
+	// A generous timeout, to show it is not what ends the wait.
+	r := &Exec{Command: script, Env: map[string]string{"READY": ready}, Timeout: time.Minute}
+	err := awaitResolve(t, startResolve(context.Background(), r), 30*time.Second,
+		"a child of the exited helper still holds stdout")
+	// Abandoning the credentials is deliberate. A helper that hands our stdout
+	// to a process outliving it has broken its side of the contract, and a
+	// resolve that fails feeds the backoff and reaches the caller as -32014,
+	// where one that blocks forever reaches nobody.
+	require.ErrorIs(t, err, exec.ErrWaitDelay)
+
+	// Returning is only half of it. Nothing cancelled this command, so the
+	// group kill never ran, and all os/exec does at WaitDelay is close OUR end
+	// of the pipe — the child is still out there, reparented to init, still in
+	// the group. Backoff brings the gateway back down this path for as long as
+	// the helper keeps the habit, so a child left behind here is a child left
+	// behind per attempt.
+	assertReaped(t, readPID(t, ready))
 }
 
 func TestFile(t *testing.T) {
@@ -568,4 +678,55 @@ func TestUnproductiveRefreshHoldsFixedCadence(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	assert.LessOrEqual(t, inner.count(), 6, "unchanged ExpiresAt must refresh at fixed cadence, not accelerate")
+}
+
+// TestCancelHelperDoesNotSignalAReapedPid guards the pid the cancel is aimed
+// at.
+//
+// Cmd.Wait reaps the child before it reads the cancel result, so cancelHelper
+// runs after the pid is free often enough to matter. The pid it signals is a
+// process GROUP id, so aimed at a freed one it is a SIGKILL delivered to
+// whatever now holds that pgid. Asking os.Process first is what catches that:
+// it declines to signal a pid it has already reaped, where the raw
+// syscall.Kill behind it consults nothing.
+//
+// Asserted against cancelHelper rather than by racing a real helper — the
+// window is too narrow to hit on purpose, so the test has to be about the
+// property that narrows it. ErrProcessDone and not some other error, because
+// os/exec reads exactly that one as "nothing was interrupted" and so declines
+// to report a helper that finished a hair early as cancelled.
+func TestCancelHelperDoesNotSignalAReapedPid(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "exit 0")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, cmd.Start())
+	require.NoError(t, cmd.Wait(), "the child is now reaped and its pid is free")
+
+	assert.ErrorIs(t, cancelHelper(cmd.Process), os.ErrProcessDone,
+		"cancel must ask os.Process before signalling a pid as a process group")
+}
+
+// readPID reads the pid the helper's forked child published for itself.
+func readPID(t *testing.T, path string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	require.NoError(t, err, "helper published %q as its child pid", raw)
+	return pid
+}
+
+// assertReaped waits for a pid to stop existing.
+//
+// Asserted directly rather than inferred from how long the resolve took. The
+// timing form — "it returned in under WaitDelay, so the group kill must have
+// worked" — is a race against the very grace period it is trying to prove
+// unnecessary, and it fails on a machine fast enough to reach the kill before
+// the group has settled. What the group kill promises is that the child is
+// gone; that is what this checks.
+func assertReaped(t *testing.T, pid int) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return syscall.Kill(pid, syscall.Signal(0)) != nil
+	}, 10*time.Second, 20*time.Millisecond,
+		"pid %d survived the group kill and still holds the helper's stdout", pid)
 }
