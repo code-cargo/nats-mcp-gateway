@@ -304,30 +304,14 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 	go func() {
 		defer s.wg.Done()
 
-		// Everything this gateway publishes for a request goes to the
-		// reply-to the CALLER chose, under the GATEWAY's identity. NATS
-		// permission-checks the subject a client publishes to; it does not
-		// check the reply-to, which is checked against whoever answers. So a
-		// caller holding one narrow publish grant can name any subject the
-		// gateway may reach and have the gateway write there on its behalf.
-		//
-		// The $ namespace is what makes that an escalation rather than a
-		// nuisance: with claim-check on, the gateway's identity carries
-		// JetStream rights, $JS.API.STREAM.DELETE.<stream> takes no request
-		// body, and the keepalive is an empty-bodied frame emitted unprompted.
-		// The two compose into another tenant's claim bucket being deleted by
-		// a caller who cannot publish to that subject themselves.
-		//
-		// No client reply inbox begins with $ — the namespace is reserved for
-		// the server's own APIs — so refusing it costs nothing and closes that
-		// whole class. It does not close a reply-to aimed at another CLIENT's
-		// inbox; only per-user inbox prefixes do, which is a deployment
-		// control the README now spells out.
-		if reply := req.Reply(); !usableReplySubject(reply) {
+		// Every frame below goes to the reply-to the CALLER chose, published
+		// under the GATEWAY's identity. See usableReplySubject for what that
+		// hands a caller and why this refuses some of it.
+		if reply := req.Reply(); !usableReplySubject(reply, prefix) {
 			// slog.Default rather than a configured logger: wire.Server has
 			// none, and a security refusal that leaves no trace is worse than
 			// one logged somewhere an operator has to go looking for.
-			slog.Default().Warn("refusing a request whose reply subject is not a client inbox",
+			slog.Default().Warn("refusing a request whose reply subject is not a usable client inbox",
 				"subject", req.Subject(), "reply", reply)
 			return
 		}
@@ -407,16 +391,13 @@ func (s *Server) beginRequest() bool {
 	return true
 }
 
-// refuseDrained answers a request delivered after the drain gave up on it.
-// ErrCodeStreamLost is the same "re-issue" signal a request caught in flight
-// gets, and it reaches another replica in the time silence would have spent
-// waiting out the caller's inactivity window.
 // usableReplySubject reports whether a caller-supplied reply-to is something
-// this gateway may publish and subscribe to on that caller's behalf.
+// this gateway may publish and subscribe to on that caller's behalf, given the
+// wire prefix this replica serves.
 //
-// Two separate hazards, both reachable from one narrow publish grant, because
-// NATS permission-checks the subject a client publishes TO and never the
-// reply-to — that is checked against whoever answers, which is us.
+// Three hazards, all reachable from one narrow publish grant, because NATS
+// permission-checks the subject a client publishes TO and never the reply-to —
+// that is checked against whoever answers, which is us.
 //
 // A privileged subject makes the gateway a publish proxy for its own rights.
 // With claim-check on, our identity carries JetStream rights,
@@ -431,32 +412,44 @@ func (s *Server) beginRequest() bool {
 // MaxReconnects(-1) does not apply, and nothing here installs a ClosedHandler.
 // One publish and the replica is silently off the air.
 //
+// A subject inside our own prefix turns the gateway into a reflector onto the
+// wire: a reply of {prefix}.req.{victim}.… has us publish keepalive and end
+// frames onto another tenant's endpoint subject. Those frames carry no
+// Mcp-Wire header, so nothing runs on the far side, but a caller who cannot
+// publish there is still spending our dispatch goroutines to reach it. No
+// client inbox lives under the wire prefix, so refusing it costs nothing.
+//
 // So: a non-empty literal subject, no wildcards, no empty tokens, no
-// whitespace, and not in the server's own $ namespace. Deliberately not a
-// check that it looks like an inbox — a deployment may configure any inbox
-// prefix, and guessing at that would refuse working clients. What is left
-// unreachable by this is a subject an account MAPPING aliases onto something
-// privileged under an ordinary-looking name, which no syntactic test can see
-// and only the gateway's own NATS grant can bound.
-func usableReplySubject(reply string) bool {
+// whitespace, outside the server's own $ namespace and outside ours.
+// Deliberately not a check that it looks like an inbox — a deployment may
+// configure any inbox prefix, and guessing at that would refuse working
+// clients. What is left unreachable by this is a subject an account MAPPING
+// aliases onto something privileged under an ordinary-looking name, which no
+// syntactic test can see and only the gateway's own NATS grant can bound.
+func usableReplySubject(reply, prefix string) bool {
 	if reply == "" || strings.HasPrefix(reply, "$") {
 		return false
 	}
+	if reply == prefix || strings.HasPrefix(reply, prefix+".") {
+		return false
+	}
 	for _, tok := range strings.Split(reply, ".") {
-		if tok == "" || tok == "*" || tok == ">" {
-			return false
-		}
-		if strings.ContainsAny(tok, "*> \t\r\n") {
+		// An empty token is its own case: ContainsAny cannot see it.
+		if tok == "" || strings.ContainsAny(tok, "*> \t\r\n") {
 			return false
 		}
 	}
 	return true
 }
 
+// refuseDrained answers a request delivered after the drain gave up on it.
+// ErrCodeStreamLost is the same "re-issue" signal a request caught in flight
+// gets, and it reaches another replica in the time silence would have spent
+// waiting out the caller's inactivity window.
 func (s *Server) refuseDrained(req micro.Request) {
 	// Same rule as dispatch: this publishes to the caller's chosen subject
 	// too, and a drain is not a reason to stop checking where.
-	if !usableReplySubject(req.Reply()) {
+	if !usableReplySubject(req.Reply(), s.prefix) {
 		return
 	}
 	w := &streamWriter{nc: s.nc, req: req}

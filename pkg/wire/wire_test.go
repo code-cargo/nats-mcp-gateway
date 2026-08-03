@@ -645,28 +645,6 @@ func TestNewClientRejectsAnUnusableSubjectPrefix(t *testing.T) {
 	}
 }
 
-// The gateway half of the same gap, and the sharper one: EndpointSubject
-// pastes the prefix in unchecked the way BuildSubject did. An empty token
-// builds an invalid SUBSCRIBE — nats.go rejects that one locally today — but a
-// WILDCARD is accepted all the way through, so `mcp.*` quietly starts a
-// replica subscribed to mcp.*.req.*.*.{server}.>, widening the very
-// subscription the prefix exists to narrow. Every config source reaches Serve.
-func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
-	nc, _ := natstest.Run(t, nil)
-	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
-		_, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
-		assert.Error(t, err, "prefix %q builds an endpoint subject nothing should serve", prefix)
-	}
-	// Including the empty prefix that means "use DefaultPrefix".
-	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
-		srv, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
-		require.NoError(t, err, "prefix %q is legitimate", prefix)
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		require.NoError(t, srv.Shutdown(ctx))
-		cancel()
-	}
-}
-
 // TestReplyToASystemSubjectIsRefused closes a confused deputy.
 //
 // NATS permission-checks the subject a client publishes TO. It does not check
@@ -773,16 +751,79 @@ func TestWildcardReplyDoesNotKillTheConnection(t *testing.T) {
 	assert.Contains(t, string(resp.Data), `"result"`)
 }
 
+// The third thing a caller-chosen reply subject can name: our own wire. A
+// reply of {prefix}.req.{victim}.… has the gateway publish keepalive and end
+// frames onto another tenant's endpoint subject — nothing runs there, since
+// those frames carry no Mcp-Wire header, but the caller is spending our
+// dispatch on a subject it cannot publish to itself.
+func TestReplyIntoTheWiresOwnSubjectsIsRefused(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	const victim = "mcp.v1.req.victim.u1.test.tools.list._"
+	watch, err := nc.SubscribeSync(victim)
+	require.NoError(t, err)
+	require.NoError(t, nc.PublishMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Reply:   victim,
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}))
+	require.NoError(t, nc.Flush())
+
+	// Long enough for a keepalive to have fired had the request been served.
+	_, err = watch.NextMsg(300 * time.Millisecond)
+	assert.ErrorIs(t, err, nats.ErrTimeout, "the gateway reflected frames onto %q", victim)
+}
+
 func TestUsableReplySubject(t *testing.T) {
 	for _, ok := range []string{
 		"_INBOX.abc123", "_INBOX_acme_u_9f3a.xyz", "my.custom.inbox.1", "a",
+		// Sharing a first token with the prefix is not being inside it.
+		"mcp.v2.inbox", "mcp.v1x.inbox",
 	} {
-		assert.True(t, usableReplySubject(ok), "legitimate inbox %q must be served", ok)
+		assert.True(t, usableReplySubject(ok, DefaultPrefix), "legitimate inbox %q must be served", ok)
 	}
 	for _, bad := range []string{
 		"", "$JS.API.STREAM.DELETE.x", "$SYS.REQ.SERVER.PING",
 		">", "*", "a.>", "a.*.b", "a..b", ".a", "a.", "a b.c", "a\tb",
+		// Our own wire: a reply here has the gateway reflect frames onto an
+		// endpoint subject the caller may not publish to itself.
+		"mcp.v1", "mcp.v1.req.victim.u1.test.tools.list._", "mcp.v1.anything",
 	} {
-		assert.False(t, usableReplySubject(bad), "unusable reply %q must be refused", bad)
+		assert.False(t, usableReplySubject(bad, DefaultPrefix), "unusable reply %q must be refused", bad)
+	}
+	// The prefix that is refused is the one this replica actually serves.
+	assert.True(t, usableReplySubject("mcp.v1.req.acme.u1.test.tools.list._", "acme.mcp"))
+	assert.False(t, usableReplySubject("acme.mcp.req.acme.u1.test.tools.list._", "acme.mcp"))
+}
+
+// Serve validated no prefix at all: EndpointSubject pastes it in unchecked, so
+// a trailing dot built an invalid SUBSCRIBE — and an unrecognised -ERR from
+// the server closes the nats.go connection for good — while a wildcard widened
+// the very subscription the prefix exists to narrow.
+func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
+		_, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		assert.Error(t, err, "prefix %q builds an endpoint subject nothing should serve", prefix)
+	}
+	// Including the empty prefix that means "use DefaultPrefix".
+	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
+		srv, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		require.NoError(t, err, "prefix %q is legitimate", prefix)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		require.NoError(t, srv.Shutdown(ctx))
+		cancel()
 	}
 }
