@@ -17,6 +17,7 @@ package cmd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -661,7 +662,17 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		// to build the pool key just before spawning us.
 		c, gen, err := resolver.ResolveGen(context.Background(), key.Tenant, credUser, key.Server)
 		if err != nil {
-			return nil, fmt.Errorf("resolving credentials for %s/%s: %w", key.Tenant, key.Server, err)
+			// The factory's error is the pool's error, which the proxy hands
+			// the caller: the same detail suppression the request path applies
+			// is owed here, and through the same function so the two cannot
+			// drift. CallerMessage's retry advice earns its place on this path
+			// rather than duplicating the error code's: a pool failure arrives
+			// as -32010, whose contract tells the client to re-issue, and a
+			// terminal credential refusal is exactly the case that has to
+			// contradict it.
+			ref := cred.FailureRef()
+			blog.Warn("credential resolution failed while spawning backend", "err", err, "ref", ref)
+			return nil, fmt.Errorf("%s/%s: %s", key.Tenant, key.Server, cred.CallerMessage(err, ref))
 		}
 		if gen != key.CredVersion {
 			// The credentials rotated between the proxy's resolve and ours:
@@ -681,8 +692,8 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		hb := &backend.HTTPBackend{URL: s.URL, Headers: s.Headers, Legacy: !modern, Logger: blog}
 		if resolver != nil {
 			hb.TokenSource = &credTokenSource{
-				resolver: resolver,
-				tenant:   key.Tenant, user: credUser, server: key.Server,
+				resolver: resolver, log: blog,
+				tenant: key.Tenant, user: credUser, server: key.Server,
 			}
 		}
 		inner = hb
@@ -733,13 +744,26 @@ func (b *expiringBackend) CredExpiresAt() time.Time { return b.expiresAt }
 // bearer and a 401 forces a refetch.
 type credTokenSource struct {
 	resolver             *cred.CachedResolver
+	log                  *slog.Logger
 	tenant, user, server string
 }
 
 func (t *credTokenSource) Headers(ctx context.Context) (map[string]string, error) {
 	c, _, err := t.resolver.ResolveGen(ctx, t.tenant, t.user, t.server)
 	if err != nil {
-		return nil, err
+		// The third resolve site, and the only one on the REQUEST path: an
+		// HTTP backend answering 401 makes doWithAuthRetry invalidate and
+		// resolve again, so this runs exactly when the credential source is
+		// most likely to be failing and most likely to say why. What it says
+		// travels — newRequest wraps it, roundTripOnce turns it into a -32603,
+		// and the proxy forwards a backend's JSON-RPC error verbatim by
+		// design. The same suppression the other two sites apply is owed here,
+		// or the helper's stderr reaches the tenant user through the one path
+		// that runs on every request.
+		ref := cred.FailureRef()
+		t.log.Warn("credential resolution failed for a backend request",
+			"err", err, "ref", ref, "server", t.server)
+		return nil, errors.New(cred.CallerMessage(err, ref))
 	}
 	return c.Headers, nil
 }

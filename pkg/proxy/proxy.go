@@ -152,12 +152,10 @@ func (p *Proxy) Handler() wire.Handler {
 				// the key drains stale backends on refresh.
 				_, gen, cerr := resolver.ResolveGen(ctx, in.Subject.Tenant, credUser, in.Subject.Server)
 				if cerr != nil {
-					reqLog.Warn("credential resolution failed", "err", cerr, "terminal", cred.IsTerminal(cerr))
-					msg := "backend credentials temporarily unavailable, retry later: " + cerr.Error()
-					if cred.IsTerminal(cerr) {
-						msg = "backend credentials unavailable, do not retry: " + cerr.Error()
-					}
-					return fail(wire.ErrCodeCredentialUnavailable, msg, nil)
+					ref := cred.FailureRef()
+					reqLog.Warn("credential resolution failed", "err", cerr,
+						"terminal", cred.IsTerminal(cerr), "ref", ref)
+					return fail(wire.ErrCodeCredentialUnavailable, cred.CallerMessage(cerr, ref), nil)
 				}
 				if perUser {
 					key.CredSet = credUser

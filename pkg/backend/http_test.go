@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -415,6 +416,82 @@ func TestNoWastedRetryWhenAnnotationsAreUnchanged(t *testing.T) {
 		"a known-unannotated tool must never be re-probed")
 }
 
+func TestOnePageOfAListingCannotSettleTheWholeToolset(t *testing.T) {
+	// tools/list is paginated, and one conn is shared by every caller of a
+	// (server, tenant, credential set) — so one client fetching page 1 and
+	// another calling a tool that lives on page 2 is ordinary traffic, not a
+	// corner case. Page 1 carrying no x-mcp-header says nothing about page 2,
+	// and concluding otherwise disables the recovery permanently: the call is
+	// rejected for a missing Mcp-Param-*, the gateway decides it already knows
+	// this server has no annotations, and the -32020 is unrecoverable for as
+	// long as the conn lives.
+	var listCalls, callAttempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		w.Header().Set("Content-Type", "application/json")
+		switch msg.Method {
+		case mcpspec.MethodToolsList:
+			listCalls.Add(1)
+			var p struct {
+				Cursor string `json:"cursor"`
+			}
+			_ = json.Unmarshal(msg.Params, &p)
+			page := `{"resultType":"complete","nextCursor":"p2","tools":[
+				{"name":"ping","inputSchema":{"type":"object"}}]}`
+			if p.Cursor == "p2" {
+				page = `{"resultType":"complete","tools":[
+					{"name":"execute_sql","inputSchema":{"type":"object","properties":{
+						"region":{"type":"string","x-mcp-header":"Region"}}}}]}`
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, json.RawMessage(page)))
+			_, _ = w.Write(resp)
+		default:
+			callAttempts.Add(1)
+			var p struct {
+				Arguments map[string]any `json:"arguments"`
+			}
+			_ = json.Unmarshal(msg.Params, &p)
+			region, _ := p.Arguments["region"].(string)
+			if r.Header.Get("Mcp-Param-Region") != region {
+				w.WriteHeader(http.StatusBadRequest)
+				resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
+					msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil,
+				))
+				_, _ = w.Write(resp)
+				return
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
+				json.RawMessage(`{"resultType":"complete","content":[]}`)))
+			_, _ = w.Write(resp)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	// An ordinary first page passes through, carrying no annotations.
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`)), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error)
+	require.Contains(t, string(resp.Result), "ping")
+
+	params, _ := json.Marshal(map[string]any{
+		"name": "execute_sql", "arguments": map[string]any{"region": "us-west1"},
+	})
+	resp, err = m.Call(context.Background(), jsonrpc.NewRequest("2", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error, "the recovery must still run for a tool whose page was never seen")
+	assert.Equal(t, int32(2), callAttempts.Load(), "one rejection, one retry carrying the header")
+	assert.Equal(t, int32(3), listCalls.Load(),
+		"the client's page plus both pages of the probe that had to read past it")
+}
+
 func TestLegacyHTTPBackendIsNotJudgedAgainstXMcpHeader(t *testing.T) {
 	// x-mcp-header does not exist in 2025-11-25. Excluding a legacy server's
 	// tools for violating a rule its author never agreed to would silently
@@ -554,6 +631,103 @@ func TestFailedRefreshDoesNotSuppressALaterOne(t *testing.T) {
 	require.NoError(t, err)
 	require.Nil(t, resp.Error, "the recovery must run after an earlier probe failed")
 	assert.Equal(t, int32(2), listCalls.Load())
+}
+
+func TestCloseEndsInFlightExchanges(t *testing.T) {
+	// A backend that accepts the POST and answers nothing is the shape that
+	// costs the gateway a goroutine and a socket per call: the client carries
+	// no Timeout (SSE streams are long-lived by design) and the exchange runs
+	// detached from the caller, so nothing on this side ever ends it. Close,
+	// EvictServer and Shutdown all returned while it ran on, which is what
+	// makes the leak unbounded rather than merely slow.
+	var arrived atomic.Int32
+	var abandoned atomic.Int32
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// net/http only starts watching for a client disconnect once the
+		// request body has been consumed, so a handler that ignores it never
+		// learns its caller is gone.
+		_, _ = io.Copy(io.Discard, r.Body)
+		arrived.Add(1)
+		select {
+		case <-r.Context().Done():
+			abandoned.Add(1)
+		case <-release:
+		}
+	}))
+	// LIFO: the wedged handlers are released before the server is closed, so a
+	// regression fails this test instead of hanging its cleanup.
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+
+	// One of each: a request, whose exchange is tied to the caller waiting for
+	// it, and a notification, which has no caller to be tied to.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewNotification(mcpspec.NotifCancelled, json.RawMessage(`{"requestId":"x"}`))))
+	require.Eventually(t, func() bool { return arrived.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
+		"the backend never received both exchanges")
+
+	require.NoError(t, conn.Close())
+
+	// Close returned, so nothing is still holding a socket on this conn's
+	// behalf — the WaitGroup it maintains is finally waited on somewhere.
+	drained := make(chan struct{})
+	go func() { c.inflight.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close returned while its exchanges were still running")
+	}
+
+	assert.Eventually(t, func() bool { return abandoned.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
+		"closing the conn must reach the backend as a disconnect, not leave the requests parked on it")
+}
+
+func TestCallerCancellationEndsItsExchange(t *testing.T) {
+	// The other end of the same leak: the conn stays open and healthy, so
+	// nothing closes it, and the caller that provoked the exchange gives up.
+	// Its POST has no deadline of its own, so without the caller's context it
+	// runs until the pool eventually recycles the whole conn — while later
+	// requests keep arriving and keep the conn from ever being idle enough to
+	// recycle.
+	var abandoned atomic.Bool
+	arrived := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		close(arrived)
+		select {
+		case <-r.Context().Done():
+			abandoned.Store(true)
+		case <-release:
+		}
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(release) })
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	select {
+	case <-arrived:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the backend was never called")
+	}
+
+	cancel()
+	assert.Eventually(t, abandoned.Load, 10*time.Second, 10*time.Millisecond,
+		"a request nobody is waiting for must not stay on the wire")
 }
 
 func TestScanSSEJoinsDataLinesWithNewline(t *testing.T) {
@@ -715,4 +889,99 @@ func TestNonStringNameSendsNoName(t *testing.T) {
 	), nil)
 	require.NoError(t, err)
 	assert.False(t, sawNameHeader, "a non-string name must not become an empty one")
+}
+
+// TestBackendErrorDoesNotEchoTheURLsSecrets covers what a transport error
+// carries to the caller.
+//
+// net/http quotes the request URL into every transport error, the proxy
+// forwards a backend's JSON-RPC error verbatim, and a backend URL is a
+// documented place to expand a secret into. So "connection refused" — which
+// any caller can provoke against an unreachable backend — was enough to read
+// an api_key out of the query string. Go redacts userinfo passwords and
+// nothing else.
+func TestBackendErrorDoesNotEchoTheURLsSecrets(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1:1/mcp?api_key=SUPERSECRET",
+		"http://127.0.0.1:1/mcp?a=1&token=SUPERSECRET#frag",
+		"http://user:SUPERSECRET@127.0.0.1:1/mcp",
+		"http://127.0.0.1:1/mcp?api_key=SUPERSECRET&x=2",
+	} {
+		b := &HTTPBackend{URL: raw}
+		conn, err := b.Connect(context.Background())
+		require.NoError(t, err)
+		m := NewMux(conn, nil)
+		resp, err := m.Call(context.Background(),
+			jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Error)
+		assert.NotContains(t, resp.Error.Message, "SUPERSECRET", "url %q leaked to the caller", raw)
+		assert.Contains(t, resp.Error.Message, "127.0.0.1:1",
+			"the host must survive: which backend failed is the whole content of the error")
+		_ = m.Close()
+	}
+}
+
+func TestScrubURLsKeepsErrorsDiagnosable(t *testing.T) {
+	cases := map[string]string{
+		`Post "http://h/mcp?k=s": refused`: `Post "http://h/mcp?[redacted]": refused`,
+		`Post "http://u:p@h/mcp": refused`: `Post "http://h/mcp": refused`,
+		`Post "http://h/mcp": refused`:     `Post "http://h/mcp": refused`,
+		`dial tcp 1.2.3.4:80: no route`:    `dial tcp 1.2.3.4:80: no route`,
+		`Get "https://h/a/b#frag" failed`:  `Get "https://h/a/b" failed`,
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, scrubURLs(in), "input %q", in)
+	}
+}
+
+// TestNonTerminatingListingRecordsTruncation bounds what a backend can make
+// the gateway do by never ending its cursor.
+//
+// Concluding "no annotations" from a truncated read would be wrong — the pages
+// never seen may carry some — so the probe correctly declines to record that.
+// But leaving it at that means every -32020 starts another full sweep, and the
+// backend decides when the cursor ends, so the sweep never gets cheaper.
+// Recording the truncation separately is what lets the recovery give up on a
+// retry that cannot succeed without claiming knowledge it does not have.
+func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
+	var listPages atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		msg := &jsonrpc.Message{}
+		_ = json.NewDecoder(r.Body).Decode(msg)
+		listPages.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
+			json.RawMessage(`{"tools":[],"nextCursor":"more"}`)))
+		_, _ = w.Write(resp)
+	}))
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+	t.Cleanup(func() { _ = c.Close() })
+
+	require.NoError(t, c.refreshAnnotations(context.Background(), 0))
+
+	c.mu.Lock()
+	known, truncated := c.annotationsKnown, c.annotationsTruncated
+	c.mu.Unlock()
+
+	assert.False(t, known,
+		"a listing that never ended is not evidence that the server publishes no annotations")
+	assert.True(t, truncated,
+		"the cap was hit with pages unread, and the recovery has to know that")
+	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
+		"the probe reads exactly the cap and stops")
+
+	// The second probe is what the guard exists to prevent: it would read the
+	// same pages and stop in the same place.
+	before := listPages.Load()
+	c.mu.Lock()
+	skip := c.annotationsKnown || c.annotationsTruncated
+	c.mu.Unlock()
+	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
+	assert.Equal(t, before, listPages.Load())
 }

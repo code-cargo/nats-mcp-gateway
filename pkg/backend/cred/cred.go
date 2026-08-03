@@ -39,6 +39,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	rand "math/rand/v2"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -103,6 +105,28 @@ func Terminal(err error) error {
 func IsTerminal(err error) bool {
 	var t *terminalError
 	return errors.As(err, &t)
+}
+
+// FailureRef mints the correlation token for one resolve failure: the caller
+// is told the ref, the gateway logs the ref beside the real error, and the
+// two are joined by an operator holding a user's screenshot.
+func FailureRef() string {
+	return strconv.FormatUint(rand.Uint64(), 36)
+}
+
+// CallerMessage renders a resolve failure for the client that provoked it.
+// Dropping the detail is the point. A resolver's error text is whatever its
+// source emitted — the helper's stderr, the IdP's response body, the expanded
+// path of an assertion file — and the client is the party all of that is
+// being kept from; it also chooses when to provoke it, since asking for a
+// server whose credentials it cannot have is enough. What survives is the
+// category, the only part a client can act on. Log err itself with the same
+// ref, or the failure becomes undiagnosable from either end.
+func CallerMessage(err error, ref string) string {
+	if IsTerminal(err) {
+		return "backend credentials unavailable, do not retry (gateway ref " + ref + ")"
+	}
+	return "backend credentials temporarily unavailable, retry later (gateway ref " + ref + ")"
 }
 
 // credJSON is the interchange shape shared by every source that carries

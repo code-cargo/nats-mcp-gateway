@@ -16,6 +16,7 @@ package backend
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -107,6 +108,12 @@ type Pool struct {
 	mu      sync.Mutex
 	entries map[Key]*entry
 	broken  map[Key]*breaker
+	// pending counts spawns a tenant has been admitted for but has not yet
+	// inserted. The lock is dropped for the whole of Connect, so without this
+	// the cap is only ever compared against backends that already finished
+	// starting — and a burst wide enough to matter is entirely in flight by
+	// then.
+	pending map[string]int
 	// orphans are past-deadline entries replaced by Get while they still had
 	// in-flight calls: the calls run to completion and the reaper closes the
 	// mux once they drain. Closing immediately would kill live work for an
@@ -153,15 +160,41 @@ func NewPool(cfg PoolConfig, factory Factory, log *slog.Logger) *Pool {
 		log:     log,
 		entries: make(map[Key]*entry),
 		broken:  make(map[Key]*breaker),
+		pending: make(map[string]int),
 		stop:    make(chan struct{}),
 	}
 	go p.reapLoop()
 	return p
 }
 
+// errEntryRetired means the entry a Get had settled on stopped being the one
+// to use while that Get was queued for a call slot. Internal to Get's retry;
+// it never reaches a caller.
+var errEntryRetired = errors.New("backend: pooled entry retired while queued")
+
+// getMaxAttempts bounds that retry. Each attempt spawns at most one backend,
+// so a pathological case — credentials already expired the moment they are
+// resolved — must not become a spawn-and-discard loop; the caller is told to
+// re-issue instead.
+const getMaxAttempts = 3
+
 // Get returns the live Mux for the key, creating it if needed, and reserves
 // one concurrency slot. The caller MUST call release when its call finishes.
 func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
+	for range getMaxAttempts {
+		mux, release, err := p.get(ctx, key)
+		if !errors.Is(err, errEntryRetired) {
+			return mux, release, err
+		}
+	}
+	return nil, nil, fmt.Errorf("backend: %s/%s could not be given a live backend to run on, re-issue the request",
+		key.Tenant, key.Server)
+}
+
+// get is one attempt at Get, reporting errEntryRetired when the caller should
+// start over.
+func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
+	var superseded []*Mux
 	p.mu.Lock()
 	e := p.entries[key]
 	// Past-deadline entries are replaced here, not only by the reaper: its
@@ -189,19 +222,27 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 			return nil, nil, fmt.Errorf("backend: tenant %q at max live backends (%d)",
 				key.Tenant, p.cfg.MaxProcsPerTenant)
 		}
+		// Claim the slot while we still hold the lock. The spawn below is the
+		// resource the cap is about, and it begins here, not when the entry
+		// lands in the map.
+		p.pending[key.Tenant]++
 		p.mu.Unlock()
 
 		// Connect outside the lock: spawning can take seconds.
 		b, err := p.factory(key)
 		if err != nil {
+			p.releasePending(key.Tenant)
 			return nil, nil, err
 		}
 		conn, err := b.Connect(ctx)
 		if err != nil {
 			p.recordFailure(key)
+			p.releasePending(key.Tenant)
 			return nil, nil, err
 		}
 		p.mu.Lock()
+		// The entry counts for itself from here, whichever branch below wins.
+		p.releasePendingLocked(key.Tenant)
 		delete(p.broken, key)
 		// Lost the race with another Get? Keep ours anyway under its key —
 		// simplest correct behavior; the reaper collects extras.
@@ -235,6 +276,7 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 				sem:      make(chan struct{}, p.cfg.MaxConcurrent),
 			}
 			p.entries[key] = e
+			superseded = p.retireSupersededLocked(key)
 		}
 	}
 	e.lastUsed = time.Now()
@@ -242,6 +284,12 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	sem := e.sem
 	mux := e.mux
 	p.mu.Unlock()
+	for _, m := range superseded {
+		// Off the request path: closing a stdio backend escalates through
+		// SIGTERM to SIGKILL and can take seconds, and the caller waiting on
+		// this Get has nothing to do with the credentials that rotated.
+		go func(m *Mux) { _ = m.Close() }(m)
+	}
 
 	select {
 	case sem <- struct{}{}:
@@ -253,6 +301,16 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 	}
 	p.mu.Lock()
 	e.waiters--
+	// The entry was sampled before the wait, and the wait is unbounded: a full
+	// semaphore holds a Get until other calls finish. Everything checked at
+	// lookup has to be checked again here, or waiting becomes the way a NEW
+	// call starts on a backend past its credential deadline — or on one
+	// EvictServer replaced, or one that died meanwhile.
+	if p.entries[key] != e || e.mux.Dead() || time.Now().After(e.deadline) {
+		p.mu.Unlock()
+		<-sem // hand the slot to whoever is behind us; we are not using it
+		return nil, nil, errEntryRetired
+	}
 	e.inflight++
 	p.mu.Unlock()
 
@@ -282,6 +340,63 @@ func (p *Pool) recordFailure(key Key) {
 	}
 }
 
+// retireSupersededLocked unmaps the idle entries a newly-keyed credential
+// generation supersedes, returning their muxes to close (p.mu held). Nothing
+// will ever be dispatched to them again: the proxy resolves before it keys,
+// so every later request for this (server, tenant, credset) carries at least
+// this generation. Waiting for the IdleTTL to notice would leave them
+// counting against MaxProcsPerTenant for five minutes — which is how a
+// backend that rejects one caller's credentials on every request becomes a
+// refusal for every OTHER server the tenant has.
+//
+// Busy entries are left alone: their in-flight calls were authorized under
+// the credentials they hold, and the reaper collects them once drained.
+func (p *Pool) retireSupersededLocked(key Key) []*Mux {
+	var victims []*Mux
+	for k, e := range p.entries {
+		if k.Server != key.Server || k.Tenant != key.Tenant || k.CredSet != key.CredSet {
+			continue
+		}
+		// Generations are globally monotonic, so "older" is exactly "lower" —
+		// and a Get that raced in with a stale generation must not be read as
+		// superseding the newer entry already serving.
+		if k.CredVersion >= key.CredVersion || e.busyLocked() {
+			continue
+		}
+		victims = append(victims, e.mux)
+		delete(p.entries, k)
+	}
+	return victims
+}
+
+func (p *Pool) releasePending(tenant string) {
+	p.mu.Lock()
+	p.releasePendingLocked(tenant)
+	p.mu.Unlock()
+}
+
+func (p *Pool) releasePendingLocked(tenant string) {
+	if n := p.pending[tenant] - 1; n > 0 {
+		p.pending[tenant] = n
+	} else {
+		delete(p.pending, tenant)
+	}
+}
+
+// closeAll closes every mux, concurrently. One close is slow by design — a
+// stdio backend escalates through SIGTERM to SIGKILL, an http conn waits out
+// the exchanges still on its wire — so closing serially charges that grace
+// once per backend to whoever is collecting them: a reaper tick, a config
+// reload's eviction, or the whole of Shutdown.
+func closeAll(muxes []*Mux) {
+	var wg sync.WaitGroup
+	for _, m := range muxes {
+		wg.Add(1)
+		go func(m *Mux) { defer wg.Done(); _ = m.Close() }(m)
+	}
+	wg.Wait()
+}
+
 func (p *Pool) tenantCountLocked(tenant string) int {
 	n := 0
 	for k, e := range p.entries {
@@ -296,7 +411,10 @@ func (p *Pool) tenantCountLocked(tenant string) int {
 			n++
 		}
 	}
-	return n
+	// Reserved slots are subprocesses being spawned right now; not counting
+	// them lets a burst of concurrent Gets on distinct keys all pass the check
+	// and all spawn, overshooting the cap by the width of the burst.
+	return n + p.pending[tenant]
 }
 
 func (p *Pool) reapLoop() {
@@ -339,9 +457,7 @@ func (p *Pool) reap() {
 	}
 	p.orphans = kept
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }
 
 // EvictServer closes every pooled connection for the named server (across all
@@ -378,9 +494,7 @@ func (p *Pool) EvictServer(server string) {
 		}
 	}
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }
 
 // Shutdown closes every pooled connection.
@@ -397,7 +511,5 @@ func (p *Pool) Shutdown() {
 	}
 	p.orphans = nil
 	p.mu.Unlock()
-	for _, m := range victims {
-		_ = m.Close()
-	}
+	closeAll(victims)
 }

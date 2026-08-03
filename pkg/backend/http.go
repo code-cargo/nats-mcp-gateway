@@ -24,6 +24,8 @@ import (
 	"log/slog"
 	"maps"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -81,8 +83,10 @@ func (b *HTTPBackend) Connect(ctx context.Context) (Conn, error) {
 		client:  client,
 		log:     log,
 		inbox:   make(chan *jsonrpc.Message, 64),
-		done:    make(chan struct{}),
 	}
+	// The conn's life as a context, because every exchange has to be scoped
+	// inside it and a channel cannot be a context's parent.
+	c.connCtx, c.connCancel = context.WithCancel(context.Background())
 	return c, nil
 }
 
@@ -96,6 +100,11 @@ type httpConn struct {
 	mu        sync.Mutex
 	sessionID string
 	inflight  sync.WaitGroup
+	// closing latches Close's arrival, so admitting an exchange (the Add on
+	// inflight) and draining them (the Wait) cannot interleave. connCtx alone
+	// cannot do this: a Write may pass a context check and reach its Add after
+	// Wait has already started on a zero counter, which that Wait will not see.
+	closing bool
 
 	// annotations maps a tool name to its honored x-mcp-header parameters,
 	// learned from tools/list responses passing through. A tool with no
@@ -104,10 +113,20 @@ type httpConn struct {
 	// refresh path decides whether to retry by comparing what it knew before
 	// against what it knows after, not by consulting a third state.
 	annotations map[string][]headerParam
-	// annotationsKnown records that a full tools/list has been read at least
-	// once. Without it a backend rejecting for a reason mirroring cannot fix
-	// re-probes its whole (paginated) tool list on every call, forever.
+	// annotationsKnown records that a tools/list has been read to its LAST
+	// page at least once. Without it a backend rejecting for a reason
+	// mirroring cannot fix re-probes its whole tool list on every call,
+	// forever. Only the out-of-band probe sets it, because only the probe
+	// follows the cursor to the end: a page passing through on its way to a
+	// client is one page, and what the pages after it hold is exactly the
+	// question being answered.
 	annotationsKnown bool
+	// annotationsTruncated records that a probe hit the page cap with the
+	// listing unfinished. Distinct from annotationsKnown: it says "we looked
+	// and could not see it all", which is not grounds to believe there are no
+	// annotations, but is grounds to stop re-reading the same pages — the
+	// backend chooses when its cursor ends.
+	annotationsTruncated bool
 	// refreshGen counts completed out-of-band schema fetches, so concurrent
 	// callers can tell whether one they waited on covered their need.
 	refreshGen uint64
@@ -116,15 +135,16 @@ type httpConn struct {
 	// ever held briefly: this one is held across a network round trip.
 	refreshMu sync.Mutex
 
-	done      chan struct{}
-	closeOnce sync.Once
+	connCtx    context.Context
+	connCancel context.CancelFunc
+	closeOnce  sync.Once
 }
 
 func (c *httpConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
 	select {
 	case m := <-c.inbox:
 		return m, nil
-	case <-c.done:
+	case <-c.connCtx.Done():
 		// Drain anything already queued before reporting closed.
 		select {
 		case m := <-c.inbox:
@@ -138,10 +158,8 @@ func (c *httpConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
 }
 
 func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
-	select {
-	case <-c.done:
+	if c.connCtx.Err() != nil {
 		return ErrConnDead
-	default:
 	}
 	body, err := jsonrpc.Encode(msg)
 	if err != nil {
@@ -152,12 +170,56 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	// background so Write keeps the Conn contract (non-blocking beyond the
 	// POST itself). The request is (re)built inside so the single 401 retry
 	// gets a fresh body reader and freshly-resolved headers.
+	//
+	// Admission is latched against Close under c.mu, not against connCtx: a
+	// WaitGroup counter raised after Wait has begun on a zero counter is not
+	// seen by that Wait, so a Write that had already passed a bare context
+	// check could start an exchange behind the drain Close just reported.
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return ErrConnDead
+	}
 	c.inflight.Add(1)
+	c.mu.Unlock()
+	exchange, done := c.exchangeContext(ctx, msg)
 	go func() {
 		defer c.inflight.Done()
-		c.roundTripOnce(context.WithoutCancel(ctx), body, msg, false)
+		defer done()
+		c.roundTripOnce(exchange, body, msg, false)
 	}()
 	return nil
+}
+
+// notificationExchangeTimeout bounds a notification's POST. Nothing is
+// waiting for one — the mux sends notifications/cancelled after its caller is
+// already gone, so inheriting that caller's context would abort the message
+// on its way out — and a notification cannot stream, so a fixed bound costs it
+// nothing.
+const notificationExchangeTimeout = 30 * time.Second
+
+// exchangeContext scopes one exchange, which outlives Write by design.
+//
+// A request's exchange lives exactly as long as the caller waiting for it. An
+// SSE stream answering subscriptions/listen may legitimately run for hours,
+// and the only thing that says whether it still should is whether anyone is
+// still reading it; a wall-clock cap could not tell the two apart. A
+// notification has no such caller and takes the fixed bound above instead.
+//
+// Either way the conn's own life is the ceiling. Without it a backend that
+// accepts the POST and answers nothing holds a goroutine and a socket past
+// every teardown the gateway has — the client has no Timeout, so eviction,
+// recycling and Shutdown all returned while the exchange ran on.
+func (c *httpConn) exchangeContext(ctx context.Context, msg *jsonrpc.Message) (context.Context, func()) {
+	var out context.Context
+	var cancel context.CancelFunc
+	if msg.Kind() == jsonrpc.KindRequest {
+		out, cancel = context.WithCancel(ctx)
+	} else {
+		out, cancel = context.WithTimeout(context.WithoutCancel(ctx), notificationExchangeTimeout)
+	}
+	stop := context.AfterFunc(c.connCtx, cancel)
+	return out, func() { stop(); cancel() }
 }
 
 // newRequest builds one POST with the static headers, the token source's
@@ -273,7 +335,13 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 	c.mu.Unlock()
 	resp, err := c.doWithAuthRetry(ctx, body, msg, name, sent)
 	if err != nil {
-		c.fail(msg, err.Error())
+		// A failure the exchange's own context caused needs no answer: either
+		// the caller stopped waiting, or the conn is closing and the mux is
+		// already failing every call on it. Synthesizing one would log a
+		// backend error for a teardown and deliver a response nobody can route.
+		if ctx.Err() == nil {
+			c.fail(msg, err.Error())
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -328,12 +396,14 @@ func (c *httpConn) roundTripOnce(ctx context.Context, body []byte, msg *jsonrpc.
 	case strings.HasPrefix(ct, "application/json"):
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
-			c.fail(msg, fmt.Sprintf("reading response: %v", err))
+			if ctx.Err() == nil {
+				c.fail(msg, fmt.Sprintf("reading response: %v", err))
+			}
 			return
 		}
 		c.deliverBytes(data, msg)
 	case strings.HasPrefix(ct, "text/event-stream"):
-		c.pumpSSE(resp.Body, msg)
+		c.pumpSSE(ctx, resp.Body, msg)
 	default:
 		c.fail(msg, fmt.Sprintf("unexpected content-type %q", ct))
 	}
@@ -367,8 +437,14 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 	c.mu.Lock()
 	_, toolKnown := c.annotations[name]
 	known := c.annotationsKnown && (toolKnown || len(c.annotations) == 0)
+	// A truncated probe counts as done for this purpose. It read every page
+	// the cap allows, so another one reads the same ones and learns nothing
+	// new — and the backend chooses when the cursor ends, so without this a
+	// listing that never terminates makes each rejected call re-sweep the
+	// whole toolset.
+	truncated := c.annotationsTruncated
 	c.mu.Unlock()
-	if known {
+	if known || truncated {
 		return false
 	}
 	if err := c.refreshAnnotations(ctx, gen); err != nil {
@@ -392,12 +468,12 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 }
 
 // pumpSSE delivers each SSE data payload as a message.
-func (c *httpConn) pumpSSE(body io.Reader, req *jsonrpc.Message) {
+func (c *httpConn) pumpSSE(ctx context.Context, body io.Reader, req *jsonrpc.Message) {
 	err := scanSSE(body, func(data []byte) bool {
 		c.deliverBytes(data, req)
 		return true
 	})
-	if err != nil {
+	if err != nil && ctx.Err() == nil {
 		// An oversize or unreadable event truncates the payload, which then
 		// fails to decode and is dropped. Without this the request simply
 		// never gets an answer and the caller waits out its whole context —
@@ -469,25 +545,79 @@ func (c *httpConn) deliverBytes(data []byte, req *jsonrpc.Message) {
 func (c *httpConn) deliver(m *jsonrpc.Message) {
 	select {
 	case c.inbox <- m:
-	case <-c.done:
+	case <-c.connCtx.Done():
 	}
 }
 
 // fail synthesizes an error response for a request whose HTTP exchange
 // failed, so the mux's caller gets an answer instead of a timeout.
 func (c *httpConn) fail(msg *jsonrpc.Message, detail string) {
+	// The operator gets the detail intact; the caller gets it with any URL
+	// stripped of what a URL can carry. net/http quotes the request URL into
+	// every transport error, the proxy forwards a backend's JSON-RPC error
+	// verbatim, and a backend URL is a documented place to expand a secret
+	// into — "http://host/mcp?api_key=${KEY}" reaches the caller in full on
+	// nothing more than a connection refused. Go redacts userinfo passwords
+	// and nothing else.
 	c.log.Warn("http backend error", "method", msg.Method, "detail", detail)
 	if msg.Kind() != jsonrpc.KindRequest {
 		return
 	}
-	c.deliver(jsonrpc.NewErrorResponse(msg.ID, jsonrpc.CodeInternalError, detail, nil))
+	c.deliver(jsonrpc.NewErrorResponse(msg.ID, jsonrpc.CodeInternalError, scrubURLs(detail), nil))
+}
+
+// urlInText matches a URL embedded in free-form error text.
+var urlInText = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'` + "`" + `]+`)
+
+// scrubURLs removes the credential-bearing parts of every URL in s, keeping
+// enough for the failure to stay diagnosable: the scheme, host and path say
+// which backend could not be reached, which is the whole content of a
+// transport error. Userinfo and query string are what a secret is expanded
+// into, and neither tells the caller anything it is owed.
+//
+// The path is kept, which bounds what this can promise: a deployment that puts
+// its secret in the path rather than the query (a webhook-shaped URL), or an
+// error quoting a file:// URI, still passes that through. Keeping the path is
+// the deliberate half of the trade — "which backend" is unreadable without it —
+// so a secret belongs in a header or the query string, not in the path.
+func scrubURLs(s string) string {
+	return urlInText.ReplaceAllStringFunc(s, func(raw string) string {
+		// Trailing punctuation belongs to the sentence, not the URL.
+		trailer := ""
+		for len(raw) > 0 && strings.ContainsRune(`.,;:)]}"'`, rune(raw[len(raw)-1])) {
+			trailer, raw = raw[len(raw)-1:]+trailer, raw[:len(raw)-1]
+		}
+		u, err := url.Parse(raw)
+		if err != nil {
+			// Unparseable is exactly when a secret is most likely to be in
+			// there, so keep only up to the authority.
+			if i := strings.Index(raw, "://"); i >= 0 {
+				if j := strings.IndexAny(raw[i+3:], "/?#"); j >= 0 {
+					return raw[:i+3+j] + "/[redacted]" + trailer
+				}
+			}
+			return "[redacted url]" + trailer
+		}
+		u.User = nil
+		if u.RawQuery != "" {
+			u.RawQuery = "[redacted]"
+		}
+		u.Fragment = ""
+		return u.String() + trailer
+	})
 }
 
 func (c *httpConn) Close() error {
 	c.closeOnce.Do(func() {
+		// Shuts the door before anything else, so no exchange can be admitted
+		// behind the drain below, and ends the ones already through it: the
+		// DELETE that follows is a courtesy call, and a request wedged against
+		// this backend must not be what decides whether it goes out.
 		c.mu.Lock()
+		c.closing = true
 		sid := c.sessionID
 		c.mu.Unlock()
+		c.connCancel()
 		if c.backend.Legacy && sid != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -511,9 +641,36 @@ func (c *httpConn) Close() error {
 				}
 			}
 		}
-		close(c.done)
+
+		// Cancelled is not the same as finished: an exchange still inside
+		// io.ReadAll holds its socket until it returns. Close is what the pool
+		// calls to reclaim a backend, so it must not report one reclaimed
+		// while its requests are still on the wire — the same grace the stdio
+		// backend gives a subprocess to die.
+		if !c.awaitInflight(terminateGrace) {
+			c.log.Warn("http backend closed with exchanges still in flight",
+				"grace", terminateGrace)
+		}
 	})
 	return nil
+}
+
+// awaitInflight reports whether every exchange finished within d. On timeout
+// the waiter outlives this call, which is bounded rather than leaked: the
+// exchanges it waits on all run under connCtx, already cancelled by Close, and
+// cancelling a request aborts the body read holding its socket.
+func (c *httpConn) awaitInflight(d time.Duration) bool {
+	drained := make(chan struct{})
+	go func() {
+		c.inflight.Wait()
+		close(drained)
+	}()
+	select {
+	case <-drained:
+		return true
+	case <-time.After(d):
+		return false
+	}
 }
 
 // annotationProbeID is the JSON-RPC id of the out-of-band tools/list the
@@ -550,12 +707,8 @@ func (c *httpConn) absorbToolsList(m *jsonrpc.Message) {
 	}
 	// A listing with the annotation nowhere in it needs no parsing at all —
 	// which is every server that does not use the feature, i.e. all of them
-	// today. Recording the fact is what stops a -32020 raised for some other
-	// reason from re-probing on every single call thereafter.
+	// today.
 	if !bytes.Contains(m.Result, schemaAnnotationBytes) {
-		c.mu.Lock()
-		c.annotationsKnown = true
-		c.mu.Unlock()
 		return
 	}
 	var result map[string]json.RawMessage
@@ -591,7 +744,6 @@ func (c *httpConn) absorbToolsList(m *jsonrpc.Message) {
 	}
 
 	c.mu.Lock()
-	c.annotationsKnown = true
 	if c.annotations == nil {
 		c.annotations = make(map[string][]headerParam, len(learned))
 	}
@@ -653,11 +805,12 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 		return nil
 	}
 
-	// The probe needs its own deadline. The conn's http.Client has no timeout
-	// (response streams are long-lived by design) and roundTrip runs under an
-	// uncancellable context, so a backend that accepts this POST and never
-	// answers would hold refreshMu for the life of the process — and every
-	// later recovery attempt behind it.
+	// The probe needs its own deadline on top of the exchange's. The conn's
+	// http.Client has no timeout (response streams are long-lived by design),
+	// and the caller whose context this inherits may have none either, so a
+	// backend that accepts this POST and never answers would hold refreshMu
+	// for as long as that caller waits — and every later recovery attempt
+	// behind it.
 	ctx, cancel := context.WithTimeout(ctx, annotationProbeTimeout)
 	defer cancel()
 
@@ -683,6 +836,23 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 	// on to run its own — crediting it with work that did not happen would
 	// have it skip the retry and fail a call whose fix was available.
 	c.mu.Lock()
+	// "This server publishes no annotations" follows from "no annotation was
+	// seen" only for a run that reached the end of the cursor. One stopped by
+	// the page cap has tools it never looked at, and must stay willing to look
+	// again.
+	if cursor == "" {
+		c.annotationsKnown = true
+	} else {
+		// Read as far as the cap allows and the listing still had more. We
+		// cannot conclude "this server publishes no annotations" from that —
+		// the tools we never saw may carry some — but we also must not keep
+		// paying for the attempt: the next probe reads the same pages and
+		// stops in the same place, so a backend that never terminates its
+		// cursor would turn every -32020 into another full sweep. Recording
+		// the truncation is what makes the recovery give up on a retry that
+		// cannot succeed, without claiming knowledge it does not have.
+		c.annotationsTruncated = true
+	}
 	c.refreshGen++
 	c.mu.Unlock()
 	return nil

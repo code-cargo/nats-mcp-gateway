@@ -86,6 +86,16 @@ type cacheEntry struct {
 	gen        int
 	refreshAt  time.Time // when refresh-ahead should begin
 	refreshing bool
+	// refreshDone is closed when the refresh-ahead in flight finishes. A
+	// caller whose credentials expired under a slow refresh waits on it
+	// instead of resolving alongside it: one source, one conversation.
+	refreshDone chan struct{}
+	// gone holds what Invalidate dropped, kept for one comparison. Without it
+	// the next resolve sees no previous material and advances the generation
+	// unconditionally — so a backend that keeps rejecting a credential the
+	// source keeps re-issuing gets a brand-new pool key, and a brand-new
+	// backend, on every request.
+	gone *Credentials
 	// epoch counts every mutation of creds (store or Invalidate). A
 	// background refresh captures it at launch and discards its result if
 	// the entry moved on — otherwise a slow refresh completing after a
@@ -123,49 +133,71 @@ func (c *CachedResolver) Resolve(ctx context.Context, tenant, user, server strin
 // served immediately; inside the refresh-ahead window a single background
 // refresh runs so callers never block on renewal they don't need.
 func (c *CachedResolver) ResolveGen(ctx context.Context, tenant, user, server string) (*Credentials, int, error) {
-	e := c.entry(tenant, user, server)
-	e.mu.Lock()
+	for {
+		e := c.entry(tenant, user, server)
+		e.mu.Lock()
 
-	now := time.Now()
-	if e.creds != nil && (e.creds.ExpiresAt.IsZero() || now.Before(e.creds.ExpiresAt)) {
-		// Valid. Kick one background refresh once inside the lead window
-		// (unless a recent failure's backoff says wait).
-		if !e.creds.ExpiresAt.IsZero() && now.After(e.refreshAt) && !e.refreshing && now.After(e.retryAt) {
-			e.refreshing = true
-			go c.refreshAhead(e, e.epoch, tenant, user, server)
+		now := time.Now()
+		if e.creds != nil && (e.creds.ExpiresAt.IsZero() || now.Before(e.creds.ExpiresAt)) {
+			// Valid. Kick one background refresh once inside the lead window
+			// (unless a recent failure's backoff says wait).
+			if !e.creds.ExpiresAt.IsZero() && now.After(e.refreshAt) && !e.refreshing && now.After(e.retryAt) {
+				e.refreshing = true
+				e.refreshDone = make(chan struct{})
+				go c.refreshAhead(e, e.epoch, tenant, user, server)
+			}
+			creds, gen := e.creds, e.gen
+			e.mu.Unlock()
+			return creds, gen, nil
+		}
+
+		// Absent or expired. A refresh slower than the lead window is still
+		// running against this key's source, and it is resolving exactly what
+		// this caller needs — so wait for it rather than opening a second
+		// conversation with that source. The expired path already funnels
+		// every foreground caller through one inner.Resolve; the refresh was
+		// the one resolve exempt from it, and being exempt is what let two
+		// refresh_token grants present the same token and get the user's whole
+		// grant revoked.
+		if e.refreshing {
+			done := e.refreshDone
+			e.mu.Unlock()
+			select {
+			case <-done:
+				continue // it stored credentials, or recorded why it could not
+			case <-ctx.Done():
+				return nil, 0, ctx.Err()
+			}
+		}
+
+		// Resolve under e.mu so concurrent misses single-flight behind the
+		// first caller.
+		if now.Before(e.retryAt) {
+			err := e.lastErr
+			e.mu.Unlock()
+			return nil, 0, err
+		}
+		creds, err := c.inner.Resolve(ctx, tenant, user, server)
+		if err == nil {
+			err = c.store(e, creds, now)
+		}
+		if err != nil {
+			// A failure caused by the CALLER (its context cancelled or timed
+			// out mid-resolve) says nothing about the credential source — do
+			// not memoize it, or one impatient client poisons the key for
+			// everyone else within the backoff window.
+			if ctx.Err() == nil {
+				e.fails++
+				e.lastErr = err
+				e.retryAt = now.Add(failBackoff(e.fails))
+			}
+			e.mu.Unlock()
+			return nil, 0, err
 		}
 		creds, gen := e.creds, e.gen
 		e.mu.Unlock()
 		return creds, gen, nil
 	}
-
-	// Absent or expired: resolve under e.mu so concurrent misses
-	// single-flight behind the first caller.
-	if now.Before(e.retryAt) {
-		err := e.lastErr
-		e.mu.Unlock()
-		return nil, 0, err
-	}
-	creds, err := c.inner.Resolve(ctx, tenant, user, server)
-	if err == nil {
-		err = c.store(e, creds, now)
-	}
-	if err != nil {
-		// A failure caused by the CALLER (its context cancelled or timed
-		// out mid-resolve) says nothing about the credential source — do
-		// not memoize it, or one impatient client poisons the key for
-		// everyone else within the backoff window.
-		if ctx.Err() == nil {
-			e.fails++
-			e.lastErr = err
-			e.retryAt = now.Add(failBackoff(e.fails))
-		}
-		e.mu.Unlock()
-		return nil, 0, err
-	}
-	creds, gen := e.creds, e.gen
-	e.mu.Unlock()
-	return creds, gen, nil
 }
 
 // refreshAhead renews one entry's credentials in the background, resolving
@@ -181,6 +213,10 @@ func (c *CachedResolver) refreshAhead(e *cacheEntry, startEpoch uint64, tenant, 
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.refreshing = false
+	// Released before the epoch check, so a caller parked on this refresh is
+	// woken by a superseded one too — it re-examines the entry either way.
+	close(e.refreshDone)
+	e.refreshDone = nil
 	if e.epoch != startEpoch {
 		return // superseded while we were resolving; newer state wins
 	}
@@ -209,11 +245,22 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 	if !creds.ExpiresAt.IsZero() && !creds.ExpiresAt.After(now) {
 		return fmt.Errorf("cred: source returned credentials already expired at %s", creds.ExpiresAt.Format(time.RFC3339))
 	}
+	// Two questions, two different predecessors. Whether the MATERIAL moved is
+	// asked of whatever this entry last held, Invalidate's dropped copy
+	// included. Whether a REFRESH was productive is asked only of credentials
+	// the entry is still serving: an invalidated entry is not being refreshed,
+	// it is being refetched, and reading that refetch as an unproductive
+	// refresh would re-arm at a fixed skew cadence for the whole remaining life
+	// of a credential that has not even reached its lead window.
 	prev := e.creds
-	if prev == nil || !maps.Equal(prev.Headers, creds.Headers) || !maps.Equal(prev.Env, creds.Env) {
+	material := prev
+	if material == nil {
+		material = e.gone
+	}
+	if material == nil || !maps.Equal(material.Headers, creds.Headers) || !maps.Equal(material.Env, creds.Env) {
 		e.gen = int(globalGen.Add(1))
 	}
-	e.creds = creds
+	e.creds, e.gone = creds, nil
 	e.epoch++
 	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
 	if !creds.ExpiresAt.IsZero() {
@@ -236,7 +283,9 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 
 // Invalidate drops the cached credentials for one key so the next Resolve
 // refetches immediately (any failure backoff is cleared too). Used when a
-// backend rejects the credentials mid-life (HTTP 401).
+// backend rejects the credentials mid-life (HTTP 401). The dropped material
+// is remembered, unused, until the next resolve decides whether the
+// generation moved.
 func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	c.mu.Lock()
 	e := c.entries[cacheKey{tenant, user, server}]
@@ -245,6 +294,9 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 		return
 	}
 	e.mu.Lock()
+	if e.creds != nil {
+		e.gone = e.creds
+	}
 	e.creds = nil
 	e.retryAt = time.Time{}
 	e.epoch++ // any in-flight refresh launched before this is now stale
