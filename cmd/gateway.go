@@ -22,6 +22,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -720,6 +721,13 @@ func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	})
 }
 
+// semVer is micro's own acceptance rule — semver.org's suggested regexp, the
+// one micro applies to ServerConfig.Version. Duplicated rather than inferred
+// because the fallback below is only safe if it catches EVERYTHING micro would
+// reject: a looser local test (say, "starts with a digit") passes strings like
+// "1.2" or "1.02.3" straight through to a rejection we exist to prevent.
+var semVer = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
+
 // normalizeVersion maps a build version onto a semver micro will accept —
 // micro rejects a service whose Version is not semver, and that rejection
 // fails wire.Serve and with it the boot.
@@ -727,14 +735,16 @@ func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 // Release tags are "vX.Y.Z" and the leading "v" is not part of semver, so it
 // is stripped rather than sent to the fallback: mapping every release to 0.0.0
 // left `nats micro list` reporting one version for the entire fleet, unable to
-// show which instances had taken a rollout. Anything with no semver reading —
-// the Makefile's "develop", a build off an untagged tree — still becomes
-// 0.0.0, since a boot failure would be a worse answer than an unhelpful
-// version.
+// show which instances had taken a rollout.
+//
+// Anything that is not semver after that — the Makefile's "develop", a build
+// off an untagged tree, a release tag typed as "v1.2" — becomes 0.0.0, because
+// a boot failure is a worse answer than an unhelpful version. That matters
+// most for the typo'd tag: release.yml takes its tag as free text, so the
+// mistake is not caught until the shipped binary fails to serve.
 func normalizeVersion(v string) string {
-	v = strings.TrimPrefix(v, "v")
-	if len(v) > 0 && v[0] >= '0' && v[0] <= '9' {
-		return v
+	if s := strings.TrimPrefix(v, "v"); semVer.MatchString(s) {
+		return s
 	}
 	return "0.0.0"
 }

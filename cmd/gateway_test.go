@@ -839,12 +839,24 @@ func TestNormalizeVersionKeepsReleaseTags(t *testing.T) {
 		{"v1.2.3", "1.2.3"},
 		{"v1.2.3-rc.1", "1.2.3-rc.1"},
 		{"1.2.3", "1.2.3"},
+		{"v1.2.3+build.7", "1.2.3+build.7"},
 		// No semver reading: the Makefile's default, and a build off an
 		// untagged tree.
 		{"develop", "0.0.0"},
 		{"dev", "0.0.0"},
 		{"", "0.0.0"},
 		{"v", "0.0.0"},
+		// Stripping the "v" must not walk a MALFORMED tag past the fallback.
+		// release.yml takes its tag as free text, so each of these is one
+		// keystroke away from a real release — and each is rejected by micro,
+		// which would fail wire.Serve and with it the boot of the binary that
+		// release just shipped. The fallback is the whole point: an unhelpful
+		// version beats a gateway that will not start.
+		{"v1.2", "0.0.0"},
+		{"v2", "0.0.0"},
+		{"v1.02.3", "0.0.0"},  // semver forbids the leading zero
+		{"v1.2.3.4", "0.0.0"}, // a fourth component is not semver
+		{"v1.2.3_rc1", "0.0.0"},
 	} {
 		assert.Equal(t, tc.want, normalizeVersion(tc.in), tc.in)
 	}
@@ -856,7 +868,12 @@ func TestNormalizeVersionKeepsReleaseTags(t *testing.T) {
 // fails the boot.
 func TestNormalizeVersionSatisfiesMicro(t *testing.T) {
 	nc, _ := fetchNATS(t)
-	for _, v := range []string{"v1.2.3", "v1.2.3-rc.1", "develop"} {
+	for _, v := range []string{
+		"v1.2.3", "v1.2.3-rc.1", "v1.2.3+build.7", "develop",
+		// The malformed tags go through micro too: the fallback is only worth
+		// anything if what it catches is exactly what micro would reject.
+		"v1.2", "v2", "v1.02.3", "v1.2.3.4", "v1.2.3_rc1",
+	} {
 		ws, err := wire.Serve(nc, wire.ServerConfig{
 			Version: normalizeVersion(v),
 			Servers: []string{"a"},
