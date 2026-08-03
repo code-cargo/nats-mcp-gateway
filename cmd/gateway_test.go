@@ -496,13 +496,10 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 // lands in a pod's event stream and in whatever the operator pastes into a
 // ticket.
 func TestConnectErrorRedactsPassword(t *testing.T) {
-	err := runGateway(
-		&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: "nats://gw:s3cr3t@127.0.0.1:14222"},
-		&Globals{LogLevel: "error"}, "0.0.0",
-	)
-	require.Error(t, err)
+	port := closedPort(t)
+	err := connectErr(t, "nats://gw:s3cr3t@127.0.0.1:"+port)
 	assert.NotContains(t, err.Error(), "s3cr3t")
-	assert.Contains(t, err.Error(), "nats://gw:xxxxx@127.0.0.1:14222",
+	assert.Contains(t, err.Error(), "nats://gw:xxxxx@127.0.0.1:"+port,
 		"the host and identity must survive: they are what the operator needs")
 }
 

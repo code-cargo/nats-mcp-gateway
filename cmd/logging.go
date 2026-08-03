@@ -108,9 +108,21 @@ func NewLogger(g *Globals) (*slog.Logger, error) {
 }
 
 // credInURL masks the password in any "scheme://user:password@" sequence,
-// wherever it appears in a longer string. Non-greedy to the first "@", which
-// a password may not contain unescaped and a host never does.
-var credInURL = regexp.MustCompile(`(://[^:/@]*:)[^@]*?(@)`)
+// wherever it appears in a longer string.
+//
+// The scanned span stops at whitespace and commas because a URL contains
+// neither, and without that bound the match runs past the end of the URL to
+// reach any later "@" in the message — swallowing the text in between. Two
+// shapes hit that: a cluster list whose FIRST member has no credential
+// ("nats://a:4222,nats://gw:pw@b" collapsing to "nats://a:xxxxx@b", a URL
+// nobody configured), and an ordinary credential-free failure whose error text
+// happens to carry an "@", such as a TLS error naming a cert subject. Neither
+// leaks — urlSecrets does that job — but both destroy the host and the reason,
+// which is the whole of what the operator reads this line for.
+//
+// Greedy within that span, so userinfo ends at the LAST "@": a password may
+// contain an unescaped one, a host may not.
+var credInURL = regexp.MustCompile(`(://[^:/@\s,]*:)[^\s,]*(@)`)
 
 // connectFailure renders a NATS connect error with the credential gone from
 // BOTH halves of the message.
@@ -187,5 +199,9 @@ type connectError struct {
 }
 
 func (e *connectError) Error() string { return e.msg }
+
+// Unwrap keeps errors.Is/As working across the redaction. The wrapped error is
+// the ORIGINAL and still holds the credential, so it is for matching, never
+// for printing: log e, not errors.Unwrap(e).
 
 func (e *connectError) Unwrap() error { return e.err }

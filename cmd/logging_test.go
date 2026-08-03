@@ -16,13 +16,55 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// closedPort returns a loopback port with nothing listening on it, for the
+// tests below that need nats.Connect to FAIL. A hardcoded port that something
+// else happens to hold would take runGateway PAST the connect and into its
+// serving loop, which runs until a signal.
+func closedPort(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return strconv.Itoa(port)
+}
+
+// connectErr runs the gateway far enough to fail its NATS connect and returns
+// that error.
+//
+// Bounded, for the same reason closedPort exists: if the connect ever
+// succeeded, runGateway would block until a signal, and the suite would hang
+// instead of failing — the one outcome a test must never have.
+func connectErr(t *testing.T, raw string) error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		done <- runGateway(
+			&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: raw},
+			&Globals{LogLevel: "error"}, "0.0.0",
+		)
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err, raw)
+		return err
+	case <-time.After(30 * time.Second):
+		t.Fatalf("runGateway never failed its connect for %q", raw)
+		return nil
+	}
+}
 
 // The README's own canonical config is "nats://gw:pw@nats:4222", so the
 // deployment shape this gateway ships with puts a password in the one string
@@ -128,32 +170,30 @@ func TestNewLoggerAcceptsKnownLevelsAndFormats(t *testing.T) {
 // breaks parsing in a different place, and the last one is an ordinary
 // password behind a mistyped IPv6 bracket.
 func TestConnectFailureRedactsThroughTheWrappedError(t *testing.T) {
-	for _, raw := range []string{
-		"nats://gw:s3c r3t@127.0.0.1:14222",
-		"nats://gw:p%ss@127.0.0.1:14222",
-		"nats://gw:s3cr3t@[::1:14222",
+	port := closedPort(t)
+	for _, tmpl := range []string{
+		"nats://gw:s3c r3t@127.0.0.1:PORT",
+		"nats://gw:p%ss@127.0.0.1:PORT",
+		"nats://gw:s3cr3t@[::1:PORT",
 		// This one used to pass for the wrong reason: it PARSES, so
 		// nats.Connect never returns a *url.Error and the raw string never
 		// entered the message. The bracket is what puts it on the leaking
 		// path, which is where the @-in-password rule actually matters —
 		// userinfo ends at the LAST @, and a scrubber that stops at the first
 		// leaves the tail behind.
-		"nats://gw:s3c@r3t@[::1:14222",
-		"nats://gw:s3c@r3t@127.0.0.1:14222",
+		"nats://gw:s3c@r3t@[::1:PORT",
+		"nats://gw:s3c@r3t@127.0.0.1:PORT",
 		"nats://gw:pw1@a:4222,nats://gw:pw2@b:4222",
 		// No colon in the userinfo: nats.go reads the whole thing as an auth
 		// token, so the "username" IS the credential. A pattern requiring a
 		// colon never matches these, and an ordinary opaque token behind a
 		// mistyped bracket or a stray space in the host is enough.
-		"nats://S3CR3TTOKEN@[::1:14222",
-		"nats://S3CR3TTOKEN@ho st:14222",
-		"nats://tok%S3CR3T@127.0.0.1:14222",
+		"nats://S3CR3TTOKEN@[::1:PORT",
+		"nats://S3CR3TTOKEN@ho st:PORT",
+		"nats://tok%S3CR3T@127.0.0.1:PORT",
 	} {
-		err := runGateway(
-			&GatewayCmd{ConfigJSON: `{"servers":{}}`, NatsURL: raw},
-			&Globals{LogLevel: "error"}, "0.0.0",
-		)
-		require.Error(t, err)
+		raw := strings.ReplaceAll(tmpl, "PORT", port)
+		err := connectErr(t, raw)
 		for _, secret := range []string{
 			"s3c r3t", "p%ss", "s3cr3t", "s3c@r3t", "r3t", "pw1", "pw2",
 			"S3CR3TTOKEN", "S3CR3T",
@@ -166,5 +206,45 @@ func TestConnectFailureRedactsThroughTheWrappedError(t *testing.T) {
 		if strings.Contains(raw, "gw:") {
 			assert.Contains(t, err.Error(), "gw:", "the username must survive: it is a diagnosis")
 		}
+	}
+}
+
+// The other half of the contract: everything that is NOT a credential has to
+// come through untouched.
+//
+// The pattern scrub is bounded to the URL — a span with no whitespace and no
+// comma — because an unbounded one runs past the URL to reach any later "@" in
+// the message and replaces everything in between. Neither case below carries a
+// credential at all, and both used to come out mangled: the first printed a
+// URL nobody configured, and the second lost the reason it failed. A redactor
+// that eats the host and the error is no more useful than one that prints the
+// password, because in both cases the operator cannot act on the line.
+func TestConnectFailureKeepsWhatIsNotACredential(t *testing.T) {
+	for _, tc := range []struct{ raw, wrapped, want string }{
+		{
+			// A cluster whose FIRST member is credential-free. The match used
+			// to start at that member's port and run to the second member's
+			// "@", collapsing both into "nats://a:xxxxx@b:4222".
+			raw:     "nats://a:4222,nats://gw:pw@b:4222",
+			wrapped: "nats: no servers available for connection",
+			want:    "connect NATS nats://a:4222,nats://gw:xxxxx@b:4222: nats: no servers available for connection",
+		},
+		{
+			// No credential anywhere; the "@" belongs to a cert subject in the
+			// error text. This is the ordinary TLS misconfiguration, and the
+			// scrub used to eat the port and the whole diagnosis with it.
+			raw:     "nats://nats.example.com:4222",
+			wrapped: "x509: certificate is valid for admin@example.com, not nats.example.com",
+			want:    "connect NATS nats://nats.example.com:4222: x509: certificate is valid for admin@example.com, not nats.example.com",
+		},
+		{
+			// Both at once: the credential goes, the cert subject stays.
+			raw:     "nats://gw:s3cr3t@nats.example.com:4222",
+			wrapped: "x509: certificate is valid for admin@example.com, not nats.example.com",
+			want:    "connect NATS nats://gw:xxxxx@nats.example.com:4222: x509: certificate is valid for admin@example.com, not nats.example.com",
+		},
+	} {
+		got := connectFailure(tc.raw, errors.New(tc.wrapped)).Error()
+		assert.Equal(t, tc.want, got, tc.raw)
 	}
 }
