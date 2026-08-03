@@ -251,7 +251,11 @@ func TestE2ECredentialFailureDoesNotEchoTheResolverDetail(t *testing.T) {
 			return nil, errors.New(detail)
 		},
 	), 0)
-	nc := credStack(t, resolver)
+	// Per-user, because the resolver above answers on the caller's identity:
+	// under the shared grain both loop iterations would resolve as
+	// wire.UserUnattributed and the terminal refusal would never be reached,
+	// leaving half of what this test covers silently uncovered.
+	nc := credStack(t, resolver, true)
 
 	for _, user := range []string{"someone", "denied"} {
 		wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: "acme", User: user, Inactivity: 5 * time.Second})
