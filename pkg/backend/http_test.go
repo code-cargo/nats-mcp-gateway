@@ -665,7 +665,8 @@ func TestUnreadableParamsSendNoName(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(msg)
 		w.Header().Set("Content-Type", "application/json")
 		resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
-			msg.ID, mcpspec.ErrHeaderMismatch, "Mcp-Name missing", nil))
+			msg.ID, mcpspec.ErrHeaderMismatch, "Mcp-Name missing", nil,
+		))
 		_, _ = w.Write(resp)
 	}))
 	t.Cleanup(srv.Close)
@@ -678,7 +679,8 @@ func TestUnreadableParamsSendNoName(t *testing.T) {
 
 	// Two readings, "a" and "b", and the gateway is entitled to neither.
 	resp, err := m.Call(context.Background(), jsonrpc.NewRequest(
-		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":"a","name":"b"}`)), nil)
+		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":"a","name":"b"}`),
+	), nil)
 	require.NoError(t, err)
 
 	assert.False(t, sawNameHeader, "an unreadable name must not be guessed at, got %q", sawName)
@@ -709,7 +711,8 @@ func TestNonStringNameSendsNoName(t *testing.T) {
 	t.Cleanup(func() { _ = m.Close() })
 
 	_, err = m.Call(context.Background(), jsonrpc.NewRequest(
-		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":{"toString":"echo"}}`)), nil)
+		"1", mcpspec.MethodToolsCall, json.RawMessage(`{"name":{"toString":"echo"}}`),
+	), nil)
 	require.NoError(t, err)
 	assert.False(t, sawNameHeader, "a non-string name must not become an empty one")
 }

@@ -591,6 +591,27 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 
 	credUser := key.CredSet
 	if credUser == "" {
+		// An empty CredSet means the pool key was minted without a per-user
+		// identity, and mapping it to the unattributed placeholder is only
+		// right when the server does not ask for one. The proxy refuses that
+		// combination on the request path, but this factory runs later and
+		// re-reads the config, so a reload flipping a server shared -> per-user
+		// mid-request arrives here with a key the new mode cannot satisfy.
+		//
+		// Checked against the grain rather than left to the generation
+		// comparison below. That comparison does reject it today — a
+		// resolver-less key carries CredVersion 0 and globalGen starts at 1 —
+		// but that is an accident of numbering, and a credential-identity
+		// boundary should not rest on one. Refusing here also means the
+		// resolver is never asked for "_", so an exec helper with side effects
+		// does not run under an identity nothing will accept.
+		if s.Auth.PerUser() {
+			return nil, fmt.Errorf(
+				"server %q resolves credentials per user and this backend was keyed without one; "+
+					"the request predates a reload that made it per-user, and re-issuing will use the new mode: %w",
+				key.Server, cred.ErrIdentityRequired,
+			)
+		}
 		credUser = wire.UserUnattributed
 	}
 	var creds *cred.Credentials

@@ -20,6 +20,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 	"time"
@@ -73,16 +74,6 @@ func (p *Proxy) Handler() wire.Handler {
 			"server", in.Subject.Server,
 			"method", in.Subject.Method,
 		)
-		if raw := in.Header.Get(wire.HeaderName); raw != "" {
-			// Decoded for the log: a name that needed sentinel encoding is
-			// precisely the one an operator will struggle to trace, so it
-			// must not appear in the audit trail as a base64 blob.
-			name, err := mcpspec.DecodeHeaderValue(raw)
-			if err != nil {
-				name = raw
-			}
-			reqLog = reqLog.With("name", name)
-		}
 		defer func() {
 			attrs := []any{
 				"outcome", outcome,
@@ -101,9 +92,30 @@ func (p *Proxy) Handler() wire.Handler {
 			return w.Err(code, message, data)
 		}
 
-		if cerr := Check(in); cerr != nil {
-			reqLog.Warn("integrity check rejected request", "reason", cerr.Message)
+		name, cerr := Check(in)
+		if cerr != nil {
+			// The claimed name, on the rejection line only and under a key
+			// that says so. The summary line stays nameless — nothing here is
+			// authorized — but an operator reading a rejection still needs to
+			// know which tool was attempted, and a refusal for a reason that
+			// is not about the name (unsupported version, malformed _meta)
+			// carries it nowhere else.
+			attrs := []any{"reason", cerr.Message}
+			if raw := in.Header.Get(wire.HeaderName); raw != "" {
+				claimed, decErr := mcpspec.DecodeHeaderValue(raw)
+				if decErr != nil {
+					claimed = raw
+				}
+				attrs = append(attrs, "claimed_name", claimed)
+			}
+			reqLog.Warn("integrity check rejected request", attrs...)
 			return fail(cerr.Code, cerr.Message, cerr.Data)
+		}
+		if name != "" {
+			// Straight from the check, in its decoded form: a name that needed
+			// sentinel encoding is precisely the one an operator will struggle
+			// to trace, so it must not reach the audit trail as a base64 blob.
+			reqLog = reqLog.With("name", name)
 		}
 
 		key := backend.Key{
@@ -114,6 +126,24 @@ func (p *Proxy) Handler() wire.Handler {
 			if resolver, perUser := p.Creds(in.Subject.Server); resolver != nil {
 				credUser := wire.UserUnattributed
 				if perUser {
+					// "_" says "this deployment has no per-user auth", which
+					// is not an identity and is the one {user} token every
+					// caller in the tenant can reach. Since {user} selects the
+					// credential AND keys the pool, resolving it here would
+					// collapse every unattributed caller onto one credential
+					// and one process — on the servers configured so that must
+					// not happen — and would do it silently, which is how a
+					// grant of mcp.v1.req.{tenant}.> instead of
+					// …{tenant}.{user}.> stays undetected. The subject cannot
+					// carry the grain the server asked for, so nothing is
+					// resolved.
+					if in.Subject.User == wire.UserUnattributed {
+						return fail(wire.ErrCodeCredentialUnavailable,
+							fmt.Sprintf("backend credentials unavailable, do not retry: server %q resolves "+
+								"credentials per user and this request is unattributed (subject user token %q) — "+
+								"publish under a {user} token minted by per-user NATS auth",
+								in.Subject.Server, wire.UserUnattributed), nil)
+					}
 					credUser = in.Subject.User
 				}
 				// The resolve is NATS-verified-identity in, generation out:
@@ -140,6 +170,16 @@ func (p *Proxy) Handler() wire.Handler {
 			if ctx.Err() != nil {
 				outcome = "cancelled"
 				return nil // cancelled while waiting: wrapper writes the empty end
+			}
+			if errors.Is(err, cred.ErrIdentityRequired) {
+				// The refusal above, reached through the factory instead: a
+				// reload changed the server's grain after this request was
+				// keyed. Same condition, so same code — it is a credential
+				// failure, not a lost stream, and unlike the request-path
+				// refusal it clears on re-issue under the new mode.
+				reqLog.Warn("credential grain changed under a live request", "err", err)
+				return fail(wire.ErrCodeCredentialUnavailable,
+					"backend credentials temporarily unavailable, retry later: "+err.Error(), nil)
 			}
 			return fail(wire.ErrCodeStreamLost, err.Error(), nil)
 		}

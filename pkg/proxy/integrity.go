@@ -31,7 +31,7 @@ import (
 // Verified relations:
 //
 //	subject.method  == header Mcp-Method == body method
-//	subject.name    == NameToken(body name)   (per the "_" fallback rules)
+//	subject.name    == wire.SubjectNameToken(method, body name)
 //	header Mcp-Name == body params.name/uri   (for the three named methods)
 //	header MCP-Protocol-Version == body _meta protocolVersion (and supported)
 //
@@ -76,11 +76,18 @@ func badParams(err error) *CheckError {
 	return &CheckError{Code: jsonrpc.CodeInvalidRequest, Message: err.Error()}
 }
 
-// Check validates one inbound request against the subject NATS enforced.
-func Check(in *wire.Inbound) *CheckError {
+// Check validates one inbound request against the subject NATS enforced, and
+// returns the MCP name it authorized — "" for a method that carries none.
+//
+// The name is returned rather than left for the caller to re-derive because
+// the audit trail is written from it. Mcp-Name is only held to the body for
+// methods that HAVE a name; on the rest nothing constrains it, so a second
+// reading of the header would record whatever the caller preferred the log to
+// say about a request the gateway never checked it against.
+func Check(in *wire.Inbound) (string, *CheckError) {
 	msg := in.Msg
 	if msg.Kind() != jsonrpc.KindRequest {
-		return &CheckError{
+		return "", &CheckError{
 			Code:    jsonrpc.CodeInvalidRequest,
 			Message: "wire requests must be JSON-RPC requests (notifications travel on the control subject)",
 		}
@@ -88,10 +95,10 @@ func Check(in *wire.Inbound) *CheckError {
 
 	// Method: subject == header == body.
 	if hm := in.Header.Get(wire.HeaderMethod); hm != msg.Method {
-		return mismatch("Mcp-Method header %q does not match body method %q", hm, msg.Method)
+		return "", mismatch("Mcp-Method header %q does not match body method %q", hm, msg.Method)
 	}
 	if in.Subject.Method != msg.Method {
-		return mismatch("subject method %q does not match body method %q", in.Subject.Method, msg.Method)
+		return "", mismatch("subject method %q does not match body method %q", in.Subject.Method, msg.Method)
 	}
 
 	// The body is forwarded verbatim, so it is read the way the backend will
@@ -102,47 +109,43 @@ func Check(in *wire.Inbound) *CheckError {
 	// choice.
 	params, err := mcpspec.DecodeParams(msg.Params)
 	if err != nil {
-		return badParams(err)
+		return "", badParams(err)
 	}
 	// _meta is an open extension bag, so only the keys the gateway acts on
 	// are held to the no-case-collision rule — and not all of them are read
 	// here. progressToken is read and rewritten later, in the backend mux,
 	// which is too late to refuse a request.
 	if err := params.CheckReadableMeta(); err != nil {
-		return badParams(err)
+		return "", badParams(err)
 	}
 
 	// Name: which body field is authoritative depends on the method.
 	bodyName, named, err := params.Name(msg.Method)
 	if err != nil {
-		return badParams(err)
+		return "", badParams(err)
 	}
 
 	if named {
 		if bodyName == "" {
-			return mismatch("method %q requires a name/uri in params", msg.Method)
+			return "", mismatch("method %q requires a name/uri in params", msg.Method)
 		}
 		// Decode before comparing: a name that is not header-safe (a resource
 		// URI, a tool named in a non-Latin script) arrives base64-sentinel
 		// encoded, and a raw comparison would reject a conformant client.
 		hn, err := mcpspec.DecodeHeaderValue(in.Header.Get(wire.HeaderName))
 		if err != nil {
-			return mismatch("Mcp-Name header is malformed: %v", err)
+			return "", mismatch("Mcp-Name header is malformed: %v", err)
 		}
 		if hn != bodyName {
-			return mismatch("Mcp-Name header %q does not match body name %q", hn, bodyName)
+			return "", mismatch("Mcp-Name header %q does not match body name %q", hn, bodyName)
 		}
 	}
 
-	// Subject name token rules. For tools/call and prompts/get the token is
-	// derived from the body name; resources/read URIs are never token-safe
-	// by grammar, so they use "_" like every unnamed method.
-	wantToken := wire.NameUnset
-	if msg.Method == mcpspec.MethodToolsCall || msg.Method == mcpspec.MethodPromptsGet {
-		wantToken = wire.NameToken(bodyName)
-	}
+	// Subject name token: the same derivation the client published under, so
+	// the rule cannot be enforced here in a form no client can satisfy.
+	wantToken := wire.SubjectNameToken(msg.Method, bodyName)
 	if in.Subject.Name != wantToken {
-		return mismatch("subject name token %q does not match required token %q for %s %q",
+		return "", mismatch("subject name token %q does not match required token %q for %s %q",
 			in.Subject.Name, wantToken, msg.Method, bodyName)
 	}
 
@@ -151,17 +154,17 @@ func Check(in *wire.Inbound) *CheckError {
 	// missing version is a version error, not a mismatch.
 	bodyVer, err := params.ProtocolVersion()
 	if err != nil {
-		return badParams(err)
+		return "", badParams(err)
 	}
 	hv, err := mcpspec.DecodeHeaderValue(in.Header.Get(wire.HeaderProtocolVersion))
 	if err != nil {
-		return mismatch("MCP-Protocol-Version header is malformed: %v", err)
+		return "", mismatch("MCP-Protocol-Version header is malformed: %v", err)
 	}
 	if hv != bodyVer {
-		return mismatch("MCP-Protocol-Version header %q does not match body _meta %q", hv, bodyVer)
+		return "", mismatch("MCP-Protocol-Version header %q does not match body _meta %q", hv, bodyVer)
 	}
 	if !mcpspec.IsSupportedProtocolVersion(bodyVer) {
-		return &CheckError{
+		return "", &CheckError{
 			Code:    mcpspec.ErrUnsupportedProtocolVersion,
 			Message: fmt.Sprintf("protocol version %q is not supported", bodyVer),
 			Data: map[string]any{
@@ -170,5 +173,5 @@ func Check(in *wire.Inbound) *CheckError {
 			},
 		}
 	}
-	return nil
+	return bodyName, nil
 }

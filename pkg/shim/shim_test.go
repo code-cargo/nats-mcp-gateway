@@ -359,7 +359,8 @@ func TestShimRejectsAmbiguousParams(t *testing.T) {
 		{"params is an array", `[]`},
 		{"colliding protocol version key in _meta", fmt.Sprintf(
 			`{"name":"echo","_meta":{%q:%q,"io.modelcontextprotocol/protocolversion":"1999-01-01"}}`,
-			mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion)},
+			mcpspec.MetaProtocolVersion, mcpspec.ProtocolVersion,
+		)},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -368,7 +369,8 @@ func TestShimRejectsAmbiguousParams(t *testing.T) {
 			// test is looking for.
 			h := newHarness(t, false)
 			h.send(t, fmt.Sprintf(
-				`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":%s}`, tt.params))
+				`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":%s}`, tt.params,
+			))
 
 			line := h.next(t, 10*time.Second)
 			m, err := jsonrpc.Decode([]byte(line))

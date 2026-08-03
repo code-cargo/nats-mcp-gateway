@@ -179,6 +179,14 @@ tenant regardless of user; a server with a per-user `auth` mode (below) keys
 its backends per `(server, tenant, user, credential-generation)`, so users
 never share a process or a credential.
 
+That grain only holds if `{user}` is an identity, so a per-user `auth` mode
+**refuses the `_` placeholder** with `-32014` rather than resolve a credential
+for it. Without the refusal, a deployment that granted `mcp.v1.req.{tenant}.>`
+instead of `…{tenant}.{user}.>` would quietly collapse every unattributed
+caller onto one credential and one process, on exactly the servers configured
+so that must not happen. Per-user `auth` modes therefore require per-user NATS
+auth; shared and static servers are unaffected and keep serving `_`.
+
 ## Configuration
 
 ```json
@@ -310,8 +318,11 @@ the gateway drops the cached credential, re-resolves, and retries exactly
 once — safe for any method, since a `401` rejects the request before the
 server executes it. Credential-resolution failures surface as **`-32014`**;
 the message says whether to retry (resolver unreachable) or not (the source
-refused), and failures are memoized with a short backoff (1s doubling to
-30s), so a resolver outage degrades into fast, legible errors instead of
+refused). The unattributed-caller refusal above uses the same code — as does
+the pool factory's copy of it, which catches a request keyed before a reload
+made its server per-user and is the one form of it worth re-issuing. Failures
+are memoized with a short backoff (1s doubling to 30s), so a resolver outage
+degrades into fast, legible errors instead of
 hammering the source at request rate. Mind `pool.maxProcsPerTenant`
 (default 16): per-user stdio servers count each `(user, server)` process
 against it, so size it to roughly users × stdio servers per tenant. A
