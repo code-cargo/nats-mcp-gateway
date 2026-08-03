@@ -249,7 +249,14 @@ func requireHTTPS(server, field, raw string, allowPlaintext bool) error {
 // resolve to a loopback address, and rejecting the name every developer types
 // while accepting the literal address it resolves to would just teach people
 // to switch the check off.
+//
+// Lowercased first, because url.Parse lowercases the SCHEME and leaves the
+// host exactly as written — so "http://Localhost:3000/mcp" arrives here
+// spelled differently from the same host, and DNS does not distinguish them.
+// A rejection that turns on the shift key is the surest way to get
+// allowPlaintext set fleet-wide.
 func isLoopbackHost(host string) bool {
+	host = strings.ToLower(host)
 	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
 		return true
 	}

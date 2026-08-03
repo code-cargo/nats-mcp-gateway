@@ -205,6 +205,12 @@ func TestPlaintextURLsRejected(t *testing.T) {
 		{"ipv6 loopback", `{"servers":{"s":{"transport":"http","url":"http://[::1]:3000/mcp"}}}`},
 		{"localhost", `{"servers":{"s":{"transport":"http","url":"http://localhost:3000/mcp"}}}`},
 		{"reserved .localhost", `{"servers":{"s":{"transport":"http","url":"http://mcp.localhost:3000/"}}}`},
+		// url.Parse lowercases the scheme and leaves the host as written, so
+		// the check has to do it: DNS does not distinguish these, and a
+		// rejection that turns on the shift key is how allowPlaintext ends up
+		// set fleet-wide.
+		{"LOCALHOST", `{"servers":{"s":{"transport":"http","url":"http://LOCALHOST:3000/mcp"}}}`},
+		{"mixed-case .localhost", `{"servers":{"s":{"transport":"http","url":"http://MCP.Localhost:3000/"}}}`},
 		{"loopback token url", `{"servers":{"s":{"command":"x","auth":{"mode":"oauth-refresh","tokenUrl":"http://localhost:8080/t","clientId":"c","refreshTokenFile":"/rt/{user}"}}}}`},
 		{"https anywhere", `{"servers":{"s":{"transport":"http","url":"https://weather.internal/mcp"}}}`},
 	}
