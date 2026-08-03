@@ -15,7 +15,7 @@
 package proxy
 
 import (
-	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
@@ -36,7 +36,11 @@ import (
 //	header MCP-Protocol-Version == body _meta protocolVersion (and supported)
 //
 // Any disagreement is a single error code, -32020, mirroring the spec's
-// treatment of the same bug at the Streamable HTTP edge.
+// treatment of the same bug at the Streamable HTTP edge. So is a body that
+// has no single meaning to begin with: params is read through
+// mcpspec.DecodeParams, which matches keys exactly and rejects duplicates,
+// because a check that reads the body differently from the backend has
+// verified nothing.
 //
 // What this is NOT is a schema validator. clientCapabilities is required on a
 // 2026-07-28 request, but it is mirrored into no header and named by no
@@ -59,11 +63,17 @@ func mismatch(format string, args ...any) *CheckError {
 	return &CheckError{Code: mcpspec.ErrHeaderMismatch, Message: fmt.Sprintf(format, args...)}
 }
 
-// paramsProbe is the only body introspection the gateway ever performs.
-type paramsProbe struct {
-	Name string                     `json:"name"`
-	URI  string                     `json:"uri"`
-	Meta map[string]json.RawMessage `json:"_meta"`
+// badParams maps a params decode failure onto its JSON-RPC code. An
+// ambiguous key is valid JSON that means two things at once, so the failure
+// is not "you sent garbage" but "these headers cannot be proven to agree
+// with this body" — which is exactly -32020. Everything else is a shape
+// error the caller can see for themselves.
+func badParams(err error) *CheckError {
+	var ambiguous *mcpspec.AmbiguousKeyError
+	if errors.As(err, &ambiguous) {
+		return mismatch("params cannot be authorized: %v", err)
+	}
+	return &CheckError{Code: jsonrpc.CodeInvalidRequest, Message: err.Error()}
 }
 
 // Check validates one inbound request against the subject NATS enforced.
@@ -84,21 +94,28 @@ func Check(in *wire.Inbound) *CheckError {
 		return mismatch("subject method %q does not match body method %q", in.Subject.Method, msg.Method)
 	}
 
-	var probe paramsProbe
-	if len(msg.Params) > 0 {
-		if err := json.Unmarshal(msg.Params, &probe); err != nil {
-			return &CheckError{Code: jsonrpc.CodeInvalidRequest, Message: "params is not a JSON object"}
-		}
+	// The body is forwarded verbatim, so it is read the way the backend will
+	// read it: exact keys, and no duplicate key at any depth. Keys differing
+	// only by case are refused across params, and — for _meta, read below —
+	// on the key actually being read. See pkg/mcpspec/params.go for why a
+	// tagged struct here was an authorization bypass rather than a stylistic
+	// choice.
+	params, err := mcpspec.DecodeParams(msg.Params)
+	if err != nil {
+		return badParams(err)
+	}
+	// _meta is an open extension bag, so only the keys the gateway acts on
+	// are held to the no-case-collision rule — and not all of them are read
+	// here. progressToken is read and rewritten later, in the backend mux,
+	// which is too late to refuse a request.
+	if err := params.CheckReadableMeta(); err != nil {
+		return badParams(err)
 	}
 
 	// Name: which body field is authoritative depends on the method.
-	bodyName := ""
-	named := false
-	switch msg.Method {
-	case mcpspec.MethodToolsCall, mcpspec.MethodPromptsGet:
-		bodyName, named = probe.Name, true
-	case mcpspec.MethodResourcesRead:
-		bodyName, named = probe.URI, true
+	bodyName, named, err := params.Name(msg.Method)
+	if err != nil {
+		return badParams(err)
 	}
 
 	if named {
@@ -132,9 +149,9 @@ func Check(in *wire.Inbound) *CheckError {
 	// Protocol version: header == body _meta, and supported. The three
 	// required _meta keys replace the removed initialize handshake, so a
 	// missing version is a version error, not a mismatch.
-	bodyVer := ""
-	if raw, ok := probe.Meta[mcpspec.MetaProtocolVersion]; ok {
-		_ = json.Unmarshal(raw, &bodyVer)
+	bodyVer, err := params.ProtocolVersion()
+	if err != nil {
+		return badParams(err)
 	}
 	hv, err := mcpspec.DecodeHeaderValue(in.Header.Get(wire.HeaderProtocolVersion))
 	if err != nil {

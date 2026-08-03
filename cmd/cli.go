@@ -42,7 +42,12 @@ type CLI struct {
 // SET reloads at runtime; the NATS connection, subject prefix, queue group and
 // scope are fixed at boot.
 type GatewayCmd struct {
-	// File source.
+	// File source. Its document owns the connection/scope/pool/claim-check
+	// settings the fetch-source flags below carry, so passing one of those
+	// alongside --config is REJECTED unless the document already agrees — the
+	// mirror of the inline source's rejected `nats` block, for the same reason:
+	// scope injected as pod env must never be dropped on the way to a gateway
+	// that then serves every tenant.
 	Config         string        `help:"Path to gateway config JSON (file source; SIGHUP reloads)." type:"existingfile" env:"NATSMCP_CONFIG" xor:"source"`
 	ReloadInterval time.Duration `help:"File source: poll interval for change detection (0 disables polling)." default:"10s" env:"NATSMCP_RELOAD_INTERVAL"`
 

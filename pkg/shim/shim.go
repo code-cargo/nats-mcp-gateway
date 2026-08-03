@@ -112,13 +112,6 @@ func (s *Shim) Run(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	return sc.Err()
 }
 
-// envelope facts the wire headers need, probed shallowly from params.
-type probe struct {
-	Name string                     `json:"name"`
-	URI  string                     `json:"uri"`
-	Meta map[string]json.RawMessage `json:"_meta"`
-}
-
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
 	// Legacy wing: a first-request initialize flips the shim into legacy
 	// mode; thereafter ping and logging/setLevel are answered locally.
@@ -130,14 +123,31 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 		return
 	}
 
-	var p probe
-	_ = json.Unmarshal(msg.Params, &p)
+	// Exact-key, duplicate-rejecting: the subject and headers built below are
+	// what the gateway will check this body against, so reading params any
+	// differently here only manufactures a -32020 one hop later. Params the
+	// shim cannot read unambiguously it must not guess at.
+	//
+	// Answered with -32600, not the -32020 the proxy answers the same
+	// AmbiguousKeyError with, and the difference is not an inconsistency:
+	// -32020 means "transport headers disagree with the body", and at this
+	// point there are no headers to disagree with — the shim is failing to
+	// read the params it would have built them FROM. To the client this is
+	// simply a request the shim cannot interpret. The two codes also never
+	// reach one observer: a body rejected here never travels, so no caller
+	// sees both answers to the same request.
+	p, err := mcpspec.DecodeParams(msg.Params)
+	if err != nil {
+		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest, err.Error())
+		return
+	}
 
 	// Ensure the required protocolVersion _meta is present: native clients
 	// send it; legacy mode injects clientInfo/clientCapabilities too.
-	ver := ""
-	if raw, ok := p.Meta[mcpspec.MetaProtocolVersion]; ok {
-		_ = json.Unmarshal(raw, &ver)
+	ver, err := p.ProtocolVersion()
+	if err != nil {
+		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest, err.Error())
+		return
 	}
 	inject := map[string]json.RawMessage{}
 	if s.legacy != nil {
@@ -154,9 +164,10 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 		}
 	}
 
-	name := p.Name
-	if msg.Method == mcpspec.MethodResourcesRead {
-		name = p.URI
+	name, _, err := p.Name(msg.Method)
+	if err != nil {
+		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest, err.Error())
+		return
 	}
 
 	req := &wire.Request{

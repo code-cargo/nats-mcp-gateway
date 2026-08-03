@@ -138,6 +138,33 @@ func TestProgressTokenRoutingWithCollidingTokens(t *testing.T) {
 	}
 }
 
+// TestProgressTokenRewriteLeavesCaseVariantSibling records what the test
+// above depends on, and what defends it.
+//
+// The rewrite gives each caller a mux-unique token so two of them cannot
+// collide — that is the whole point of the test above. It swaps the exact
+// key and has no opinion about a "ProgressToken" sibling, which rides through
+// untouched. A case-folding backend binds THAT one instead, echoes it on its
+// progress notifications, and the mux routes them by token to whichever call
+// registered it. Mux tokens are a counter, not a secret, so a caller can name
+// another caller's.
+//
+// Nothing here is wrong: this function is far past the point where a request
+// can still be refused. pkg/proxy.Check is that point, and it refuses the
+// collision — mcpspec.metaKeysRead names progressToken for exactly this
+// reason. If that ever goes away, this test is the record of what it held up.
+func TestProgressTokenRewriteLeavesCaseVariantSibling(t *testing.T) {
+	orig, out, ok := rewriteProgressToken(
+		json.RawMessage(`{"name":"x","_meta":{"progressToken":"mine","ProgressToken":"gt7"}}`),
+		"gt99",
+	)
+	require.True(t, ok)
+	assert.JSONEq(t, `"mine"`, string(orig), "the caller's own token is what gets restored later")
+	assert.Contains(t, string(out), `"progressToken":"gt99"`, "the exact key is rewritten")
+	assert.Contains(t, string(out), `"ProgressToken":"gt7"`,
+		"the sibling survives, which is why the request must be refused upstream")
+}
+
 func TestCrashFailsAllInFlight(t *testing.T) {
 	m := newTestMux(t)
 

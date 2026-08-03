@@ -127,7 +127,15 @@ Two things make that real:
 1. **The integrity check** (`pkg/proxy/integrity.go`): the gateway proves the
    subject NATS authorized, the mirrored headers, and the JSON-RPC body all
    agree, and rejects any disagreement with `-32020`. Without it a caller
-   could publish a `delete_repo` body to a `get_issue` subject.
+   could publish a `delete_repo` body to a `get_issue` subject. The body is
+   forwarded verbatim, so it is read the way the backend will read it: exact
+   keys, and no duplicate key at any depth. Keys differing only by case are
+   refused across `params`, whose field names the spec fixes — and, inside
+   the open extension bags `_meta` and tool `arguments`, on the specific key
+   being read rather than the whole object, since a third party's two keys
+   there are none of the gateway's business (`pkg/mcpspec/params.go`). A
+   check that parses the body differently from the server executing it has
+   verified nothing.
 2. **The tenant token is NATS-enforced**: a user cannot publish into another
    tenant's subjects, so the gateway trusts the tenant it parses from the
    subject. Backend processes are pooled per `(server, tenant, credentials)`
@@ -470,7 +478,10 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
 Note: only the **file** source reads connection settings (URL, prefix, queue
 group, inbox prefix, scope) from the document's `nats` block. The fetch and
 inline sources take those from flags/env — the document supplies only the
-server set.
+server set. Passing one of those flags (or its `NATSMCP_*` env var) alongside
+`--config` is **rejected at boot** unless the document already carries that same
+value — the mirror of the inline source rejecting a `nats` block. A scope
+injected as pod env is therefore never silently dropped, in either direction.
 
 `--inbox-prefix` / `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`)
 sets the prefix for this process's own request/reply inboxes — the config
