@@ -563,4 +563,6 @@ code running**. See `demo/README-steps` inside `demo/run.sh`.
 does (embedded NATS server; the fake MCP server is the re-exec'd test
 binary). `make test-race` runs the same suite under the race detector; CI
 runs it as its own job on every PR, so "the race detector is clean" is a
-checked claim rather than a remembered one.
+checked claim rather than a remembered one. It is deliberately not part of
+`make ci` — the run is several times slower — so a full local pass is
+`make ci && make test-race`.
