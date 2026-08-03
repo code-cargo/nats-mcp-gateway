@@ -86,6 +86,10 @@ func TestStdioEcho(t *testing.T) {
 // condition that fails a pipe is descriptor exhaustion, which is exactly the
 // condition that repeats. A gateway under it leaked a directory per attempt,
 // and the descriptors of whichever pipes had already succeeded.
+//
+// The rlimit below is PROCESS-wide, so this test must never gain t.Parallel()
+// — nothing in this package uses it today, which is exactly what would make
+// the hazard invisible to whoever adds the first one.
 func TestFailedConnectLeavesNothingBehind(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("TMPDIR", tmp) // os.MkdirTemp("", ...) lands here
@@ -100,8 +104,12 @@ func TestFailedConnectLeavesNothingBehind(t *testing.T) {
 	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim))
 
 	if err == nil {
+		// The limit only bites if the process has no free descriptor slot
+		// below it, which depends on what this binary happens to hold open.
+		// That is a property of the machine, not of the code under test, so
+		// it is a skip and not a failure.
 		_ = conn.Close()
-		t.Fatal("connect succeeded with no descriptors to spare; the test proved nothing")
+		t.Skip("connect succeeded with the descriptor limit lowered; nothing to assert")
 	}
 	entries, readErr := os.ReadDir(tmp)
 	require.NoError(t, readErr)
