@@ -15,9 +15,12 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -784,6 +787,26 @@ func TestReplyIntoTheWiresOwnSubjectsIsRefused(t *testing.T) {
 	// Long enough for a keepalive to have fired had the request been served.
 	_, err = watch.NextMsg(300 * time.Millisecond)
 	assert.ErrorIs(t, err, nats.ErrTimeout, "the gateway reflected frames onto %q", victim)
+}
+
+// The refusal is caller-triggered, so its log is caller-controlled: a
+// publisher that keeps naming bad reply subjects would otherwise write a Warn
+// line per request into the gateway's log for as long as it cared to. The
+// throttle keeps the refusal visible without letting it become the outage.
+func TestRefusalLogIsThrottled(t *testing.T) {
+	var buf bytes.Buffer
+	s := &Server{log: slog.New(slog.NewTextHandler(&buf, nil))}
+	for i := 0; i < 50; i++ {
+		s.warnUnusableReply("mcp.v1.req.acme.u1.test.tools.list._", "$JS.API.STREAM.DELETE.x")
+	}
+	assert.Equal(t, 1, strings.Count(buf.String(), "refusing a request"),
+		"a flood of refusals must not be a flood of log lines")
+
+	// Nothing is lost, though: the 49 that did not print are counted into the
+	// next line that does.
+	s.refusedAt = time.Now().Add(-2 * refusalLogInterval)
+	s.warnUnusableReply("mcp.v1.req.acme.u1.test.tools.list._", "$JS.API.STREAM.DELETE.x")
+	assert.Contains(t, buf.String(), "suppressed=49")
 }
 
 func TestUsableReplySubject(t *testing.T) {

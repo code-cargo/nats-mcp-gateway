@@ -253,6 +253,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		User:       boot.user,
 		Version:    normalizeVersion(version),
 		Claims:     claims,
+		Logger:     log,
 	}, px.Handler())
 	if err != nil {
 		return err

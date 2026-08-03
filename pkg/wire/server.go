@@ -34,6 +34,9 @@ const (
 	// DefaultKeepAlive is the ka-frame interval on idle streams. Must be
 	// well under the client's inactivity deadline.
 	DefaultKeepAlive = 15 * time.Second
+
+	// refusalLogInterval is the floor between two reply-subject refusal logs.
+	refusalLogInterval = time.Second
 )
 
 var (
@@ -94,6 +97,9 @@ type ServerConfig struct {
 	Version string
 	// KeepAlive overrides DefaultKeepAlive when > 0.
 	KeepAlive time.Duration
+	// Logger receives the wire's own operational messages — today, refused
+	// reply subjects. slog.Default() when nil.
+	Logger *slog.Logger
 	// Claims, when set, parks oversize responses in a claim store instead of
 	// failing them with ErrCodePayloadTooLarge — but only for callers that
 	// sent HeaderAcceptClaim. Nil disables claim-check (today's behavior).
@@ -115,6 +121,16 @@ type Server struct {
 	version    string
 	keepAlive  time.Duration
 	claims     ClaimStore
+	log        *slog.Logger
+
+	// A refused reply subject is caller-triggered, so the log it produces is
+	// caller-controlled too: one publisher can emit them as fast as it can
+	// publish. Warn at most once per refusalLogInterval and carry the
+	// suppressed count into the next line, so the refusal is never invisible
+	// and never the thing that fills the disk.
+	refuseMu          sync.Mutex
+	refusedAt         time.Time
+	refusedSuppressed int
 
 	svcMu sync.Mutex
 	svcs  map[string]micro.Service // server name -> its micro service
@@ -182,11 +198,17 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		return nil, fmt.Errorf("wire: endpoint scoping with a User requires a Tenant (got tenant=%q, user=%q)", cfg.Tenant, cfg.User)
 	}
 
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+
 	base, cancel := context.WithCancelCause(context.Background())
 	s := &Server{
 		nc:         nc,
 		handler:    handler,
 		prefix:     prefix,
+		log:        log,
 		queueGroup: cfg.QueueGroup,
 		tenant:     cfg.Tenant,
 		user:       cfg.User,
@@ -308,11 +330,7 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		// under the GATEWAY's identity. See usableReplySubject for what that
 		// hands a caller and why this refuses some of it.
 		if reply := req.Reply(); !usableReplySubject(reply, prefix) {
-			// slog.Default rather than a configured logger: wire.Server has
-			// none, and a security refusal that leaves no trace is worse than
-			// one logged somewhere an operator has to go looking for.
-			slog.Default().Warn("refusing a request whose reply subject is not a usable client inbox",
-				"subject", req.Subject(), "reply", reply)
+			s.warnUnusableReply(req.Subject(), reply)
 			return
 		}
 
@@ -440,6 +458,27 @@ func usableReplySubject(reply, prefix string) bool {
 		}
 	}
 	return true
+}
+
+// warnUnusableReply logs a refusal, at most one line per refusalLogInterval —
+// see the throttle fields on Server for why a caller-triggered log needs one.
+func (s *Server) warnUnusableReply(subject, reply string) {
+	now := time.Now()
+	s.refuseMu.Lock()
+	if !s.refusedAt.IsZero() && now.Sub(s.refusedAt) < refusalLogInterval {
+		s.refusedSuppressed++
+		s.refuseMu.Unlock()
+		return
+	}
+	suppressed := s.refusedSuppressed
+	s.refusedSuppressed = 0
+	s.refusedAt = now
+	s.refuseMu.Unlock()
+
+	// slog quotes a value that needs it, so the caller-controlled reply cannot
+	// forge log lines of its own here.
+	s.log.Warn("refusing a request whose reply subject is not a usable client inbox",
+		"subject", subject, "reply", reply, "suppressed", suppressed)
 }
 
 // refuseDrained answers a request delivered after the drain gave up on it.
