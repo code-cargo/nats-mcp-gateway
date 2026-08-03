@@ -701,7 +701,13 @@ func credsEnvName(got string) string {
 // document field reads as "" rather than as nothing at all.
 func settingValue(v any) string {
 	if s, ok := v.(string); ok {
-		return fmt.Sprintf("%q", s)
+		// Redacted because two of the settings rendered here are NATS URLs and
+		// a NATS URL carries its credential inline — the README's own canonical
+		// form is nats://gw:pw@nats:4222. This text is built on both paths: the
+		// fatal one, which a person reads once, and the ignored one, which goes
+		// to the log. Non-URL values are unaffected; redactNATSURL only rewrites
+		// an authority that has userinfo in it.
+		return fmt.Sprintf("%q", redactNATSURL(s))
 	}
 	return fmt.Sprint(v)
 }

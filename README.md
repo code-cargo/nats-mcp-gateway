@@ -10,7 +10,7 @@ end users never hold them.
 > still change incompatibly, and MCP 2026-07-28 — the revision the wire
 > carries — was itself only finalized on 2026-07-28. Pin a commit, expect
 > breaking changes, and read [Upgrading](#upgrading) and the git log before
-> moving one.
+> moving to a newer one.
 
 ```
 [MCP client]           [gateway fleet, queue group]       [real MCP servers]

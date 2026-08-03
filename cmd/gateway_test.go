@@ -1799,6 +1799,31 @@ func TestSharedEnvVarsDoNotRefuseTheFileSourceBoot(t *testing.T) {
 		})
 	}
 
+	// A NATS URL carries its credential inline, and this text reaches the log
+	// on the ignored path and an operator's terminal on the fatal one. The
+	// message that reports a dropped setting must not be the thing that
+	// publishes it.
+	t.Run("neither path prints the credential", func(t *testing.T) {
+		t.Setenv("NATSMCP_NATS_URL", "nats://gw:s3cr3t@prod:4222")
+		boot, err := parse(t).bootParams(sourceFile)
+		require.NoError(t, err)
+		require.Len(t, boot.ignoredFlags, 1)
+		assert.NotContains(t, boot.ignoredFlags[0], "s3cr3t")
+		assert.Contains(t, boot.ignoredFlags[0], "prod:4222", "the host is the whole point of the line")
+
+		var cli CLI
+		parser, perr := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, perr)
+		// A value the env did not supply, so this takes the fatal path rather
+		// than the ignored one.
+		_, perr = parser.Parse([]string{"gateway", "--config", path, "--nats-url", "nats://gw:fl4gs3cret@other:4222"})
+		require.NoError(t, perr)
+		_, err = cli.Gateway.bootParams(sourceFile)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "fl4gs3cret")
+		assert.Contains(t, err.Error(), "other:4222")
+	})
+
 	// The same setting aimed at THIS process still fails: an argv the operator
 	// typed is not one exported once for the host, and silently dropping it
 	// would be the original defect.

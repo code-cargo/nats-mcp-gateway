@@ -805,8 +805,10 @@ type errCapture struct {
 }
 
 func (c *errCapture) Enabled(context.Context, slog.Level) bool { return true }
-func (c *errCapture) WithAttrs([]slog.Attr) slog.Handler       { return c }
-func (c *errCapture) WithGroup(string) slog.Handler            { return c }
+
+func (c *errCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *errCapture) WithGroup(string) slog.Handler { return c }
 
 func (c *errCapture) Handle(_ context.Context, r slog.Record) error {
 	if r.Level < slog.LevelError {
