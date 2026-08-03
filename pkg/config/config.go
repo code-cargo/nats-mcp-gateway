@@ -361,6 +361,11 @@ func (c *Config) validate() error {
 			return fmt.Errorf("nats.inboxPrefix: %w", err)
 		}
 	}
+	if c.NATS.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.NATS.SubjectPrefix); err != nil {
+			return fmt.Errorf("nats.subjectPrefix: %w", err)
+		}
+	}
 	if c.NATS.Tenant == "" && c.NATS.User != "" {
 		return fmt.Errorf("nats: scoping with a user requires a tenant (got user=%q)", c.NATS.User)
 	}

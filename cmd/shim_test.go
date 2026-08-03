@@ -21,12 +21,14 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The shim's wire prefix gets the same check as the gateway's. The failure it
-// prevents is milder — a wildcard prefix builds a publish subject NATS refuses,
-// so nothing is widened — but it arrives once per request, as an opaque publish
-// error, from a process whose entire job is to look like a local MCP server to
-// the client that spawned it. Both checks run BEFORE the connect, so a
-// malformed prefix is named without a NATS server in the picture.
+// Both prefix flags are checked at the cmd layer, which is what names the flag
+// that is wrong. wire.NewClient rejects a malformed prefix too, but its error
+// names the wire, not the setting the operator typed — and this process reads
+// its settings from an .mcp.json entry, where nobody is watching a boot log.
+//
+// Both checks also run BEFORE the connect, so a malformed prefix is named
+// without a NATS server in the picture. That is what this test pins: the error
+// arrives from a shim pointed at a port nothing is listening on.
 func TestShimValidatesPrefixesBeforeConnecting(t *testing.T) {
 	for _, bad := range []string{"mcp.*", "mcp.>", "mcp v1", "mcp.v1.", ".mcp.v1", "mcp..v1"} {
 		err := runShim(&ShimCmd{

@@ -18,7 +18,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -32,6 +34,9 @@ const (
 	// DefaultKeepAlive is the ka-frame interval on idle streams. Must be
 	// well under the client's inactivity deadline.
 	DefaultKeepAlive = 15 * time.Second
+
+	// refusalLogInterval is the floor between two reply-subject refusal logs.
+	refusalLogInterval = time.Second
 )
 
 var (
@@ -92,6 +97,9 @@ type ServerConfig struct {
 	Version string
 	// KeepAlive overrides DefaultKeepAlive when > 0.
 	KeepAlive time.Duration
+	// Logger receives the wire's own operational messages — today, refused
+	// reply subjects. slog.Default() when nil.
+	Logger *slog.Logger
 	// Claims, when set, parks oversize responses in a claim store instead of
 	// failing them with ErrCodePayloadTooLarge — but only for callers that
 	// sent HeaderAcceptClaim. Nil disables claim-check (today's behavior).
@@ -113,13 +121,33 @@ type Server struct {
 	version    string
 	keepAlive  time.Duration
 	claims     ClaimStore
+	log        *slog.Logger
+
+	// A refused reply subject is caller-triggered, so the log it produces is
+	// caller-controlled too: one publisher can emit them as fast as it can
+	// publish. Warn at most once per refusalLogInterval and carry the
+	// suppressed count into the next line, so the refusal is never invisible
+	// and never the thing that fills the disk.
+	refuseMu          sync.Mutex
+	refusedAt         time.Time
+	refusedSuppressed int
 
 	svcMu sync.Mutex
 	svcs  map[string]micro.Service // server name -> its micro service
 
 	base   context.Context
 	cancel context.CancelCauseFunc
-	wg     sync.WaitGroup
+
+	// Requests keep arriving after stopAllServices returns: micro stops an
+	// endpoint with Subscription.Drain, which only buffers the UNSUB. drainMu
+	// fuses "has the drain given up on new work?" and "reserve a slot in wg"
+	// into one decision, so once Shutdown starts waiting the counter can only
+	// fall. Without it an Add can land on a zero counter concurrently with
+	// Wait — the misuse sync.WaitGroup documents, and the exact window in
+	// which Shutdown reports a clean drain while a handler is still running.
+	drainMu  sync.Mutex
+	draining bool
+	wg       sync.WaitGroup
 }
 
 // DefaultQueueGroup is the group a gateway joins when none is configured.
@@ -162,10 +190,24 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 	prefix := cfg.Prefix
 	if prefix == "" {
 		prefix = DefaultPrefix
+	} else if err := ValidateSubjectPrefix(prefix); err != nil {
+		// The same check NewClient makes, and for a sharper reason on this
+		// side: EndpointSubject pastes the prefix in unchecked, so an empty
+		// token or a wildcard builds a SUBSCRIBE that is either invalid — the
+		// server's -ERR 'Invalid Subject' is unrecognised by nats.go, which
+		// closes the connection for good — or wider than the grant the prefix
+		// exists to narrow. Every config source reaches Serve, so this is the
+		// one place none of them can forget.
+		return nil, fmt.Errorf("wire: %w", err)
 	}
 
 	if cfg.Tenant == "" && cfg.User != "" {
 		return nil, fmt.Errorf("wire: endpoint scoping with a User requires a Tenant (got tenant=%q, user=%q)", cfg.Tenant, cfg.User)
+	}
+
+	log := cfg.Logger
+	if log == nil {
+		log = slog.Default()
 	}
 
 	base, cancel := context.WithCancelCause(context.Background())
@@ -173,6 +215,7 @@ func Serve(nc *nats.Conn, cfg ServerConfig, handler Handler) (*Server, error) {
 		nc:         nc,
 		handler:    handler,
 		prefix:     prefix,
+		log:        log,
 		queueGroup: cfg.QueueGroup,
 		tenant:     cfg.Tenant,
 		user:       cfg.User,
@@ -258,9 +301,14 @@ func (s *Server) stopAllServices() error {
 
 // Shutdown drains: stop accepting requests on every server, terminate every
 // live stream with ErrCodeStreamLost so clients re-issue immediately, then
-// wait for handlers up to ctx's deadline.
+// wait for handlers up to ctx's deadline. A request micro hands over after
+// that wait is armed is refused with the same ErrCodeStreamLost — silence
+// would cost its caller the full inactivity window.
 func (s *Server) Shutdown(ctx context.Context) error {
 	err := s.stopAllServices()
+	s.drainMu.Lock()
+	s.draining = true
+	s.drainMu.Unlock()
 	s.cancel(errDraining)
 	done := make(chan struct{})
 	go func() {
@@ -278,9 +326,20 @@ func (s *Server) Shutdown(ctx context.Context) error {
 // dispatch runs one request. It owns envelope decoding, the control-subject
 // subscription, the keepalive ticker, and the exactly-one-terminal guarantee.
 func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
-	s.wg.Add(1)
+	if !s.beginRequest() {
+		s.refuseDrained(req)
+		return
+	}
 	go func() {
 		defer s.wg.Done()
+
+		// Every frame below goes to the reply-to the CALLER chose, published
+		// under the GATEWAY's identity. See usableReplySubject for what that
+		// hands a caller and why this refuses some of it.
+		if reply := req.Reply(); !usableReplySubject(reply, prefix) {
+			s.warnUnusableReply(req.Subject(), reply)
+			return
+		}
 
 		w := &streamWriter{nc: s.nc, req: req}
 
@@ -343,6 +402,109 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 			_ = w.Err(jsonrpc.CodeInternalError, "handler returned no response", nil)
 		}
 	}()
+}
+
+// beginRequest reserves the request's slot in the drain WaitGroup, reporting
+// false once Shutdown has stopped waiting for new work.
+func (s *Server) beginRequest() bool {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	if s.draining {
+		return false
+	}
+	s.wg.Add(1)
+	return true
+}
+
+// usableReplySubject reports whether a caller-supplied reply-to is something
+// this gateway may publish and subscribe to on that caller's behalf, given the
+// wire prefix this replica serves.
+//
+// Three hazards, all reachable from one narrow publish grant, because NATS
+// permission-checks the subject a client publishes TO and never the reply-to —
+// that is checked against whoever answers, which is us.
+//
+// A privileged subject makes the gateway a publish proxy for its own rights.
+// With claim-check on, our identity carries JetStream rights,
+// $JS.API.STREAM.DELETE.<stream> takes no request body, and the keepalive is
+// an empty-bodied frame emitted unprompted: together, another tenant's claim
+// bucket deleted by a caller who cannot publish to that subject themselves.
+//
+// A subject that is not a valid LITERAL takes the whole replica down. dispatch
+// subscribes to reply+ctlSuffix, so a reply of ">" or "a.>" builds an invalid
+// subscribe subject, the server answers -ERR 'Invalid Subject', and nats.go
+// treats an unrecognised -ERR as fatal and closes the connection for good —
+// MaxReconnects(-1) does not apply, and nothing here installs a ClosedHandler.
+// One publish and the replica is silently off the air.
+//
+// A subject inside our own prefix turns the gateway into a reflector onto the
+// wire: a reply of {prefix}.req.{victim}.… has us publish keepalive and end
+// frames onto another tenant's endpoint subject. Those frames carry no
+// Mcp-Wire header, so nothing runs on the far side, but a caller who cannot
+// publish there is still spending our dispatch goroutines to reach it. No
+// client inbox lives under the wire prefix, so refusing it costs nothing.
+//
+// So: a non-empty literal subject, no wildcards, no empty tokens, no
+// whitespace, outside the server's own $ namespace and outside ours.
+// Deliberately not a check that it looks like an inbox — a deployment may
+// configure any inbox prefix, and guessing at that would refuse working
+// clients. What is left unreachable by this is a subject an account MAPPING
+// aliases onto something privileged under an ordinary-looking name, which no
+// syntactic test can see and only the gateway's own NATS grant can bound.
+func usableReplySubject(reply, prefix string) bool {
+	if reply == "" || strings.HasPrefix(reply, "$") {
+		return false
+	}
+	if reply == prefix || strings.HasPrefix(reply, prefix+".") {
+		return false
+	}
+	for _, tok := range strings.Split(reply, ".") {
+		// An empty token is its own case: ContainsAny cannot see it.
+		if tok == "" || strings.ContainsAny(tok, "*> \t\r\n") {
+			return false
+		}
+	}
+	return true
+}
+
+// warnUnusableReply logs a refusal, at most one line per refusalLogInterval —
+// see the throttle fields on Server for why a caller-triggered log needs one.
+func (s *Server) warnUnusableReply(subject, reply string) {
+	now := time.Now()
+	s.refuseMu.Lock()
+	if !s.refusedAt.IsZero() && now.Sub(s.refusedAt) < refusalLogInterval {
+		s.refusedSuppressed++
+		s.refuseMu.Unlock()
+		return
+	}
+	suppressed := s.refusedSuppressed
+	s.refusedSuppressed = 0
+	s.refusedAt = now
+	s.refuseMu.Unlock()
+
+	// slog quotes a value that needs it, so the caller-controlled reply cannot
+	// forge log lines of its own here.
+	s.log.Warn("refusing a request whose reply subject is not a usable client inbox",
+		"subject", subject, "reply", reply, "suppressed", suppressed)
+}
+
+// refuseDrained answers a request delivered after the drain gave up on it.
+// ErrCodeStreamLost is the same "re-issue" signal a request caught in flight
+// gets, and it reaches another replica in the time silence would have spent
+// waiting out the caller's inactivity window.
+func (s *Server) refuseDrained(req micro.Request) {
+	// Same rule as dispatch: this publishes to the caller's chosen subject
+	// too, and a drain is not a reason to stop checking where.
+	if !usableReplySubject(req.Reply(), s.prefix) {
+		return
+	}
+	w := &streamWriter{nc: s.nc, req: req}
+	// Best effort on the id: a body that will not decode has none to echo,
+	// and re-issuing is the answer either way.
+	if msg, err := jsonrpc.Decode(req.Data()); err == nil {
+		w.id = msg.ID
+	}
+	_ = w.Err(ErrCodeStreamLost, "gateway draining, re-issue the request", nil)
 }
 
 func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWriter) {

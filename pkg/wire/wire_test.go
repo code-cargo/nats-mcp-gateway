@@ -15,9 +15,14 @@
 package wire
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,6 +230,85 @@ func TestNoGateway(t *testing.T) {
 	assert.Less(t, time.Since(start), 2*time.Second, "no-responders must fail fast, not wait out inactivity")
 }
 
+// Every request hangs a cancellable child off its caller's context, and only
+// Stream.Close, a permission violation or a failed publish ever released it —
+// never the normal terminal frame. A caller that outlives its requests (the
+// shim runs one context for the whole process and issues every request under
+// it) therefore accumulated one cancelCtx per completed request, forever.
+func TestCompletedRequestReleasesItsCallerContext(t *testing.T) {
+	nc := runNATS(t, nil)
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	caller := &countingCtx{done: make(chan struct{})}
+	c := client(t, nc, 5*time.Second)
+	for i := 0; i < 20; i++ {
+		s, err := c.Do(caller, testRequest("1", "tools/call"))
+		require.NoError(t, err)
+		frames := collect(t, s)
+		require.Len(t, frames, 1)
+		require.Equal(t, FrameEnd, frames[0].Kind)
+	}
+	require.Positive(t, caller.peak(), "the requests must have registered on the caller's context at all")
+
+	// The release lands just behind the frame channel's close, so let the last
+	// request's goroutine finish unwinding.
+	assert.Eventually(t, caller.empty, 2*time.Second, 10*time.Millisecond,
+		"completed requests are still registered on the caller's context")
+}
+
+// countingCtx is a cancellable context that counts what is registered against
+// it. context keeps its own child registry unexported, but it hands
+// registration to a parent that implements AfterFunc — so a parent that does
+// gets to watch the wire register a request and, once fixed, release it. The
+// context is never actually cancelled: outliving its requests is the point.
+type countingCtx struct {
+	done chan struct{}
+
+	mu   sync.Mutex
+	live int
+	seen int
+}
+
+func (c *countingCtx) Deadline() (time.Time, bool) { return time.Time{}, false }
+
+func (c *countingCtx) Done() <-chan struct{} { return c.done }
+
+func (c *countingCtx) Err() error { return nil }
+
+func (c *countingCtx) Value(any) any { return nil }
+
+func (c *countingCtx) AfterFunc(func()) func() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.live++
+	c.seen++
+	released := false
+	return func() bool {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if released {
+			return false
+		}
+		released = true
+		c.live--
+		return true
+	}
+}
+
+func (c *countingCtx) empty() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.live == 0
+}
+
+func (c *countingCtx) peak() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.seen
+}
+
 func TestOversizeRequestFailsBeforePublish(t *testing.T) {
 	nc := runNATS(t, &server.Options{MaxPayload: 1024})
 	req := testRequest("1", "tools/call")
@@ -280,6 +364,83 @@ func TestDrainTerminatesLiveStreams(t *testing.T) {
 	require.NotNil(t, m.Error)
 	assert.Equal(t, ErrCodeStreamLost, m.Error.Code)
 	assert.Contains(t, m.Error.Message, "draining")
+}
+
+// Shutdown must never report a completed drain while the gateway is still
+// taking work on. micro stops an endpoint with Subscription.Drain, which
+// returns as soon as the UNSUB is buffered — the request published a moment
+// earlier is still delivered to the handler afterwards. A drain that returns
+// in that window leaves the caller with no terminal frame at all once the
+// process exits, costing it the whole inactivity window.
+func TestShutdownDoesNotAbandonRequestsItAccepts(t *testing.T) {
+	nc := runNATS(t, nil)
+
+	var running atomic.Int32
+	var drainReturned, lateStart atomic.Bool
+	srv := serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		if drainReturned.Load() {
+			lateStart.Store(true)
+		}
+		running.Add(1)
+		defer running.Add(-1)
+		// Long enough that a handler picked up before the drain finished is
+		// unmistakably still running when Shutdown returns.
+		time.Sleep(200 * time.Millisecond)
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+
+	// Inactivity far beyond collect's own fatal timeout: a caller left without
+	// a terminal frame fails the test rather than quietly waiting it out.
+	s, err := client(t, nc, 30*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+
+	// No handshake with the handler first: the request is on the wire but not
+	// yet dispatched, which is precisely the window Shutdown has to cover.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = srv.Shutdown(shutdownCtx)
+	drainReturned.Store(true)
+	stillRunning := running.Load()
+	require.NoError(t, err)
+	assert.Zero(t, stillRunning, "Shutdown reported a completed drain with a handler still running")
+
+	// A dispatch landing after the drain is the same failure seen from the
+	// other side — nothing is left to wait for it.
+	time.Sleep(500 * time.Millisecond)
+	assert.False(t, lateStart.Load(), "a request was dispatched after Shutdown reported a completed drain")
+
+	// Whichever side of the drain it fell on, the caller gets a terminal frame.
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	assert.True(t, frames[0].Kind.Terminal())
+}
+
+// Once the drain has stopped waiting for new work, a request micro still
+// delivers is answered rather than dropped: the caller re-issues against
+// another replica instead of spending its whole inactivity window on a reply
+// that is never coming.
+func TestDrainedGatewayRefusesRatherThanGoingSilent(t *testing.T) {
+	nc := runNATS(t, nil)
+	srv := serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		t.Error("a drained gateway must not take on a handler")
+		return nil
+	})
+	// Marked without stopping the services, so the request still routes and
+	// the refusal is unambiguously what answers it.
+	srv.drainMu.Lock()
+	srv.draining = true
+	srv.drainMu.Unlock()
+
+	s, err := client(t, nc, 30*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	m, err := jsonrpc.Decode(frames[0].Body)
+	require.NoError(t, err)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, ErrCodeStreamLost, m.Error.Code)
+	assert.JSONEq(t, `"1"`, string(m.ID), "the refusal must echo the id so the client can fail that request")
 }
 
 func TestBadWireVersionRejected(t *testing.T) {
@@ -461,4 +622,231 @@ func TestQueueGroupDefaults(t *testing.T) {
 
 	s = serve(t, nc, ServerConfig{Tenant: "acme", User: "u1", QueueGroup: "custom"}, nil)
 	assert.Equal(t, "custom", s.queueGroup, "an explicit group is always respected")
+}
+
+// TestNewClientRejectsAnUnusableSubjectPrefix closes the gap between the two
+// prefixes a client carries.
+//
+// --inbox-prefix is validated by every caller; --subject-prefix was not, and
+// BuildSubject checks every token EXCEPT the prefix it pastes in. A trailing
+// dot or a wildcard therefore built a subject nothing serves, and the caller
+// was told -32011 — "no gateway is serving this server" — about a fleet that
+// is serving it fine. Validating in NewClient rather than in each subcommand
+// means a future caller cannot forget it.
+func TestNewClientRejectsAnUnusableSubjectPrefix(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
+		_, err := NewClient(nc, ClientConfig{Prefix: prefix, Tenant: "acme"})
+		assert.Error(t, err, "prefix %q builds subjects nothing can serve", prefix)
+	}
+	// The ordinary cases still work, including the empty prefix that means
+	// "use DefaultPrefix".
+	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
+		c, err := NewClient(nc, ClientConfig{Prefix: prefix, Tenant: "acme"})
+		require.NoError(t, err, "prefix %q is legitimate", prefix)
+		require.NotNil(t, c)
+	}
+}
+
+// TestReplyToASystemSubjectIsRefused closes a confused deputy.
+//
+// NATS permission-checks the subject a client publishes TO. It does not check
+// the reply-to — that is checked against whoever answers, which is the
+// gateway. So every frame the gateway emits for a request goes to a subject
+// the CALLER chose, under the GATEWAY's identity.
+//
+// With claim-check on, that identity carries JetStream rights. $JS.API.STREAM.
+// DELETE.<stream> takes no request body, and the keepalive is an empty-bodied
+// frame the wire emits unprompted — so a caller holding one narrow publish
+// grant could have the gateway delete another tenant's claim bucket, on a
+// subject the caller is themselves refused.
+//
+// No client inbox begins with $; that namespace is the server's own APIs.
+func TestReplyToASystemSubjectIsRefused(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	for _, reply := range []string{
+		"$JS.API.STREAM.DELETE.OBJ_MCP_CLAIMS_victim",
+		"$JS.API.STREAM.PURGE.OBJ_MCP_CLAIMS_victim",
+		"$SYS.REQ.SERVER.PING",
+	} {
+		watch, err := nc.SubscribeSync(reply)
+		require.NoError(t, err)
+		require.NoError(t, nc.PublishMsg(&nats.Msg{
+			Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+			Reply:   reply,
+			Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+			Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+		}))
+		require.NoError(t, nc.Flush())
+
+		// Long enough for a keepalive to have fired had the request been served.
+		_, err = watch.NextMsg(300 * time.Millisecond)
+		assert.ErrorIs(t, err, nats.ErrTimeout,
+			"the gateway published to %q on a caller's say-so", reply)
+		_ = watch.Unsubscribe()
+	}
+
+	// An ordinary inbox reply still works, or the guard has eaten the wire.
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}, 5*time.Second)
+	require.NoError(t, err)
+	assert.Contains(t, string(resp.Data), `"result"`)
+}
+
+// TestWildcardReplyDoesNotKillTheConnection covers the other half of the
+// caller-controlled reply subject.
+//
+// dispatch subscribes to reply+ctlSuffix. A reply of ">" or "a.>" builds an
+// invalid SUBSCRIBE subject, the server answers -ERR 'Invalid Subject', and
+// nats.go treats an unrecognised -ERR as fatal and closes the connection
+// permanently — MaxReconnects(-1) does not apply and nothing installs a
+// ClosedHandler. One publish from a caller holding one narrow grant would take
+// the replica off the air with no trace but silence.
+func TestWildcardReplyDoesNotKillTheConnection(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	// Only the forms a client can actually put on the wire: nats.go refuses a
+	// reply containing whitespace before it sends. The rest are covered by
+	// TestUsableReplySubject.
+	for _, reply := range []string{">", "a.>", "_INBOX.>", "a.*.b", "a..b", "*"} {
+		require.NoError(t, nc.PublishMsg(&nats.Msg{
+			Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+			Reply:   reply,
+			Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+			Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+		}), "publish with reply %q", reply)
+		require.NoError(t, nc.Flush())
+	}
+
+	// The gateway must still be serving: that is the whole claim.
+	resp, err := nc.RequestMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}, 5*time.Second)
+	require.NoError(t, err, "the gateway's connection died on a caller's reply subject")
+	assert.Contains(t, string(resp.Data), `"result"`)
+}
+
+// The third thing a caller-chosen reply subject can name: our own wire. A
+// reply of {prefix}.req.{victim}.… has the gateway publish keepalive and end
+// frames onto another tenant's endpoint subject — nothing runs there, since
+// those frames carry no Mcp-Wire header, but the caller is spending our
+// dispatch on a subject it cannot publish to itself.
+func TestReplyIntoTheWiresOwnSubjectsIsRefused(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	srv, err := Serve(nc, ServerConfig{
+		Servers: []string{"test"}, KeepAlive: 50 * time.Millisecond,
+	}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{}}`))
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	const victim = "mcp.v1.req.victim.u1.test.tools.list._"
+	watch, err := nc.SubscribeSync(victim)
+	require.NoError(t, err)
+	require.NoError(t, nc.PublishMsg(&nats.Msg{
+		Subject: "mcp.v1.req.acme.u1.test.tools.list._",
+		Reply:   victim,
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/list","params":{}}`),
+		Header:  nats.Header{HeaderWire: []string{WireVersion}, HeaderMethod: []string{"tools/list"}},
+	}))
+	require.NoError(t, nc.Flush())
+
+	// Long enough for a keepalive to have fired had the request been served.
+	_, err = watch.NextMsg(300 * time.Millisecond)
+	assert.ErrorIs(t, err, nats.ErrTimeout, "the gateway reflected frames onto %q", victim)
+}
+
+// The refusal is caller-triggered, so its log is caller-controlled: a
+// publisher that keeps naming bad reply subjects would otherwise write a Warn
+// line per request into the gateway's log for as long as it cared to. The
+// throttle keeps the refusal visible without letting it become the outage.
+func TestRefusalLogIsThrottled(t *testing.T) {
+	var buf bytes.Buffer
+	s := &Server{log: slog.New(slog.NewTextHandler(&buf, nil))}
+	for i := 0; i < 50; i++ {
+		s.warnUnusableReply("mcp.v1.req.acme.u1.test.tools.list._", "$JS.API.STREAM.DELETE.x")
+	}
+	assert.Equal(t, 1, strings.Count(buf.String(), "refusing a request"),
+		"a flood of refusals must not be a flood of log lines")
+
+	// Nothing is lost, though: the 49 that did not print are counted into the
+	// next line that does.
+	s.refusedAt = time.Now().Add(-2 * refusalLogInterval)
+	s.warnUnusableReply("mcp.v1.req.acme.u1.test.tools.list._", "$JS.API.STREAM.DELETE.x")
+	assert.Contains(t, buf.String(), "suppressed=49")
+}
+
+func TestUsableReplySubject(t *testing.T) {
+	for _, ok := range []string{
+		"_INBOX.abc123", "_INBOX_acme_u_9f3a.xyz", "my.custom.inbox.1", "a",
+		// Sharing a first token with the prefix is not being inside it.
+		"mcp.v2.inbox", "mcp.v1x.inbox",
+	} {
+		assert.True(t, usableReplySubject(ok, DefaultPrefix), "legitimate inbox %q must be served", ok)
+	}
+	for _, bad := range []string{
+		"", "$JS.API.STREAM.DELETE.x", "$SYS.REQ.SERVER.PING",
+		">", "*", "a.>", "a.*.b", "a..b", ".a", "a.", "a b.c", "a\tb",
+		// Our own wire: a reply here has the gateway reflect frames onto an
+		// endpoint subject the caller may not publish to itself.
+		"mcp.v1", "mcp.v1.req.victim.u1.test.tools.list._", "mcp.v1.anything",
+	} {
+		assert.False(t, usableReplySubject(bad, DefaultPrefix), "unusable reply %q must be refused", bad)
+	}
+	// The prefix that is refused is the one this replica actually serves.
+	assert.True(t, usableReplySubject("mcp.v1.req.acme.u1.test.tools.list._", "acme.mcp"))
+	assert.False(t, usableReplySubject("acme.mcp.req.acme.u1.test.tools.list._", "acme.mcp"))
+}
+
+// Serve validated no prefix at all: EndpointSubject pastes it in unchecked, so
+// a trailing dot built an invalid SUBSCRIBE — and an unrecognised -ERR from
+// the server closes the nats.go connection for good — while a wildcard widened
+// the very subscription the prefix exists to narrow.
+func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
+	nc, _ := natstest.Run(t, nil)
+	for _, prefix := range []string{"mcp.v1.", ".mcp.v1", "mcp..v1", "mcp.>", "mcp.*", "mcp v1"} {
+		_, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		assert.Error(t, err, "prefix %q builds an endpoint subject nothing should serve", prefix)
+	}
+	// Including the empty prefix that means "use DefaultPrefix".
+	for _, prefix := range []string{"", "mcp.v1", "acme.mcp", "a"} {
+		srv, err := Serve(nc, ServerConfig{Prefix: prefix, Servers: []string{"test"}}, nil)
+		require.NoError(t, err, "prefix %q is legitimate", prefix)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		require.NoError(t, srv.Shutdown(ctx))
+		cancel()
+	}
 }

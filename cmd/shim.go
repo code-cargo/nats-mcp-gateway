@@ -45,11 +45,8 @@ func runShim(c *ShimCmd, g *Globals) error {
 		}
 		opts = append(opts, nats.CustomInboxPrefix(c.InboxPrefix))
 	}
-	// The same check the gateway's --subject-prefix gets. Client-side the
-	// failure is milder — a wildcard prefix builds a publish subject NATS
-	// refuses — but it arrives per request, as an opaque publish error on a
-	// process whose whole job is to look like a local MCP server to the client
-	// that spawned it.
+	// NewClient checks this too; checking it here as well is what names the
+	// flag that is wrong, the same way --inbox-prefix does above.
 	if c.SubjectPrefix != "" {
 		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
 			return fmt.Errorf("--subject-prefix: %w", err)

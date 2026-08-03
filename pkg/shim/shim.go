@@ -24,6 +24,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -34,6 +35,12 @@ import (
 )
 
 const maxLineBytes = 16 * 1024 * 1024
+
+// errLineTooLong reports a client line past maxLineBytes. The line has been
+// consumed either way, so the loop can read on: drained to its newline when
+// there was one, or to the end of a stream that stopped mid-line — in which
+// case the next read returns the sticky io.EOF and ends the loop.
+var errLineTooLong = errors.New("shim: client line exceeds the line cap")
 
 // Config configures a shim.
 type Config struct {
@@ -82,34 +89,86 @@ func (s *Shim) Run(ctx context.Context, stdin io.Reader, stdout io.Writer) error
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	sc := bufio.NewScanner(stdin)
-	sc.Buffer(make([]byte, 64*1024), maxLineBytes)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
+	br := bufio.NewReaderSize(stdin, 64*1024)
+	var readErr error
+	for {
+		raw, err := readLine(br, maxLineBytes)
+		if errors.Is(err, errLineTooLong) {
+			// Dropped like any other line we cannot make sense of. There is no
+			// id to answer with — the body it was in never parsed — so the one
+			// request pays for it, which is the whole point: under Scanner the
+			// session's other requests paid too.
+			s.log.Warn("dropping oversize line from client", "err", err, "cap", maxLineBytes)
 			continue
 		}
-		msg, err := jsonrpc.Decode(line)
+		line := bytes.TrimSpace(raw)
+		if len(line) > 0 {
+			msg, derr := jsonrpc.Decode(line)
+			switch {
+			case derr != nil:
+				s.log.Warn("dropping invalid JSON-RPC line from client", "err", derr)
+			case msg.Kind() == jsonrpc.KindRequest:
+				body := make([]byte, len(line))
+				copy(body, line)
+				s.handleRequest(ctx, msg, body)
+			case msg.Kind() == jsonrpc.KindNotification:
+				s.handleNotification(msg)
+			default:
+				// Modern servers never initiate requests, so a client response
+				// has nothing to answer.
+				s.log.Debug("dropping unexpected client message", "kind", "response")
+			}
+		}
 		if err != nil {
-			s.log.Warn("dropping invalid JSON-RPC line from client", "err", err)
-			continue
-		}
-		switch msg.Kind() {
-		case jsonrpc.KindRequest:
-			body := make([]byte, len(line))
-			copy(body, line)
-			s.handleRequest(ctx, msg, body)
-		case jsonrpc.KindNotification:
-			s.handleNotification(msg)
-		default:
-			// Modern servers never initiate requests, so a client response
-			// has nothing to answer.
-			s.log.Debug("dropping unexpected client message", "kind", "response")
+			if !errors.Is(err, io.EOF) {
+				readErr = err
+			}
+			break
 		}
 	}
 	cancel()    // abandon in-flight streams
 	s.wg.Wait() // let pumps finish writing
-	return sc.Err()
+	return readErr
+}
+
+// readLine returns the next line without its terminator. A line past max is
+// drained to its newline and reported as errLineTooLong: bufio.Scanner would
+// instead end the loop for good, and one unreadable line must not take the
+// session's other requests with it.
+func readLine(r *bufio.Reader, max int) ([]byte, error) {
+	var line []byte
+	dropped, n := false, 0
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if err == nil {
+			// ReadSlice reports nil only when it found the delimiter, and the
+			// cap is on the line rather than on its terminator.
+			chunk = chunk[:len(chunk)-1]
+		}
+		n += len(chunk)
+		switch {
+		case dropped:
+			// Past the cap already: read on only to find the newline.
+		case n > max:
+			dropped, line = true, nil
+		default:
+			// ReadSlice hands back the reader's own buffer, so this has to
+			// copy — the next read overwrites it.
+			line = append(line, chunk...)
+		}
+		switch {
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case dropped:
+			// A stream that ends mid-line reports the drop first; the next
+			// call re-reads the sticky io.EOF and ends the loop. The length is
+			// carried along because it is the number whoever is reading the
+			// log wants: the cap on its own never says how far past it we went.
+			return nil, fmt.Errorf("%w (%d bytes)", errLineTooLong, n)
+		default:
+			return line, err
+		}
+	}
 }
 
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
