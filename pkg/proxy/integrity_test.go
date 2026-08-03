@@ -168,7 +168,7 @@ func TestIntegrityMatrix(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			in := inbound(t, tt.subject, tt.hMethod, tt.hName, tt.body)
-			got := Check(in)
+			_, got := Check(in)
 			if tt.wantCode == 0 {
 				assert.Nil(t, got, "expected pass, got %v", got)
 			} else {
@@ -358,7 +358,7 @@ func TestIntegrityRejectsKeySmuggling(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			in := inbound(t, tt.subject, tt.hMethod, tt.hName, rawBody(tt.hMethod, tt.params))
-			got := Check(in)
+			_, got := Check(in)
 			require.NotNil(t, got, "smuggled body was authorized")
 			assert.Equal(t, mcpspec.ErrHeaderMismatch, got.Code)
 		})
@@ -438,7 +438,7 @@ func TestIntegrityRejectsMalformedParams(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			in := inbound(t, tt.subject, tt.method, tt.hName, rawBody(tt.method, tt.params))
-			got := Check(in)
+			_, got := Check(in)
 			require.NotNil(t, got, "expected rejection")
 			assert.Equal(t, tt.wantCode, got.Code)
 		})
@@ -458,7 +458,8 @@ func TestIntegrityLeavesToolArgumentsAlone(t *testing.T) {
 	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call.get_issue", "tools/call", "get_issue",
 		rawBody("tools/call", params))
 
-	assert.Nil(t, Check(in))
+	_, got := Check(in)
+	assert.Nil(t, got)
 }
 
 // TestIntegrityAuthorizesTheBytesItForwards is the invariant the whole check
@@ -505,7 +506,7 @@ func TestIntegrityAuthorizesTheBytesItForwards(t *testing.T) {
 	for _, b := range bodies {
 		t.Run(b.params, func(t *testing.T) {
 			in := inbound(t, b.subject, b.method, b.hName, rawBody(b.method, b.params))
-			if Check(in) != nil {
+			if _, cerr := Check(in); cerr != nil {
 				return // rejected: nothing is forwarded, nothing to prove
 			}
 
@@ -522,12 +523,59 @@ func TestIntegrityAuthorizesTheBytesItForwards(t *testing.T) {
 
 			assert.Equal(t, b.hName, executed,
 				"backend executes %q but Mcp-Name advertised %q", executed, b.hName)
+			// Deliberately NOT wire.SubjectNameToken: this is the invariant,
+			// and an invariant restated by calling the helper that decides it
+			// is an invariant that agrees with any bug in the helper. The
+			// cost of the second copy is that a method gaining a subject
+			// token fails here until someone re-reads this assertion, which
+			// is the review this file is for.
 			wantToken := wire.NameUnset
 			if b.method != mcpspec.MethodResourcesRead {
 				wantToken = wire.NameToken(executed)
 			}
 			assert.Equal(t, wantToken, in.Subject.Name,
 				"backend executes %q, which NATS did not authorize on this subject", executed)
+		})
+	}
+}
+
+// TestCheckAcceptsEverySubjectAConformantClientBuilds is the anti-drift test
+// for the subject's name token, which is decided in two packages that cannot
+// see each other: wire.BuildSubject picks the token a client publishes to, and
+// Check picks the token it will accept. A rule written twice is a rule that
+// eventually disagrees with itself, and the symptom is not an authorization
+// hole but a permanent -32020 on requests where subject, header and body all
+// honestly agree — the caller is told their subject token is wrong and has
+// nothing to correct.
+//
+// Each case here is a request built exactly the way wire.Client builds one,
+// sentinel-encoded header and all, so the two sides are compared through the
+// wire's own construction rather than through a fixture that assumes the
+// answer.
+func TestCheckAcceptsEverySubjectAConformantClientBuilds(t *testing.T) {
+	cases := []struct{ method, name string }{
+		{mcpspec.MethodToolsCall, "get_issue"},
+		{mcpspec.MethodToolsCall, "crème.brûlée"},
+		{mcpspec.MethodToolsCall, "_"},
+		{mcpspec.MethodPromptsGet, "safe"},
+		{mcpspec.MethodResourcesRead, "file:///x/y"},
+		{mcpspec.MethodResourcesRead, "https://example.test/a"},
+		// The URI shape that has no scheme, which nothing in MCP forbids.
+		{mcpspec.MethodResourcesRead, "readme"},
+		{"tools/list", ""},
+		{"resources/templates/list", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.method+" "+c.name, func(t *testing.T) {
+			subj, err := wire.BuildSubject("", "acme", "u1", "gh", c.method, c.name)
+			require.NoError(t, err)
+			in := inbound(t, subj, c.method, "", body(c.method, c.name, true))
+			if c.name != "" {
+				in.Header.Set(wire.HeaderName, mcpspec.EncodeHeaderValue(c.name))
+			}
+			_, cerr := Check(in)
+			assert.Nil(t, cerr,
+				"a conformant client published to %s and the gateway refused it", subj)
 		})
 	}
 }
@@ -539,7 +587,7 @@ func TestIntegrityUnsupportedVersion(t *testing.T) {
 	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.list._", "tools/list", "", b)
 	in.Header.Set(wire.HeaderProtocolVersion, mcpspec.LegacyProtocolVersion)
 
-	got := Check(in)
+	_, got := Check(in)
 	require.NotNil(t, got)
 	assert.Equal(t, mcpspec.ErrUnsupportedProtocolVersion, got.Code)
 	data, ok := got.Data.(map[string]any)
@@ -558,7 +606,8 @@ func TestIntegrityAcceptsSentinelEncodedName(t *testing.T) {
 	require.NotEqual(t, name, encoded, "the fixture must actually be encoded")
 	in.Header.Set(wire.HeaderName, encoded)
 
-	assert.Nil(t, Check(in))
+	_, got := Check(in)
+	assert.Nil(t, got)
 }
 
 func TestIntegrityStillCatchesMismatchUnderEncoding(t *testing.T) {
@@ -568,7 +617,7 @@ func TestIntegrityStillCatchesMismatchUnderEncoding(t *testing.T) {
 	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call._", mcpspec.MethodToolsCall, "", b)
 	in.Header.Set(wire.HeaderName, mcpspec.EncodeHeaderValue("délicieux"))
 
-	got := Check(in)
+	_, got := Check(in)
 	require.NotNil(t, got)
 	assert.Equal(t, mcpspec.ErrHeaderMismatch, got.Code)
 }
@@ -578,7 +627,7 @@ func TestIntegrityRejectsMalformedSentinel(t *testing.T) {
 	in := inbound(t, "mcp.v1.req.acme.u1.gh.tools.call._", mcpspec.MethodToolsCall, "", b)
 	in.Header.Set(wire.HeaderName, "=?base64?not!base64!?=")
 
-	got := Check(in)
+	_, got := Check(in)
 	require.NotNil(t, got)
 	assert.Equal(t, mcpspec.ErrHeaderMismatch, got.Code)
 }

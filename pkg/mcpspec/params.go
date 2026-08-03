@@ -89,6 +89,18 @@ import (
 // MetaField is the params key holding a request's _meta object.
 const MetaField = "_meta"
 
+// NameParam and URIParam are the two params keys that can carry a method's
+// MCP name. WHICH of the two a method uses is not a detail of this package:
+// the subject's name token turns on it, because a URI is a different kind of
+// name from a tool's — see wire.SubjectNameToken. They are named so that rule
+// can be written against this file instead of against a string literal
+// repeated in another package, which is the shape the two sides drifted into
+// the first time.
+const (
+	NameParam = "name"
+	URIParam  = "uri"
+)
+
 // MaxParamsDepth bounds how deep the ambiguity scan will descend. Nesting is
 // caller-controlled and the scan recurses, so it needs a floor under it;
 // 1000 is far past anything a tool schema describes and far short of
@@ -323,9 +335,9 @@ func (p Params) Object(key string) (Params, error) {
 func NameField(method string) string {
 	switch method {
 	case MethodToolsCall, MethodPromptsGet:
-		return "name"
+		return NameParam
 	case MethodResourcesRead:
-		return "uri"
+		return URIParam
 	}
 	return ""
 }

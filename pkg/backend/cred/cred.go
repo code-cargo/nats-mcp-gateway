@@ -73,6 +73,14 @@ func (f ResolveFunc) Resolve(ctx context.Context, tenant, user, server string) (
 	return f(ctx, tenant, user, server)
 }
 
+// ErrIdentityRequired reports credentials asked for per user without a caller
+// identity to ask under. The proxy refuses that on the request path, where it
+// can say so precisely; this sentinel is for the pool factory, which sits
+// below the layer that owns wire error codes and whose failures would
+// otherwise all read as a lost stream. It travels wrapped, so the message
+// keeps naming the server and the reload that caused it.
+var ErrIdentityRequired = errors.New("per-user credentials require a caller identity")
+
 // terminalError marks a resolve failure as authoritative: the resolver
 // reached its source and was told no (unauthorized, unknown user). Retrying
 // will not help, unlike a transport failure (source unreachable), and the

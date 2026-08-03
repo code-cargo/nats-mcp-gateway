@@ -26,6 +26,64 @@ import (
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
 
+// buildCallRequest turns the CLI's flags into the wire request the shim would
+// have sent for the same call: a spec-correct body with the required _meta
+// keys injected, and the name the method's params field carries.
+//
+// It is separate from the send so it can be held to the property that makes
+// this command worth having — that what it publishes is what a real client
+// publishes. A debug tool that cannot reproduce a request the shim sends
+// correctly turns every session into a hunt for a gateway bug that isn't there.
+func buildCallRequest(c *CallCmd) (*wire.Request, error) {
+	// Decode the flag through the same reader the gateway uses on a body,
+	// rather than into a plain map: a map keeps the LAST of two duplicate
+	// keys, so --params '{"name":"a","name":"b"}' would be re-marshalled below
+	// into a well-formed call to "b" — a request the operator did not type,
+	// built by the one tool whose job is to reproduce requests exactly.
+	// DecodeParams refuses it here, at any depth, with the key named.
+	//
+	// It also lands the one --params that unmarshals into a nil map rather
+	// than failing: a JSON null reads as "no params", the way the shim's
+	// injectMeta reads it, so nothing below has a nil map to panic on.
+	params, err := mcpspec.DecodeParams(json.RawMessage(c.Params))
+	if err != nil {
+		return nil, fmt.Errorf("--params: %w", err)
+	}
+	var meta map[string]json.RawMessage
+	if raw, ok := params["_meta"]; ok {
+		_ = json.Unmarshal(raw, &meta)
+	}
+	if meta == nil {
+		meta = map[string]json.RawMessage{}
+	}
+	ver, _ := json.Marshal(mcpspec.ProtocolVersion)
+	meta[mcpspec.MetaProtocolVersion] = ver
+	metaRaw, _ := json.Marshal(meta)
+	params["_meta"] = metaRaw
+	paramsRaw, _ := json.Marshal(params)
+
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": "cli-1", "method": c.Method, "params": json.RawMessage(paramsRaw),
+	})
+
+	// Read the name through the same accessor the shim uses, so the CLI can
+	// never derive it from a field the method does not name. Reading it here
+	// also catches the case-colliding sibling ("name" beside "Name") locally,
+	// with the field named, rather than as a -32020 from the gateway.
+	name, _, err := params.Name(c.Method)
+	if err != nil {
+		return nil, fmt.Errorf("--params: %w", err)
+	}
+
+	return &wire.Request{
+		Server:          c.Server,
+		Method:          c.Method,
+		Name:            name,
+		ProtocolVersion: mcpspec.ProtocolVersion,
+		Body:            body,
+	}, nil
+}
+
 func runCall(c *CallCmd, g *Globals) error {
 	opts := []nats.Option{nats.Name("natsmcp-call")}
 	if c.Creds != "" {
@@ -50,42 +108,9 @@ func runCall(c *CallCmd, g *Globals) error {
 	}
 	defer nc.Close()
 
-	// Build a spec-correct request: inject the required _meta keys the way
-	// the shim would.
-	var params map[string]json.RawMessage
-	if err := json.Unmarshal([]byte(c.Params), &params); err != nil {
-		return fmt.Errorf("--params is not a JSON object: %w", err)
-	}
-	if params == nil {
-		// A JSON null decodes into a map cleanly and leaves it nil, so it is
-		// the one non-object --params the check above lets past. Read as "no
-		// params", the way the shim's injectMeta reads it.
-		params = map[string]json.RawMessage{}
-	}
-	var meta map[string]json.RawMessage
-	if raw, ok := params["_meta"]; ok {
-		_ = json.Unmarshal(raw, &meta)
-	}
-	if meta == nil {
-		meta = map[string]json.RawMessage{}
-	}
-	ver, _ := json.Marshal(mcpspec.ProtocolVersion)
-	meta[mcpspec.MetaProtocolVersion] = ver
-	metaRaw, _ := json.Marshal(meta)
-	params["_meta"] = metaRaw
-	paramsRaw, _ := json.Marshal(params)
-
-	body, _ := json.Marshal(map[string]any{
-		"jsonrpc": "2.0", "id": "cli-1", "method": c.Method, "params": json.RawMessage(paramsRaw),
-	})
-
-	name := ""
-	var s string
-	if raw, ok := params["name"]; ok && json.Unmarshal(raw, &s) == nil {
-		name = s
-	}
-	if raw, ok := params["uri"]; ok && json.Unmarshal(raw, &s) == nil {
-		name = s
+	req, err := buildCallRequest(c)
+	if err != nil {
+		return err
 	}
 
 	cfg := wire.ClientConfig{Prefix: c.SubjectPrefix, Tenant: c.Tenant, User: c.User}
@@ -100,13 +125,7 @@ func runCall(c *CallCmd, g *Globals) error {
 	if err != nil {
 		return err
 	}
-	stream, err := wc.Do(context.Background(), &wire.Request{
-		Server:          c.Server,
-		Method:          c.Method,
-		Name:            name,
-		ProtocolVersion: mcpspec.ProtocolVersion,
-		Body:            body,
-	})
+	stream, err := wc.Do(context.Background(), req)
 	if err != nil {
 		return err
 	}

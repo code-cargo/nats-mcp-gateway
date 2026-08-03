@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -42,10 +43,12 @@ func decodeMsg(t *testing.T, body []byte) *jsonrpc.Message {
 	return m
 }
 
-// credStack is stack() plus a per-user credential resolver wired the way
-// cmd/gateway.go does it: the proxy resolves for the pool key, the factory
-// injects the resolved env over the fakemcp base env.
-func credStack(t *testing.T, resolver *cred.CachedResolver) *nats.Conn {
+// credStack is stack() plus a credential resolver wired the way cmd/gateway.go
+// does it: the proxy resolves for the pool key, the factory injects the
+// resolved env over the fakemcp base env. perUser is the grain the server's
+// auth mode implies — the two grains take different paths through the proxy,
+// so it is a parameter rather than a constant.
+func credStack(t *testing.T, resolver *cred.CachedResolver, perUser bool) *nats.Conn {
 	t.Helper()
 	nc, _ := natstest.Run(t, nil)
 
@@ -67,7 +70,7 @@ func credStack(t *testing.T, resolver *cred.CachedResolver) *nats.Conn {
 	t.Cleanup(pool.Shutdown)
 
 	px := New(pool, nil)
-	px.Creds = func(string) (*cred.CachedResolver, bool) { return resolver, true }
+	px.Creds = func(string) (*cred.CachedResolver, bool) { return resolver, perUser }
 	ws, err := wire.Serve(nc, wire.ServerConfig{
 		Servers:   []string{"fake"},
 		KeepAlive: 50 * time.Millisecond,
@@ -106,7 +109,7 @@ func TestE2EPerUserCredentials(t *testing.T) {
 			return &cred.Credentials{Env: map[string]string{"TOKEN": "tok-" + user}}, nil
 		},
 	), 0)
-	nc := credStack(t, resolver)
+	nc := credStack(t, resolver, true)
 
 	pidA, tokA := envCall(t, nc, "alice", "TOKEN")
 	pidB, tokB := envCall(t, nc, "bob", "TOKEN")
@@ -119,6 +122,83 @@ func TestE2EPerUserCredentials(t *testing.T) {
 	assert.Equal(t, tokA, tokA2)
 }
 
+// recordingResolver hands out a per-user token and remembers every identity it
+// was asked to resolve, so a test can assert on resolutions that must never
+// happen at all — an error code alone cannot distinguish "refused" from
+// "resolved and then failed for some other reason".
+func recordingResolver(t *testing.T) (*cred.CachedResolver, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var asked []string
+	r := cred.Cached(cred.ResolveFunc(
+		func(_ context.Context, _, user, _ string) (*cred.Credentials, error) {
+			mu.Lock()
+			asked = append(asked, user)
+			mu.Unlock()
+			return &cred.Credentials{Env: map[string]string{"TOKEN": "tok-" + user}}, nil
+		},
+	), 0)
+	return r, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), asked...)
+	}
+}
+
+// TestE2EPerUserServerRefusesUnattributedCaller is the fail-closed rule on the
+// per-user credential grain.
+//
+// "_" is the placeholder for "this deployment has no per-user auth". It is not
+// an identity, and it is the one {user} token every caller in a tenant can
+// reach: a deployment that grants mcp.v1.req.{tenant}.> rather than
+// …{tenant}.{user}.> makes the token forgeable outright. Because {user} drives
+// credential SELECTION and the pool's CredSet, resolving it on a per-user
+// server does not merely mislabel the request — it hands every unattributed
+// caller in the tenant one shared credential and one shared backend process,
+// on precisely the servers configured so that must not happen.
+//
+// The subject cannot support the grain the server asked for, so the request is
+// refused before any credential is resolved. That turns a silent
+// credential-sharing misconfiguration into a legible error on the first
+// request.
+func TestE2EPerUserServerRefusesUnattributedCaller(t *testing.T) {
+	resolver, asked := recordingResolver(t)
+	nc := credStack(t, resolver, true)
+
+	wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: "acme", Inactivity: 5 * time.Second})
+	require.NoError(t, err)
+	frames := doCollect(t, wc, mcpRequest("1", "tools/call",
+		map[string]any{"name": "env", "arguments": map[string]any{"name": "TOKEN"}}))
+	require.NotEmpty(t, frames)
+
+	last := frames[len(frames)-1]
+	require.Equal(t, wire.FrameErr, last.Kind,
+		"an unattributed caller reached a per-user backend: %+v", last)
+	m := decodeMsg(t, last.Body)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, wire.ErrCodeCredentialUnavailable, m.Error.Code)
+	assert.Contains(t, m.Error.Message, "do not retry",
+		"a forgeable subject token will not become an identity on the next attempt")
+
+	assert.NotContains(t, asked(), wire.UserUnattributed,
+		"the placeholder must never be resolved as though it were an identity")
+}
+
+// TestE2ESharedServerStillServesUnattributedCallers is the other half of the
+// rule above: "_" is the DOCUMENTED token for a deployment without per-user
+// auth, so a server whose credentials are shared per tenant must keep serving
+// it. Refusing the placeholder outright would break every deployment that has
+// no per-user NATS auth to begin with.
+func TestE2ESharedServerStillServesUnattributedCallers(t *testing.T) {
+	resolver, asked := recordingResolver(t)
+	nc := credStack(t, resolver, false)
+
+	_, tok := envCall(t, nc, "", "TOKEN")
+	assert.Equal(t, "tok-"+wire.UserUnattributed, tok)
+	assert.Contains(t, asked(), wire.UserUnattributed,
+		"a shared server resolves one credential for the whole tenant, under the placeholder")
+}
+
 func TestE2ECredentialFailureMapsToWireError(t *testing.T) {
 	boom := errors.New("controller unreachable")
 	resolver := cred.Cached(cred.ResolveFunc(
@@ -129,7 +209,7 @@ func TestE2ECredentialFailureMapsToWireError(t *testing.T) {
 			return nil, boom
 		},
 	), 0)
-	nc := credStack(t, resolver)
+	nc := credStack(t, resolver, true)
 
 	errFrameFor := func(user string) *wire.Frame {
 		wc, err := wire.NewClient(nc, wire.ClientConfig{Tenant: "acme", User: user, Inactivity: 5 * time.Second})

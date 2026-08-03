@@ -267,7 +267,8 @@ func TestCheckReadableMetaCoversProgressToken(t *testing.T) {
 	for _, forged := range []string{"ProgressToken", "PROGRESSTOKEN", "progressToken"} {
 		p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
 			`{"name":"t","_meta":{%q:%q,%q:"gt7"}}`,
-			MetaProtocolVersion, ProtocolVersion, forged)))
+			MetaProtocolVersion, ProtocolVersion, forged,
+		)))
 		require.NoError(t, err, "the collision is inside _meta, so the decode itself allows it")
 
 		err = p.CheckReadableMeta()
@@ -287,7 +288,8 @@ func TestCheckReadableMetaCoversProgressToken(t *testing.T) {
 func TestCheckReadableMetaLeavesUndeclaredKeysAlone(t *testing.T) {
 	p, err := DecodeParams(json.RawMessage(fmt.Sprintf(
 		`{"name":"t","_meta":{%q:%q,"com.acme/trace":"x","com.acme/Trace":"y"}}`,
-		MetaProtocolVersion, ProtocolVersion)))
+		MetaProtocolVersion, ProtocolVersion,
+	)))
 	require.NoError(t, err)
 	assert.NoError(t, p.CheckReadableMeta())
 }

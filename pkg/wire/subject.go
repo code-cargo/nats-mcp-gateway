@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 // Subject grammar:
@@ -41,7 +43,8 @@ import (
 //
 // The name token is params.name for named methods; the literal "_" for
 // everything else, and as the fallback for names that are not subject-token
-// safe. See NameToken for the two rules that keep the "_" fallback sound.
+// safe. See NameToken for the two rules that keep the "_" fallback sound, and
+// SubjectNameToken for which methods are named on the subject at all.
 
 // DefaultPrefix is the default subject prefix.
 const DefaultPrefix = "mcp.v1"
@@ -103,6 +106,37 @@ func NameToken(name string) string {
 	return NameUnset
 }
 
+// SubjectNameToken maps a method and its raw MCP name to the subject's name
+// token. It is the only copy of that rule: BuildSubject picks the token a
+// conformant client publishes to and pkg/proxy.Check picks the token it will
+// accept, in packages that cannot see each other drift apart. When they did,
+// the symptom was not a hole but a permanent -32020 on requests where subject,
+// header and body all honestly agreed.
+//
+// Which methods are named at all is mcpspec.NameField's answer, so a method
+// gaining a name there gains its subject token on both sides at once — rather
+// than a Mcp-Name check plus a silent seat in the unnamed "_" slot, which is a
+// per-name ACL that looks enforced and is not.
+//
+// A URI-named method is the deliberate exception, and it is keyed off the
+// FIELD rather than off resources/read by name, because the reason is a
+// property of URIs and not of that one method: for URIs the "_" fallback is
+// the rule rather than the exception — every scheme-bearing URI contains a
+// ":" and is not token-safe, so any grant broad enough to cover
+// "file:///etc/passwd" already covers everything a per-URI token could have
+// carved out. Deriving a token from the token-safe minority would make
+// per-URI grants look expressible while changing nothing about what they
+// authorize. Naming the method instead would hand that shape to the next
+// uri-carrying method (resources/subscribe is the obvious one) silently, with
+// both sides agreeing and no test to notice. URI-named methods are named in
+// the header and the body, and authorized on the subject as one method.
+func SubjectNameToken(method, name string) string {
+	if field := mcpspec.NameField(method); field == "" || field == mcpspec.URIParam {
+		return NameUnset
+	}
+	return NameToken(name)
+}
+
 // BuildSubject constructs the request subject. user is the caller's identity
 // token ("_" / UserUnattributed when there is no per-user auth); method is the
 // MCP form with slashes ("tools/call"); name is the raw MCP name ("" for
@@ -132,10 +166,7 @@ func BuildSubject(prefix, tenant, user, server, method, name string) (string, er
 			return "", fmt.Errorf("wire: method %q has non-token-safe segment %q", method, seg)
 		}
 	}
-	nameTok := NameUnset
-	if name != "" {
-		nameTok = NameToken(name)
-	}
+	nameTok := SubjectNameToken(method, name)
 	return prefix + ".req." + tenant + "." + user + "." + server + "." + strings.Join(segs, ".") + "." + nameTok, nil
 }
 

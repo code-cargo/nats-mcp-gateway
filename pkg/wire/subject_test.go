@@ -61,6 +61,29 @@ func TestBuildSubject(t *testing.T) {
 	}
 }
 
+// TestBuildSubjectKeepsResourceURIsOffTheSubject pins the one method whose
+// name never reaches the subject.
+//
+// "A URI is never token-safe" is a property of the URIs seen so far, not of
+// the grammar: MCP does not require a scheme, and a server is free to hand out
+// a relative reference like "readme". Deriving the token from the URI anyway
+// puts such a request on a subject pkg/proxy.Check refuses by rule, and the
+// caller gets a -32020 naming a subject-token rule nobody wrote while subject,
+// header and body all honestly agree.
+//
+// The token is withheld rather than the check widened because per-URI grants
+// cannot be written honestly: the "_" fallback is the RULE for URIs, not the
+// exception, so any grant that covers "file:///…" already covers everything a
+// per-URI token could have carved out.
+func TestBuildSubjectKeepsResourceURIsOffTheSubject(t *testing.T) {
+	for _, uri := range []string{"readme", "config", "file:///x", "https://a/b"} {
+		got, err := BuildSubject("", "acme", "u1", "gh", "resources/read", uri)
+		require.NoError(t, err)
+		assert.Equal(t, "mcp.v1.req.acme.u1.gh.resources.read."+NameUnset, got,
+			"uri %q must not reach the subject's name token", uri)
+	}
+}
+
 func TestParseSubjectRoundTrip(t *testing.T) {
 	methods := []struct {
 		method string

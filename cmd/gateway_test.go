@@ -966,8 +966,17 @@ func TestGatewayInlineConfigServesTenantScoped(t *testing.T) {
 
 func waitServing(t *testing.T, a *assembled, serverName string) {
 	t.Helper()
+	waitServingAs(t, a, "", serverName)
+}
+
+// waitServingAs is waitServing with a caller identity, which a server whose
+// credentials are per-user requires: the gateway refuses the unattributed "_"
+// token there rather than resolve a credential for it, so an anonymous probe
+// would wait out the timeout against a server that is serving perfectly well.
+func waitServingAs(t *testing.T, a *assembled, user, serverName string) {
+	t.Helper()
 	require.Eventually(t, func() bool {
-		return a.call(t, serverName, "echo").Kind == wire.FrameEnd
+		return a.callAs(t, user, serverName, "echo", nil).Kind == wire.FrameEnd
 	}, 8*time.Second, 100*time.Millisecond, "server %q never began serving", serverName)
 }
 
@@ -1032,7 +1041,7 @@ echo "{\"env\":{\"TOKEN\":\"tok-$NATSMCP_CRED_USER\"},\"expiresAt\":\"2100-01-01
 			return err
 		})
 	}()
-	waitServing(t, a, "a")
+	waitServingAs(t, a, "alice", "a")
 
 	envOf := func(user, name string) (float64, string) {
 		f := a.callAs(t, user, "a", "env", map[string]any{"name": name})
@@ -1201,4 +1210,47 @@ func TestFileSourceGuardAllowsSettingsThatDropNothing(t *testing.T) {
 			assert.NoError(t, err, "a flag that changes nothing must not refuse the boot")
 		})
 	}
+}
+
+// TestBuildBackendRefusesAPerUserServerKeyedWithoutAUser closes the factory
+// half of the unattributed-credential refusal.
+//
+// proxy.Check refuses an unattributed caller on a per-user server, but the
+// pool factory runs later and re-reads the config, so a reload that flips a
+// server shared -> per-user mid-request reaches here with a key minted under
+// the old mode. The generation comparison further down does reject it today,
+// because a resolver-less key carries CredVersion 0 and globalGen starts at
+// 1 — but that is an accident of numbering, and it also rejects only AFTER
+// the resolver has been asked for "_", which runs an exec helper's side
+// effects under an identity nothing will accept.
+func TestBuildBackendRefusesAPerUserServerKeyedWithoutAUser(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "helper-ran")
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\ntouch \"$MARKER\"\necho '{\"headers\":{\"a\":\"b\"}}'\n"), 0o755))
+
+	resolver := cred.Cached(&cred.Exec{
+		Command: helper, Env: map[string]string{"MARKER": marker}, Timeout: 10 * time.Second,
+	}, 0)
+
+	srv := config.Server{
+		Transport: "stdio", Command: "true",
+		Auth: &config.Auth{Mode: "exec", Command: helper, Scope: "user"},
+	}
+	require.True(t, srv.Auth.PerUser(), "fixture must be a per-user server")
+
+	// CredSet empty: the shape a pre-reload key has.
+	_, err := buildBackend(
+		backend.Key{Server: "aws", Tenant: "acme"},
+		srv, resolver, slog.New(slog.NewTextHandler(io.Discard, nil)),
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "per user")
+	assert.ErrorIs(t, err, cred.ErrIdentityRequired,
+		"the proxy maps this to -32014 by the sentinel, not by reading the message")
+	_, statErr := os.Stat(marker)
+	assert.True(t, os.IsNotExist(statErr),
+		"the resolver must not be asked for the placeholder identity at all")
 }
