@@ -473,13 +473,15 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		if err != nil {
 			// The factory's error is the pool's error, which the proxy hands
 			// the caller: the same detail suppression the request path applies
-			// (cred.CallerMessage) is owed here. The wording carries no retry
-			// advice because this one arrives as -32010, whose contract already
-			// tells the client to re-issue.
+			// is owed here, and through the same function so the two cannot
+			// drift. CallerMessage's retry advice earns its place on this path
+			// rather than duplicating the error code's: a pool failure arrives
+			// as -32010, whose contract tells the client to re-issue, and a
+			// terminal credential refusal is exactly the case that has to
+			// contradict it.
 			ref := cred.FailureRef()
 			blog.Warn("credential resolution failed while spawning backend", "err", err, "ref", ref)
-			return nil, fmt.Errorf("backend credentials unavailable for %s/%s (gateway ref %s)",
-				key.Tenant, key.Server, ref)
+			return nil, fmt.Errorf("%s/%s: %s", key.Tenant, key.Server, cred.CallerMessage(err, ref))
 		}
 		if gen != key.CredVersion {
 			// The credentials rotated between the proxy's resolve and ours:

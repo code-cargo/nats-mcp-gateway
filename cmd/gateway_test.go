@@ -924,6 +924,10 @@ func TestBuildBackendDoesNotEchoTheResolverDetail(t *testing.T) {
 	assert.NotContains(t, err.Error(), "u1.jwt", "the resolver's error text must not travel to the caller")
 	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD")
 	assert.Contains(t, err.Error(), "gateway ref ")
+	// A pool failure reaches the client as -32010, which means "re-issue". A
+	// refusal that re-issuing cannot fix has to say so, or the contract of the
+	// code the caller sees is the only advice it gets.
+	assert.Contains(t, err.Error(), "do not retry", "an authoritative refusal must survive the suppression")
 }
 
 // A server removed from config must not leave its resolver (and cached
