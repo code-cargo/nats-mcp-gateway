@@ -1028,6 +1028,44 @@ func TestRedirectCannotCarryTheCredentialAway(t *testing.T) {
 	}
 }
 
+// A client is injected for the TRANSPORT — a proxy, a custom TLS config, a
+// test hook — and nothing about that says the caller meant to opt out of
+// redirect policy. Guarding only the nil case left the protection on a
+// default nobody had to keep: the first caller to pass a client for an
+// unrelated reason would silently get Go's browser rules back, carrying this
+// backend's injected Authorization wherever a hop pointed.
+func TestInjectedClientStillRefusesUnsafeRedirects(t *testing.T) {
+	var stolen atomic.Int32
+	thief := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" {
+			stolen.Add(1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	}))
+	t.Cleanup(thief.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, thief.URL+"/steal", http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	caller := &http.Client{} // no CheckRedirect: Go's default would follow
+	b := &HTTPBackend{
+		URL:     redirector.URL,
+		Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"},
+		Client:  caller,
+	}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	_, _ = m.Call(context.Background(), jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	assert.Equal(t, int32(0), stolen.Load(), "the credential reached the redirect target")
+	assert.Nil(t, caller.CheckRedirect, "the caller's own client was mutated instead of copied")
+}
+
 func TestRefuseUnsafeRedirect(t *testing.T) {
 	req := func(u string) *http.Request {
 		r, err := http.NewRequest(http.MethodPost, u, nil)

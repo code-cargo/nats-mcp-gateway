@@ -78,6 +78,15 @@ func (b *HTTPBackend) Connect(ctx context.Context) (Conn, error) {
 	if client == nil {
 		// Timeout 0: streams are long-lived; per-request ctx bounds them.
 		client = &http.Client{Timeout: 0, CheckRedirect: RefuseUnsafeRedirect}
+	} else if client.CheckRedirect == nil {
+		// An injected client is for the transport (a proxy, a custom TLS
+		// config), never for redirect policy — and Go's default policy would
+		// carry this backend's injected Authorization header off to whatever
+		// the hop names. Copied rather than mutated: the client belongs to
+		// whoever passed it in.
+		withPolicy := *client
+		withPolicy.CheckRedirect = RefuseUnsafeRedirect
+		client = &withPolicy
 	}
 	c := &httpConn{
 		backend: b,
