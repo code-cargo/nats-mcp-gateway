@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nats "github.com/nats-io/nats.go"
@@ -52,6 +53,18 @@ const (
 
 	// claimOpTimeout bounds one store operation regardless of caller ctx.
 	claimOpTimeout = 30 * time.Second
+
+	// claimEagerDeleteTimeout bounds only the cleanup delete at the end of a
+	// Fetch, which the caller is waiting on with the body already in hand.
+	//
+	// It is separate from claimOpTimeout, and short, because the documented
+	// read-only client grant cannot delete: the delete is a publish, and
+	// nats.go hands a publish permissions-violation to the async error handler
+	// WITHOUT cancelling the request waiting on a reply that will now never
+	// come. So the refusal is indistinguishable from silence and costs the
+	// full budget. Under claimOpTimeout that was a 30s stall added to every
+	// claimed response in the deployment the README recommends.
+	claimEagerDeleteTimeout = 2 * time.Second
 )
 
 // DefaultClaimMaxAge and DefaultClaimMaxBytes are what a claim bucket gets for
@@ -104,6 +117,15 @@ type ObjectClaims struct {
 
 	mu      sync.Mutex
 	buckets map[string]jetstream.ObjectStore // tenant -> handle (Put side)
+
+	// noEagerDelete latches once a cleanup delete has failed, so the cost
+	// above is paid once per process rather than once per claimed response.
+	// A delete that failed is either refused — the documented read-only grant,
+	// which is a permanent property of this identity — or the store is
+	// unhealthy; the next attempt costs the same and achieves the same
+	// nothing. Never unlatched, because the bucket TTL is the backstop by
+	// design and the eager delete is an optimization on top of it.
+	noEagerDelete atomic.Bool
 }
 
 // Put implements ClaimStore. It creates the tenant's bucket on first use.
@@ -225,7 +247,13 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 		return nil, fmt.Errorf("wire: claim exceeds the %d byte limit", claimMaxBody)
 	}
 	// Eager cleanup; TTL is the backstop when this is denied or we die here.
-	_ = obs.Delete(ctx, id)
+	if !o.noEagerDelete.Load() {
+		dctx, dcancel := context.WithTimeout(ctx, claimEagerDeleteTimeout)
+		if err := obs.Delete(dctx, id); err != nil {
+			o.noEagerDelete.Store(true)
+		}
+		dcancel()
+	}
 	return body, nil
 }
 

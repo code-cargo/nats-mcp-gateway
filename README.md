@@ -110,9 +110,11 @@ it: those subjects are the bucket stream's *ingest*, so it is write access
 that can read nothing. A client holding it fails its first fetch on
 `$JS.API.STREAM.INFO.…` — and can meanwhile publish a rollup metadata
 message over `$O.MCP_CLAIMS_acme.M.{base64url(claim-id)}`, a subject
-derivable from a claim id alone, turning a co-tenant's in-flight fetch into
-a digest mismatch; and can fill that tenant's bucket to `maxBytes` with
-chunk traffic nobody asked for.
+derivable from a claim id alone. That substitution is SILENT rather than a
+digest mismatch: a rollup declaring size 0 makes the victim's fetch return an
+empty body and no error at all, because the read ends before the digest is
+ever compared. It can also fill that tenant's bucket to `maxBytes` with chunk
+traffic nobody asked for.
 
 The gateway's own identity needs the write side. `$JS.API.>` would cover it
 and grants far too much — every other tenant's bucket, and `STREAM.DELETE`
@@ -130,6 +132,11 @@ publish: [
 ]
 ```
 
+The two blocks are disjoint, and neither is a superset of the other: the
+gateway cannot READ a claim it wrote, since reading chunks means running a
+consumer and only the client grant may create one. That is the intended split
+— the gateway only ever puts and deletes.
+
 Both blocks are per tenant and there is no shortening them: NATS wildcards
 match whole tokens, so `OBJ_MCP_CLAIMS_*` is a literal token that matches no
 bucket at all. A scoped instance has one tenant and this is exact; a central
@@ -140,9 +147,13 @@ a metadata write plus `$JS.API.STREAM.PURGE.…`, and that purge would equally
 let any client wipe the tenant's live claims. So the delete is best-effort
 by design — objects live until the bucket TTL (`maxAge`, default 5m) reaps
 them, which is the same reason a client that dies mid-fetch can re-issue and
-still succeed. The fetch itself is unaffected; the client's NATS library
-notes the refused delete on stderr, one line per claimed response, which is
-expected under a read-only grant rather than a fault. Keep `maxAge` short
+still succeed. The fetch itself still returns the body; the client's NATS
+library notes the refused delete on stderr, once, which is expected under a
+read-only grant rather than a fault. A refused publish is reported to that
+handler without ending the request that provoked it, so the delete is bounded
+separately from the fetch and stops being attempted after the first refusal —
+otherwise every claimed response would wait out the full store timeout with
+the body already in hand. Keep `maxAge` short
 where you leave the delete ungranted, and size `maxBytes` (default 1GiB, per
 tenant) for a whole TTL window of claims; single objects cap at 64MiB. Every
 failure degrades to the status quo: store unreachable at put time →
