@@ -233,6 +233,13 @@ func TestAllowPlaintextOptsOutPerServer(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, cfg.Servers["s"].AllowPlaintext)
 
+	// The flag reaches auth.tokenUrl and not only url. Asserted on a server
+	// with no url of its own, because the case above passes either way — a
+	// tokenUrl nothing checks looks exactly like a tokenUrl the flag licensed.
+	_, err = Parse([]byte(`{"servers":{"s":{"command":"x","allowPlaintext":true,
+		"auth":{"mode":"oauth-client-credentials","tokenUrl":"http://idp.svc/t","clientId":"c","clientSecret":"sec"}}}}`))
+	require.NoError(t, err)
+
 	// It licenses plaintext for the one server that declares it, and says
 	// nothing about any other.
 	_, err = Parse([]byte(`{"servers":{
