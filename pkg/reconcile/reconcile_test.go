@@ -17,8 +17,10 @@ package reconcile
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -167,6 +169,86 @@ func (c *logCapture) warns() []string {
 	return out
 }
 
+// warnsAbout narrows to the warnings whose line mentions sub, so a test about
+// one warning is not disturbed by another the same apply emits.
+func (c *logCapture) warnsAbout(sub string) []string {
+	var out []string
+	for _, line := range c.warns() {
+		if strings.Contains(line, sub) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// evictCall is one thing an apply asked of the pool. windowed separates the
+// rollback's bounded eviction from the unfiltered one an adopted revision does.
+type evictCall struct {
+	server   string
+	windowed bool
+}
+
+// recordingPool is a Pool that only remembers what it was asked to do. A live
+// pool answers "did this apply evict anything?" only through side effects —
+// a respawned pid, a killed call — which cannot tell an eviction that matched
+// nothing from one that never happened.
+type recordingPool struct {
+	mu     sync.Mutex
+	got    []evictCall
+	onCall func()
+}
+
+func (p *recordingPool) EvictServer(server string) {
+	p.record(evictCall{server: server})
+}
+
+func (p *recordingPool) EvictServerSince(server string, _ time.Time) {
+	p.record(evictCall{server: server, windowed: true})
+}
+
+func (p *recordingPool) record(c evictCall) {
+	p.mu.Lock()
+	p.got = append(p.got, c)
+	hook := p.onCall
+	p.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+func (p *recordingPool) calls() []evictCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]evictCall(nil), p.got...)
+}
+
+func (p *recordingPool) reset() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.got = nil
+}
+
+// newRecordingStack is newStack without the backends: a real wire server,
+// because SetServers is what an apply succeeds or fails at, and a pool that
+// records rather than spawns. No request is issued against it.
+func newRecordingStack(t *testing.T, log *slog.Logger) (*Reconciler, *recordingPool) {
+	t.Helper()
+	nc, _ := natstest.Run(t, nil)
+	pool := backend.NewPool(backend.PoolConfig{}, func(backend.Key) (backend.Backend, error) {
+		return nil, errors.New("this stack serves no requests")
+	}, nil)
+	t.Cleanup(pool.Shutdown)
+	ws, err := wire.Serve(nc, wire.ServerConfig{}, proxy.New(pool, nil).Handler())
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = ws.Shutdown(ctx)
+	})
+	rp := &recordingPool{}
+	return New(ws, rp, log), rp
+}
+
 func (st *stack) call(t *testing.T, tenant, serverName, tool string) wire.Frame {
 	t.Helper()
 	c, err := wire.NewClient(st.nc, wire.ClientConfig{Tenant: tenant, Inactivity: 3 * time.Second})
@@ -189,6 +271,40 @@ func (st *stack) call(t *testing.T, tenant, serverName, tool string) wire.Frame 
 		last = f
 	}
 	return last
+}
+
+// stream issues a call and hands back its frames without waiting for them, so a
+// test can hold a request open across a reload and see what the reload does to
+// it. The inactivity window is long: only the gateway should be able to end
+// this stream.
+func (st *stack) stream(t *testing.T, tenant, serverName, tool string) <-chan wire.Frame {
+	t.Helper()
+	c, err := wire.NewClient(st.nc, wire.ClientConfig{Tenant: tenant, Inactivity: 30 * time.Second})
+	require.NoError(t, err)
+	params, _ := json.Marshal(map[string]any{
+		"name": tool, "arguments": map[string]any{},
+		"_meta": map[string]any{mcpspec.MetaProtocolVersion: mcpspec.ProtocolVersion},
+	})
+	body, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": "1", "method": "tools/call",
+		"params": json.RawMessage(params),
+	})
+	s, err := c.Do(context.Background(), &wire.Request{
+		Server: serverName, Method: "tools/call", Name: tool,
+		ProtocolVersion: mcpspec.ProtocolVersion, Body: body,
+	})
+	require.NoError(t, err)
+	out := make(chan wire.Frame, 8)
+	go func() {
+		defer close(out)
+		for f := range s.C {
+			out <- f
+		}
+	}()
+	// The request has to be AT the backend before a reload can be said to have
+	// spared it; the wedge tool never answers, so there is no frame to wait on.
+	time.Sleep(250 * time.Millisecond)
+	return out
 }
 
 func pidOf(t *testing.T, f wire.Frame) float64 {
@@ -253,10 +369,10 @@ func TestApplyUnchangedIsNoop(t *testing.T) {
 }
 
 // Editing the file's nats block and reloading changes nothing: the connection
-// and the wire's scope were fixed before the Reconciler existed. Today that is
-// also SILENT — the diff covers servers only, so an operator who drops
-// nats.tenant and HUPs sees "config unchanged" while the gateway goes on
-// serving every tenant.
+// and the wire's scope were fixed before the Reconciler existed. The warning is
+// the only signal there is — the diff covers servers only, so an operator who
+// drops nats.tenant and HUPs otherwise sees "config unchanged" while the
+// gateway goes on serving every tenant.
 func TestApplyWarnsWhenNatsBlockDriftsFromBoot(t *testing.T) {
 	logs := &logCapture{}
 	st := newStack(t, slog.New(logs))
@@ -372,6 +488,188 @@ func TestApplyRollbackKeepsWhatThePreviousConfigOwns(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotEqual(t, pidA, pidOf(t, st.call(t, "acme", "a", "echo")),
 		"a changed server must respawn once its revision really is live")
+}
+
+// A nil revision is the one the package doc invites an embedder to produce:
+// pkg/configsource advertises a hand-written fetch as an extension point, and
+// (nil, nil) is what one returns to empty the gateway. It has to reconcile like
+// any other revision — and leave Current dereferenceable, because the pool
+// factory reaches through it on every spawn.
+func TestApplyNilRevisionRemovesEveryServer(t *testing.T) {
+	st := newStack(t, nil)
+
+	_, err := st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+	require.Equal(t, wire.FrameEnd, st.call(t, "acme", "a", "echo").Kind)
+
+	d, err := st.rec.Apply(nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, d.Removed, "a nil revision removes every server")
+
+	cur := st.rec.Current()
+	require.NotNil(t, cur, "the pool factory dereferences whatever Current returns")
+	assert.Empty(t, cur.ServerNames())
+
+	f := st.call(t, "acme", "a", "echo")
+	require.NotNil(t, f.Err)
+	assert.Equal(t, wire.ErrCodeNoGateway, f.Err.Code, "the removed server stops answering")
+
+	// And the gateway reconciles back out of it.
+	_, err = st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+	assert.Equal(t, wire.FrameEnd, st.call(t, "acme", "a", "echo").Kind)
+}
+
+// A rejected revision must not reach into calls the previous config is serving
+// right now. The rollback drops what the revision could have started, and a
+// backend that predates it started under the definition that is live again —
+// so a call on it is doing exactly what the operator asked for, and a revision
+// that never took effect has no business ending it.
+func TestApplyRollbackLeavesInFlightWorkAlone(t *testing.T) {
+	st := newStack(t, nil)
+
+	_, err := st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+	pidA := pidOf(t, st.call(t, "acme", "a", "echo"))
+
+	// wedge never answers, so the only thing that can end this stream early is
+	// the gateway. Keepalives hold it open otherwise.
+	inflight := st.stream(t, "acme", "a", "wedge")
+
+	// A revision that redefines a — and that the wire refuses.
+	_, err = st.rec.Apply(cfg(map[string]config.Server{
+		"a":        fakeSrv(map[string]string{"EXTRA": "1"}),
+		"bad name": fakeSrv(nil),
+	}))
+	require.Error(t, err)
+
+	select {
+	case f := <-inflight:
+		t.Fatalf("a rejected revision ended a call the live config was serving: kind=%v err=%+v", f.Kind, f.Err)
+	case <-time.After(750 * time.Millisecond):
+	}
+	assert.Equal(t, pidA, pidOf(t, st.call(t, "acme", "a", "echo")),
+		"and the backend serving it is the same one")
+}
+
+// Run hands a failed revision back to its source to re-deliver, so a config the
+// wire refuses arrives again on every trigger for as long as the operator
+// leaves it in place. Each attempt that publishes opens a window a request can
+// pool a backend in, and the rollback then kills it — which at one attempt per
+// tick is a backend-churn loop, across every tenant, for a revision that never
+// served anything. Only the first attempt pays it.
+func TestRepeatedFailingRevisionEvictsOnce(t *testing.T) {
+	logs := &logCapture{}
+	rec, pool := newRecordingStack(t, slog.New(logs))
+
+	_, err := rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+	pool.reset()
+
+	bad := cfg(map[string]config.Server{
+		"a":        fakeSrv(map[string]string{"EXTRA": "1"}),
+		"bad name": fakeSrv(nil),
+	})
+	for i := 0; i < 20; i++ {
+		_, err := rec.Apply(bad)
+		require.Error(t, err, "every attempt still reaches the wire, so a transient refusal recovers")
+	}
+	assert.Equal(t, []evictCall{
+		{server: "a", windowed: true},
+		{server: "bad name", windowed: true},
+	}, pool.calls(), "only the attempt that published has anything to undo")
+
+	// And the operator can tell which attempt cost them a backend. The caller's
+	// own failure line knows only that the apply returned an error; "the
+	// previous config keeps serving" is the whole truth about the wire and none
+	// of it about the pools.
+	rolled := logs.warnsAbout("rolled back")
+	require.Len(t, rolled, 1, "the attempts that touched nothing say nothing")
+	assert.Contains(t, rolled[0], "a")
+	assert.Contains(t, rolled[0], "bad name")
+
+	// Still retryable: the moment the wire can take the revision, it applies —
+	// and now the changed server really does drop its backends.
+	pool.reset()
+	_, err = rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(map[string]string{"EXTRA": "1"})}))
+	require.NoError(t, err)
+	assert.Equal(t, []evictCall{{server: "a"}}, pool.calls())
+}
+
+// Closing a backend waits out its terminate grace. An apply that pays that
+// under the lock that serializes applies makes it the next reload's latency
+// too, so the pool work runs with the lock released.
+func TestEvictionRunsWithTheApplyLockReleased(t *testing.T) {
+	rec, pool := newRecordingStack(t, nil)
+
+	_, err := rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
+	require.NoError(t, err)
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	pool.onCall = func() {
+		once.Do(func() { close(entered) })
+		<-release
+	}
+	defer close(release)
+
+	// A reload that evicts, held open inside the pool.
+	go func() { _, _ = rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(map[string]string{"EXTRA": "1"})})) }()
+	<-entered
+
+	// The next reload goes ahead rather than waiting out the previous one's
+	// subprocesses: Current is what the pool factory and every later diff read,
+	// so a reload that cannot publish has not happened.
+	go func() {
+		_, _ = rec.Apply(cfg(map[string]config.Server{
+			"a": fakeSrv(map[string]string{"EXTRA": "1"}),
+			"b": fakeSrv(nil),
+		}))
+	}()
+	require.Eventually(t, func() bool {
+		cur := rec.Current()
+		return cur != nil && len(cur.Servers) == 2
+	}, 2*time.Second, 10*time.Millisecond,
+		"a reload must not wait out the previous one's evictions to take effect")
+}
+
+// The drift warning is about an EDIT the operator made, and #24 made a refused
+// revision arrive again on every source trigger. Warning from the top of an
+// apply therefore reported the same unapplied block once per tick, forever;
+// warning only for a revision the gateway adopts keeps it to one line per edit.
+func TestNatsDriftWarnsPerAdoptedEditNotPerRetry(t *testing.T) {
+	logs := &logCapture{}
+	st := newStack(t, slog.New(logs))
+	const drift = "nats block"
+
+	_, err := st.rec.Apply(&config.Config{
+		NATS:    config.NATS{Tenant: "acme"},
+		Servers: map[string]config.Server{"a": fakeSrv(nil)},
+	})
+	require.NoError(t, err)
+	require.Empty(t, logs.warnsAbout(drift), "the first revision is what the process booted on")
+
+	// The operator moves the nats block in a document the wire cannot bind.
+	bad := &config.Config{
+		NATS:    config.NATS{Tenant: "other"},
+		Servers: map[string]config.Server{"a": fakeSrv(nil), "bad name": fakeSrv(nil)},
+	}
+	for i := 0; i < 12; i++ {
+		_, err := st.rec.Apply(bad)
+		require.Error(t, err)
+	}
+	assert.Empty(t, logs.warnsAbout(drift),
+		"a revision the gateway never adopted asserts nothing about the block it is running")
+
+	// The same edit, now bindable: adopted, and reported once.
+	_, err = st.rec.Apply(&config.Config{
+		NATS:    config.NATS{Tenant: "other"},
+		Servers: map[string]config.Server{"a": fakeSrv(nil)},
+	})
+	require.NoError(t, err)
+	got := logs.warnsAbout(drift)
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "tenant")
 }
 
 func fakeSrv(extraEnv map[string]string) config.Server {

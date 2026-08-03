@@ -29,7 +29,7 @@ type File struct {
 	path         string
 	pollInterval time.Duration
 	reload       chan struct{}
-	changeFilter
+	filterSet
 }
 
 // NewFile builds a file source. pollInterval <= 0 disables polling (reload
@@ -67,7 +67,7 @@ func (f *File) Reload() {
 // clears the swallowed flag, so a second failure re-arms nothing unless another
 // trigger was genuinely lost.
 func (f *File) Retry() {
-	if f.changeFilter.retry() {
+	if f.filterSet.retry() {
 		f.Reload()
 	}
 }
@@ -75,15 +75,17 @@ func (f *File) Retry() {
 // Watch implements Source.
 func (f *File) Watch(ctx context.Context) <-chan Update {
 	out := make(chan Update)
+	filter, release := f.attach()
 	go func() {
 		defer close(out)
+		defer release()
 		emit := func() {
 			cfg, err := config.Load(f.path)
 			if err != nil {
 				send(ctx, out, Update{Err: err})
 				return
 			}
-			if !f.changed(cfg) {
+			if !filter.changed(cfg) {
 				return
 			}
 			send(ctx, out, Update{Config: cfg})

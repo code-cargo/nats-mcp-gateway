@@ -44,21 +44,23 @@ func Poll(interval time.Duration, fetch FetchFunc) Source {
 type poller struct {
 	interval time.Duration
 	fetch    FetchFunc
-	changeFilter
+	filterSet
 }
 
 // Watch implements Source.
 func (p *poller) Watch(ctx context.Context) <-chan Update {
 	out := make(chan Update)
+	filter, release := p.attach()
 	go func() {
 		defer close(out)
+		defer release()
 		emit := func() {
 			cfg, err := p.fetch(ctx)
 			if err != nil {
 				send(ctx, out, Update{Err: err})
 				return
 			}
-			if !p.changed(cfg) {
+			if !filter.changed(cfg) {
 				return // unchanged: stay quiet
 			}
 			send(ctx, out, Update{Config: cfg})

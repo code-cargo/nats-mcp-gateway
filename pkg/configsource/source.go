@@ -44,15 +44,16 @@ type Update struct {
 }
 
 // Source streams config revisions until ctx is cancelled, at which point it
-// closes the returned channel. The first Update is the initial config. A
-// source owns its own trigger (file poll, NATS event, ticker, …) and its own
-// goroutine lifecycle bound to ctx.
+// closes the returned channel. The first Update is the initial config — for
+// every Watch, including a second one on a source that has been watched
+// before. A source owns its own trigger (file poll, NATS event, ticker, …) and
+// its own goroutine lifecycle bound to ctx.
 //
-// Watch once per source value. The built-ins carry their change-detection
-// baseline on the source itself — that is what makes Retryable possible — so a
-// second Watch inherits it rather than starting fresh, and two concurrent
-// Watches would split revisions between them instead of each seeing all. Build
-// a new source for a new consumer.
+// A source that dedups keeps its change-detection baseline per Watch, so a
+// second consumer starts fresh rather than inheriting what the first had
+// already emitted. Retry has no such split — it is a method on the source, and
+// Run has nothing finer to call it on — so it re-arms every live Watch. See
+// filterSet.
 type Source interface {
 	Watch(ctx context.Context) <-chan Update
 }

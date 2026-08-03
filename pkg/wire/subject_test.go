@@ -157,3 +157,40 @@ func TestEndpointSubjectScoped(t *testing.T) {
 	_, err = EndpointSubject("", "acme", "bad user", "github")
 	assert.Error(t, err)
 }
+
+// The checks exist to stop a prefix widening the authz-bearing subscription,
+// not to impose a house alphabet on what the operator typed. Two of these
+// settings went unvalidated until the checks were added, so every value here
+// is one a deployment could already have been serving.
+func TestOperatorTokenRunsAcceptWhatTheWireCarries(t *testing.T) {
+	for _, s := range []string{
+		"$MCP.v1",     // the system namespace is a legal prefix
+		"mcp:v1",      // ":" is not a subject separator
+		"mcp.v1+beta", //
+		"tenant.acmé", // NATS subjects are not ASCII-only
+		"mcpgw/acme",  // a queue group naming a path-ish scope
+		"ctl:creds",   // an auth.subject that parsed for months
+		"mcp.v1",      // and the ordinary case still passes
+	} {
+		assert.NoError(t, ValidateSubjectPrefix(s), s)
+		assert.NoError(t, ValidateQueueGroup(s), s)
+	}
+
+	// Unchanged: each of these widens or misdirects the subscription the
+	// setting exists to narrow.
+	for _, s := range []string{
+		"mcp.*", "mcp.>", // subscribes this instance to every prefix in the account
+		"mcp..v1", ".mcp", "mcp.", // an empty token is not the subject that was written
+		"mcp v1", "mcp.\tv1", // micro rejects this at the first apply, anonymously
+		"mcp.v\x001", // a NUL truncates the subject at the socket
+	} {
+		assert.Error(t, ValidateSubjectPrefix(s), s)
+		assert.Error(t, ValidateQueueGroup(s), s)
+	}
+
+	// The inbox prefix keeps the narrow alphabet: nats.CustomInboxPrefix is
+	// its consumer, it has been validated since before it had company, and no
+	// deployment was relying on a wider one.
+	assert.Error(t, ValidateInboxPrefix("_INBOX.acme/1"))
+	assert.NoError(t, ValidateInboxPrefix("_INBOX_acme.u_9f3a"))
+}

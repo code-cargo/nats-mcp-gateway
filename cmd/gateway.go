@@ -434,7 +434,7 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	// misses spaces, and its "invalid custom prefix" names neither the setting
 	// nor the value.
 	if c.InboxPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+		if err := wire.ValidateInboxPrefix(c.InboxPrefix); err != nil {
 			return bootParams{}, fmt.Errorf("--inbox-prefix: %w", err)
 		}
 	}

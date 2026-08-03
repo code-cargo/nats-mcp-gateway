@@ -61,7 +61,14 @@ func Run(ctx context.Context, log *slog.Logger, src Source, apply func(*config.C
 				if !serving {
 					return fmt.Errorf("configsource: applying initial config: %w", err)
 				}
-				log.Error("applying config failed; keeping last good config", "err", err)
+				// Not "keeping last good config" on its own: that is true of
+				// the wire and says nothing about the backend pools, which the
+				// apply may well have touched — and an operator watching this
+				// line repeat every tick needs to know whether their traffic is
+				// paying for it. What it did is on the apply's own line.
+				log.Error("applying config failed; the previous config keeps serving "+
+					"and this revision will be retried — see the apply's own line for what it did to the backend pools",
+					"err", err)
 				// A source that dedups by content has already recorded this
 				// revision as delivered. Tell it otherwise, or the next
 				// redelivery of the same content — the poll tick, the change

@@ -247,6 +247,24 @@ caller onto one credential and one process, on exactly the servers configured
 so that must not happen. Per-user `auth` modes therefore require per-user NATS
 auth; shared and static servers are unaffected and keep serving `_`.
 
+Which modes are per-user is a property of the credential, not of the mode
+name. `file`, `oauth-token-exchange` and `oauth-refresh` read their grain from
+the path: one containing `{user}` resolves per caller, a fixed one — a
+projected service-account token, a single rotated refresh token — is a shared
+credential and is treated as one. `exec` and `nats` cannot be read that way,
+since the helper or controller decides what the arguments mean, so they are
+per-user unless the server says otherwise:
+
+```json
+"auth": { "mode": "exec", "command": "/usr/local/bin/creds", "perUser": false }
+```
+
+Use it when the helper returns one credential for the whole tenant — it is
+handed `NATSMCP_CRED_TENANT` and `NATSMCP_CRED_SERVER` and may ignore the
+user. Without it, a deployment whose callers all send `_` gets `-32014` on
+every request to that server. The gateway names each per-user server at boot
+so this is legible before the first call rather than after it.
+
 ## Configuration
 
 ```json
@@ -389,10 +407,10 @@ credential, and per-user modes keep secrets out of the config entirely.
 | `static` (default) | shared | config `env`/`headers` — today's behavior |
 | `file` | shared, or per-user when `path` contains `{user}` | a mounted/rotated file (`path`; optional `ttl`, default 1m, applied when the file carries no `expiresAt`) |
 | `oauth-client-credentials` | shared | RFC 6749 client_credentials (`tokenUrl`, `clientId`, `clientSecret`; optional `scope`, `audience`) |
-| `exec` | per-user | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
-| `oauth-token-exchange` | per-user | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |
-| `oauth-refresh` | per-user | refresh_token grant (`tokenUrl`, `clientId`, `refreshTokenFile`; a rotated refresh token is written back) |
-| `nats` | per-user | request/reply to a controller (below; the subject prefix defaults to `{subjectPrefix}.cred` and `subject` overrides it) |
+| `exec` | per-user, or shared with `"perUser": false` | a credential-helper command (`command`; optional `args`, `env` passthrough) — the universal adapter, below |
+| `oauth-token-exchange` | shared, or per-user when `subjectTokenFile` contains `{user}` | RFC 8693 (`tokenUrl`, `subjectTokenFile`; optional `clientId`, `clientSecret`, `scope`, `audience`, `subjectTokenType` — default `urn:ietf:params:oauth:token-type:access_token`) |
+| `oauth-refresh` | shared, or per-user when `refreshTokenFile` contains `{user}` | refresh_token grant (`tokenUrl`, `clientId`, `refreshTokenFile`; a rotated refresh token is written back) |
+| `nats` | per-user, or shared with `"perUser": false` | request/reply to a controller (below; the subject prefix defaults to `{subjectPrefix}.cred` and `subject` overrides it) |
 
 The file-path fields (`path`, `subjectTokenFile`, `refreshTokenFile`) accept
 `{tenant}`, `{user}`, `{server}` placeholders, and `file` reads the same

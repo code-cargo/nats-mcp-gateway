@@ -579,7 +579,7 @@ func (c *Config) validate() error {
 		}
 	}
 	if c.NATS.InboxPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.NATS.InboxPrefix); err != nil {
+		if err := wire.ValidateInboxPrefix(c.NATS.InboxPrefix); err != nil {
 			return fmt.Errorf("nats.inboxPrefix: %w", err)
 		}
 	}
