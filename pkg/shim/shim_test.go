@@ -226,15 +226,36 @@ func TestFinishedRequestDoesNotUnregisterItsDuplicate(t *testing.T) {
 	require.JSONEq(t, id, string(m.ID))
 	require.Contains(t, string(m.Result), `"echo"`, "the finished request is the tools/list")
 
-	// The cleanup runs immediately behind that write; this only has to outlast
-	// the goroutine unwinding, not any I/O.
-	time.Sleep(200 * time.Millisecond)
-
-	h.shim.streamMu.Lock()
-	_, live := h.shim.streams[id]
-	h.shim.streamMu.Unlock()
-	assert.True(t, live,
+	// A WINDOW, not a poll. The assertion is that the entry survives, and an
+	// entry that is still there because the cleanup has not run yet looks
+	// exactly like one the fix preserved — so a fixed sleep can only be too
+	// short, never too long, and its failure mode is a green test on a loaded
+	// machine. Never() keeps checking for the whole window instead: under the
+	// bug the entry vanishes the moment the finished request unwinds, and a
+	// wider window only makes that more certain to be seen.
+	assert.Never(t, func() bool {
+		h.shim.streamMu.Lock()
+		defer h.shim.streamMu.Unlock()
+		_, live := h.shim.streams[id]
+		return !live
+	}, 2*time.Second, 25*time.Millisecond,
 		"the finished request's cleanup unregistered the still-running one, which can no longer be cancelled")
+
+	// And the survivor is the LIVE request, not the finished one left behind by
+	// a delete that never ran at all — which would satisfy the check above
+	// while failing at the thing it is protecting. A finished stream has had
+	// its channel closed by the client pump; the wedge's is open and empty,
+	// since it never responds and keepalives are consumed inside the pump.
+	h.shim.streamMu.Lock()
+	stream := h.shim.streams[id]
+	h.shim.streamMu.Unlock()
+	require.NotNil(t, stream)
+	select {
+	case _, ok := <-stream.C:
+		assert.True(t, ok,
+			"the registered stream is the FINISHED request's, so the live one has no route back")
+	default: // open with nothing pending: the wedge, still running
+	}
 }
 
 // A null request id identifies nothing. Every response to it comes back as

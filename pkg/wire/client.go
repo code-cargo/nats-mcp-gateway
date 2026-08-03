@@ -157,7 +157,7 @@ type violReg struct {
 // refused — the request subject it publishes to, or the inbox it expects the
 // reply on.
 func (c *Client) failViolated(err error) {
-	subject := quotedSubject(err.Error())
+	op, subject := parseViolation(err.Error())
 	if subject == "" {
 		return
 	}
@@ -169,38 +169,39 @@ func (c *Client) failViolated(err error) {
 		r.cancel(&Error{
 			Code: ErrCodePermissionDenied,
 			Message: fmt.Sprintf("NATS denied %s %q: this caller's permissions do not cover it",
-				violatedOp(err), subject),
+				op, subject),
 		})
 	}
 }
 
-// violatedOp reports which operation NATS refused, taken from its own wording
-// ("Permissions Violation for Publish to ..." / "... for Subscription to
-// ..."). Naming it is what tells an operator whether the missing grant is on
-// the request subject or on the reply inbox — two different lines of config.
-func violatedOp(err error) string {
+// parseViolation pulls the refused operation and subject out of a NATS
+// permission-violation error. That error's prose is the only place either is
+// reported — 'Permissions Violation for Publish to "mcp.v1..."', or the same
+// with 'Subscription to "_INBOX..."' — so this is coupled to the NATS server's
+// wording by necessity. Both halves are read in ONE pass to keep that coupling
+// in one function rather than spread over two that must agree.
+//
+// Naming the operation is what tells an operator whether the missing grant is
+// on the request subject or on the reply inbox — two different lines of
+// config. Wording this does not recognize degrades to "access to" rather than
+// guessing: the subject is the actionable half, and it still parses.
+func parseViolation(s string) (op, subject string) {
+	op = "access to"
 	switch {
-	case strings.Contains(err.Error(), "Publish to"):
-		return "publish to"
-	case strings.Contains(err.Error(), "Subscription to"):
-		return "subscribe to"
-	default:
-		return "access to"
+	case strings.Contains(s, "Publish to"):
+		op = "publish to"
+	case strings.Contains(s, "Subscription to"):
+		op = "subscribe to"
 	}
-}
-
-// quotedSubject extracts the subject from a NATS permission-violation error
-// ('Permissions Violation for Publish to "mcp.v1..."').
-func quotedSubject(s string) string {
 	i := strings.IndexByte(s, '"')
 	if i < 0 {
-		return ""
+		return op, ""
 	}
 	j := strings.IndexByte(s[i+1:], '"')
 	if j < 0 {
-		return ""
+		return op, ""
 	}
-	return s[i+1 : i+1+j]
+	return op, s[i+1 : i+1+j]
 }
 
 // Request is one outbound MCP request: opaque JSON-RPC bytes plus the

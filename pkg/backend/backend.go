@@ -23,6 +23,13 @@ import (
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
 )
 
+// MsgServerInitiatedUnsupported is the -32601 message every server-initiated
+// request is answered with. Two sites send it — the legacy handshake, before
+// the mux exists, and the mux itself once it does — and the whole point of
+// answering in both is that a server sees ONE answer wherever its request
+// landed. Shared here so the two cannot drift into two spellings of it.
+const MsgServerInitiatedUnsupported = "server-initiated requests are not supported by this gateway"
+
 // Backend creates connections to one configured MCP server.
 type Backend interface {
 	// Connect establishes a live connection (spawns the subprocess, dials

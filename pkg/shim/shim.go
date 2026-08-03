@@ -172,7 +172,7 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 }
 
 // nullID is the one id that identifies nothing.
-var nullID = []byte("null")
+const nullID = "null"
 
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
 	// Every response to a null-id request comes back as "id":null, so the
@@ -182,7 +182,7 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 	// 2.0 discourages null request ids for exactly this reason. Refusing is
 	// what makes the problem visible to the client; serving it loses a request
 	// to a collision instead.
-	if bytes.Equal(bytes.TrimSpace(msg.ID), nullID) {
+	if string(bytes.TrimSpace(msg.ID)) == nullID {
 		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest,
 			"null is not a usable request id: responses could not be matched back to requests")
 		return
