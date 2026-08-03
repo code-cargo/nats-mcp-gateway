@@ -33,6 +33,7 @@ import (
 
 	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 // runNATS starts an embedded nats-server on a random port.
@@ -183,6 +184,97 @@ func TestCancelViaCtl(t *testing.T) {
 	require.Len(t, frames, 1)
 	assert.Equal(t, FrameEnd, frames[0].Kind)
 	assert.Empty(t, frames[0].Body, "cancelled request ends with an empty body: no response exists")
+}
+
+// The control subject is an ordinary NATS subject sitting under the caller's
+// reply inbox, so the gateway has to check what lands on it. Cancelling on any
+// message at all means a stray publish, a probe, or a cancellation meant for
+// some other request ends a live call — and a cancelled request terminates
+// with the empty end frame that tells the caller no response exists, so the
+// request simply vanishes rather than failing.
+func TestCtlIgnoresAnythingButAMatchingCancellation(t *testing.T) {
+	nc := runNATS(t, nil)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cancelled := make(chan bool, 1)
+	// Keepalives parked far away so the reply subject carries only what this
+	// test is asserting about.
+	serve(t, nc, ServerConfig{KeepAlive: time.Hour}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		close(started)
+		select {
+		case <-ctx.Done():
+			cancelled <- true
+			return nil
+		case <-release:
+			cancelled <- false
+			return w.End([]byte(`{"jsonrpc":"2.0","id":"1","result":{"ok":true}}`))
+		}
+	})
+
+	// Hand-built so the test knows the reply inbox the control subject hangs
+	// off; the client derives it internally.
+	reply := nc.NewRespInbox()
+	sub, err := nc.SubscribeSync(reply)
+	require.NoError(t, err)
+	subj, err := BuildSubject("", "acme", "_", "test", "tools/call", "")
+	require.NoError(t, err)
+	require.NoError(t, nc.PublishMsg(&nats.Msg{
+		Subject: subj,
+		Reply:   reply,
+		Data:    []byte(`{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{}}`),
+		Header: nats.Header{
+			HeaderWire:   []string{WireVersion},
+			HeaderMethod: []string{"tools/call"},
+		},
+	}))
+	<-started
+
+	for _, body := range []string{
+		``,
+		`not json at all`,
+		`{"jsonrpc":"2.0","method":"notifications/progress","params":{}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"a-different-request"}}`,
+		`{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`,
+		`{"jsonrpc":"2.0","id":"1","method":"notifications/cancelled","params":{"requestId":"1"}}`,
+	} {
+		require.NoError(t, nc.Publish(reply+ctlSuffix, []byte(body)))
+	}
+	require.NoError(t, nc.Flush())
+	// The control callback runs on its own delivery goroutine, so give it room
+	// to have acted before the handler is allowed to finish on its own.
+	time.Sleep(250 * time.Millisecond)
+	close(release)
+
+	assert.False(t, <-cancelled, "a non-cancellation on the control subject cancelled the request")
+	msg, err := sub.NextMsg(5 * time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, string(FrameEnd), msg.Header.Get(HeaderFrame))
+	assert.Contains(t, string(msg.Data), `"ok":true`, "the request must complete normally")
+}
+
+func TestIsCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		id   string
+		want bool
+	}{
+		{"matching string id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, true},
+		{"matching numeric id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}`, `7`, true},
+		{"whitespace around the id", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId": "7" }}`, `"7"`, true},
+		{"other request", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"8"}}`, `"7"`, false},
+		{"string and number are different ids", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `7`, false},
+		{"no requestId", `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{}}`, `"7"`, false},
+		{"another notification", `{"jsonrpc":"2.0","method":"notifications/progress","params":{"requestId":"7"}}`, `"7"`, false},
+		{"a request, not a notification", `{"jsonrpc":"2.0","id":"9","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, false},
+		{"wrong jsonrpc version", `{"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":"7"}}`, `"7"`, false},
+		{"not json", `hello`, `"7"`, false},
+		{"empty", ``, `"7"`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, isCancellation([]byte(tc.body), []byte(tc.id)))
+		})
+	}
 }
 
 func TestKeepAliveHoldsIdleStream(t *testing.T) {
@@ -606,6 +698,54 @@ func TestPermissionViolationFailsFast(t *testing.T) {
 	assert.Equal(t, ErrCodeNoGateway, frames[0].Err.Code)
 }
 
+// A denied SUBSCRIBE is exactly as fatal to a stream as a denied publish, and
+// it arrives the same way: asynchronously on the connection, never from
+// SubscribeSync, which hands back a perfectly good subscription. The request
+// then publishes fine and no reply can ever be delivered to it, so the caller
+// used to sit out the entire inactivity window before being told the stream
+// was "inactive" — for a permission problem NATS reported in milliseconds.
+//
+// The likely cause is an identity whose grant covers its request subjects but
+// not its reply inbox: the shape of an --inbox-prefix deployment with the
+// prefix left off one side.
+func TestSubscribePermissionDeniedFailsFast(t *testing.T) {
+	opts := &server.Options{
+		Host: "127.0.0.1", Port: -1, NoLog: true, NoSigs: true,
+		Users: []*server.User{{
+			Username: "restricted", Password: "pw",
+			Permissions: &server.Permissions{
+				// The request publish is allowed; only the reply inbox is not.
+				Publish:   &server.SubjectPermission{Allow: []string{"mcp.v1.req.acme.>"}},
+				Subscribe: &server.SubjectPermission{Allow: []string{"_INBOX_other.>"}},
+			},
+		}},
+	}
+	srv, err := server.NewServer(opts)
+	require.NoError(t, err)
+	go srv.Start()
+	require.True(t, srv.ReadyForConnections(5*time.Second))
+	t.Cleanup(srv.Shutdown)
+
+	nc, err := nats.Connect(srv.ClientURL(), nats.UserInfo("restricted", "pw"))
+	require.NoError(t, err)
+	t.Cleanup(nc.Close)
+
+	// Far beyond collect's own 10s fatal: a stream left to the inactivity
+	// deadline fails this test rather than quietly waiting it out.
+	c, err := NewClient(nc, ClientConfig{Tenant: "acme", Inactivity: 30 * time.Second})
+	require.NoError(t, err)
+
+	s, err := c.Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.NotNil(t, frames[0].Err)
+	assert.Equal(t, ErrCodePermissionDenied, frames[0].Err.Code)
+	assert.Contains(t, frames[0].Err.Message, "subscribe to",
+		"the message must name the operation that was denied rather than assuming publish")
+}
+
 // The scoped queue-group default lives in Serve so EVERY config source gets
 // it — a scoped instance must never silently share the fleet's "mcpgw" group
 // (the two would compete for the scoped user's traffic).
@@ -849,4 +989,62 @@ func TestServeRejectsAnUnusableSubjectPrefix(t *testing.T) {
 		require.NoError(t, srv.Shutdown(ctx))
 		cancel()
 	}
+}
+
+// TestCancellationSurvivesADifferentEncoder covers the asymmetry the ctl
+// guard is exposed to: the two ids it compares did not come out of the same
+// encoder.
+//
+// A native client's request body is forwarded verbatim, so its id is whatever
+// that client wrote. The cancellation naming it is re-encoded by Go, and
+// encoding/json escapes <, > and & by default — so an id derived from a URL or
+// any user text arrives spelled two ways and a byte comparison drops the
+// cancellation. The request then runs on after the client asked it to stop,
+// which is the ctl guard's own failure mode reached from the other side.
+//
+// Both hand-built, deliberately: a test that encodes both sides the same way
+// cannot see this, which is why the existing ones do not.
+func TestCancellationSurvivesADifferentEncoder(t *testing.T) {
+	cancelBody := func(id string) []byte {
+		params, err := json.Marshal(map[string]any{"requestId": id})
+		require.NoError(t, err)
+		body, err := jsonrpc.Encode(jsonrpc.NewNotification(mcpspec.NotifCancelled, params))
+		require.NoError(t, err)
+		return body
+	}
+	for _, id := range []string{"a<b", "a>b", "a&b", "https://x/?a=1&b=2", "plain-1"} {
+		verbatim, err := json.Marshal(id)
+		require.NoError(t, err)
+		// What a client that does not HTML-escape would actually put on the wire.
+		literal := []byte(`"` + id + `"`)
+		assert.True(t, isCancellation(cancelBody(id), verbatim), "same encoder, id %q", id)
+		assert.True(t, isCancellation(cancelBody(id), literal), "different encoder, id %q", id)
+	}
+	// Still refuses a cancellation naming a different request.
+	assert.False(t, isCancellation(cancelBody("other"), []byte(`"a<b"`)))
+	// Numbers keep their literal: two spellings are two ids.
+	assert.True(t, isCancellation(cancelBody("1"), []byte(`"1"`)))
+	assert.False(t, isCancellation(cancelBody("1"), []byte(`1`)),
+		"a string id and a number id are different ids")
+}
+
+// TestOnlyStringsAndNumbersCanNameARequest pins decodeID's contract against
+// the shortcut that used to run ahead of it.
+//
+// JSON-RPC 2.0 allows only a string or a number as an id, and a byte-equality
+// fast path answered before that check could refuse anything else. `null` is
+// the one that matters: jsonrpc.HasID counts a literal null as present, so
+// {"id":null,"method":…} really is a request on the wire, and null is the one
+// id nobody has to guess.
+func TestOnlyStringsAndNumbersCanNameARequest(t *testing.T) {
+	for _, id := range []string{`null`, `true`, `false`, `{"a":1}`, `[1]`, `[]`, `{}`} {
+		assert.False(t, sameRequestID([]byte(id), []byte(id)),
+			"%s is not an id and must not name a request, even against itself", id)
+	}
+	for _, id := range []string{`"a"`, `"a<b"`, `1`, `-2`, `1.5`, `"1"`} {
+		assert.True(t, sameRequestID([]byte(id), []byte(id)), "%s is a legitimate id", id)
+	}
+	// Distinctness survives the change.
+	assert.False(t, sameRequestID([]byte(`"1"`), []byte(`1`)))
+	assert.False(t, sameRequestID([]byte(`1`), []byte(`1.0`)))
 }

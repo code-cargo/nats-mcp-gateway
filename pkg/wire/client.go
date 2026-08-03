@@ -85,6 +85,18 @@ type Client struct {
 }
 
 // NewClient wraps an established NATS connection.
+//
+// It installs an async error handler on that connection, which is the only
+// channel NATS reports a permission violation on, and there is no way to take
+// one back off — SetErrorHandler replaces, and a client in the middle of a
+// chain cannot unlink itself. So a connection is meant to host a small fixed
+// number of clients; the CLIs create exactly one. A caller that churns clients
+// over one long-lived connection adds a link per client and keeps every one of
+// them reachable for as long as the connection lives.
+//
+// For the same reason, concurrent NewClient calls on ONE connection are not
+// safe: the previous handler is read straight off nc.Opts while another call
+// may be writing it. Sequential calls are fine.
 func NewClient(nc *nats.Conn, cfg ClientConfig) (*Client, error) {
 	// The prefix is validated here rather than by each caller because
 	// BuildSubject checks every other token and pastes this one in unchecked:
@@ -141,10 +153,11 @@ type violReg struct {
 	cancel context.CancelCauseFunc
 }
 
-// failViolated cancels every stream whose publish subject the server just
-// refused.
+// failViolated cancels every stream that depends on a subject the server just
+// refused — the request subject it publishes to, or the inbox it expects the
+// reply on.
 func (c *Client) failViolated(err error) {
-	subject := quotedSubject(err.Error())
+	op, subject := parseViolation(err.Error())
 	if subject == "" {
 		return
 	}
@@ -154,24 +167,41 @@ func (c *Client) failViolated(err error) {
 	c.violMu.Unlock()
 	for r := range regs {
 		r.cancel(&Error{
-			Code:    ErrCodePermissionDenied,
-			Message: fmt.Sprintf("NATS denied publish to %q: this caller's permissions do not cover it", subject),
+			Code: ErrCodePermissionDenied,
+			Message: fmt.Sprintf("NATS denied %s %q: this caller's permissions do not cover it",
+				op, subject),
 		})
 	}
 }
 
-// quotedSubject extracts the subject from a NATS permission-violation error
-// ('Permissions Violation for Publish to "mcp.v1..."').
-func quotedSubject(s string) string {
+// parseViolation pulls the refused operation and subject out of a NATS
+// permission-violation error. That error's prose is the only place either is
+// reported — 'Permissions Violation for Publish to "mcp.v1..."', or the same
+// with 'Subscription to "_INBOX..."' — so this is coupled to the NATS server's
+// wording by necessity. Both halves are read in ONE pass to keep that coupling
+// in one function rather than spread over two that must agree.
+//
+// Naming the operation is what tells an operator whether the missing grant is
+// on the request subject or on the reply inbox — two different lines of
+// config. Wording this does not recognize degrades to "access to" rather than
+// guessing: the subject is the actionable half, and it still parses.
+func parseViolation(s string) (op, subject string) {
+	op = "access to"
+	switch {
+	case strings.Contains(s, "Publish to"):
+		op = "publish to"
+	case strings.Contains(s, "Subscription to"):
+		op = "subscribe to"
+	}
 	i := strings.IndexByte(s, '"')
 	if i < 0 {
-		return ""
+		return op, ""
 	}
 	j := strings.IndexByte(s[i+1:], '"')
 	if j < 0 {
-		return ""
+		return op, ""
 	}
-	return s[i+1 : i+1+j]
+	return op, s[i+1 : i+1+j]
 }
 
 // Request is one outbound MCP request: opaque JSON-RPC bytes plus the
@@ -226,11 +256,47 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	}
 
 	reply := c.nc.NewRespInbox()
+	streamCtx, stop := context.WithCancelCause(ctx)
+
+	// Register for permission-violation failure on BOTH subjects this request
+	// needs, and do it before either is used. A denied publish and a denied
+	// subscribe are reported the same way — asynchronously on the connection,
+	// never from the call that triggered them — and either one leaves the
+	// stream with nothing that can ever arrive on it. Registering after
+	// subscribing would leave the denial free to land first and find nobody
+	// waiting for it.
+	reg := &violReg{cancel: stop}
+	watched := [...]string{subject, reply}
+	c.violMu.Lock()
+	for _, s := range watched {
+		if c.viol[s] == nil {
+			c.viol[s] = make(map[*violReg]struct{})
+		}
+		c.viol[s][reg] = struct{}{}
+	}
+	c.violMu.Unlock()
+	unregister := func() {
+		c.violMu.Lock()
+		defer c.violMu.Unlock()
+		for _, s := range watched {
+			if regs := c.viol[s]; regs != nil {
+				delete(regs, reg)
+				if len(regs) == 0 {
+					delete(c.viol, s)
+				}
+			}
+		}
+	}
+
 	sub, err := c.nc.SubscribeSync(reply)
 	if err != nil {
+		unregister()
+		stop(nil)
 		return nil, fmt.Errorf("wire: subscribe reply: %w", err)
 	}
 	if err := sub.SetPendingLimits(pendingMsgsLimit, pendingBytesLimit); err != nil {
+		unregister()
+		stop(nil)
 		_ = sub.Unsubscribe()
 		return nil, fmt.Errorf("wire: pending limits: %w", err)
 	}
@@ -257,26 +323,6 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	}
 	if c.claims != nil {
 		msg.Header.Set(HeaderAcceptClaim, "1")
-	}
-	streamCtx, stop := context.WithCancelCause(ctx)
-
-	// Register for permission-violation failure BEFORE publishing.
-	reg := &violReg{cancel: stop}
-	c.violMu.Lock()
-	if c.viol[subject] == nil {
-		c.viol[subject] = make(map[*violReg]struct{})
-	}
-	c.viol[subject][reg] = struct{}{}
-	c.violMu.Unlock()
-	unregister := func() {
-		c.violMu.Lock()
-		defer c.violMu.Unlock()
-		if regs := c.viol[subject]; regs != nil {
-			delete(regs, reg)
-			if len(regs) == 0 {
-				delete(c.viol, subject)
-			}
-		}
 	}
 
 	if err := c.nc.PublishMsg(msg); err != nil {

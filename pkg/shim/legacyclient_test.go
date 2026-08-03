@@ -74,7 +74,7 @@ func newLegacyHarness(t *testing.T) *harness {
 	stdoutR, stdoutW := io.Pipe()
 	s := New(wc, Config{Server: "fake"})
 
-	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1)}
+	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1), shim: s}
 	go func() { h.runErr <- s.Run(context.Background(), stdinR, stdoutW) }()
 	go func() {
 		sc := bufio.NewScanner(stdoutR)
@@ -151,6 +151,37 @@ func TestLegacyClientEndToEnd(t *testing.T) {
 		assert.JSONEq(t, `4`, string(m.ID))
 		assert.Equal(t, 3, progress, "progress must precede the response")
 		break
+	}
+}
+
+// Only the FIRST initialize engaged the legacy wing; a repeat fell through to
+// the wire. There is no initialize on the 2026-07-28 wire, so that request
+// goes out on a subject no sane grant covers — and where one does, the
+// gateway's own bridge forwards it to a subprocess that is already
+// initialized. Either way the client asked the shim a question the shim can
+// answer from what it already knows.
+func TestRepeatedLegacyInitializeIsAnsweredLocally(t *testing.T) {
+	h := newLegacyHarness(t)
+	for _, id := range []string{`0`, `9`} {
+		h.send(t, `{"jsonrpc":"2.0","id":`+id+`,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"c","version":"1"}}}`)
+		line := h.next(t, 15*time.Second)
+		m, err := jsonrpc.Decode([]byte(line))
+		require.NoError(t, err)
+		require.Nil(t, m.Error, "initialize id=%s was not answered locally: %s", id, line)
+		assert.JSONEq(t, id, string(m.ID))
+		var init struct {
+			ProtocolVersion string          `json:"protocolVersion"`
+			ServerInfo      json.RawMessage `json:"serverInfo"`
+		}
+		require.NoError(t, json.Unmarshal(m.Result, &init))
+		assert.Equal(t, mcpspec.LegacyProtocolVersion, init.ProtocolVersion)
+		assert.Contains(t, string(init.ServerInfo), "fakemcp")
+		// resultType is stamped by the gateway's legacy bridge on the way back
+		// and never appears on an answer the shim built itself, so it is the
+		// fingerprint of a request that crossed the wire. It is also a modern
+		// field with no business in a 2025-11-25 InitializeResult.
+		assert.NotContains(t, string(m.Result), "resultType",
+			"initialize id=%s was forwarded onto the wire instead of answered locally", id)
 	}
 }
 

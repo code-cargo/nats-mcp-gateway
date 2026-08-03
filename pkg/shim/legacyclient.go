@@ -39,15 +39,29 @@ type legacyClient struct {
 
 const discoverTimeout = 30 * time.Second
 
-// engageLegacy handles the initialize request that triggered legacy mode.
+// engageLegacy handles an initialize request: it engages legacy mode on the
+// first one and refreshes the recorded client identity on any repeat, then
+// answers from server/discover. Called only from the Run loop goroutine, which
+// is what makes the s.legacy assignment safe.
+//
+// Repeats are deliberately not serialized against an answer still in flight.
+// Replacing s.legacy underneath one is safe — answerInitialize closes over the
+// id it must reply to and nothing else — and two discovers can therefore
+// answer out of order, which JSON-RPC allows and every client already handles.
+// Serializing them would mean holding an initialize behind a discover that can
+// take the full discoverTimeout, which is worse for no correctness gain.
 func (s *Shim) engageLegacy(ctx context.Context, msg *jsonrpc.Message) {
 	var p struct {
 		ClientInfo   json.RawMessage `json:"clientInfo"`
 		Capabilities json.RawMessage `json:"capabilities"`
 	}
 	_ = json.Unmarshal(msg.Params, &p)
+	if s.legacy == nil {
+		s.log.Info("legacy client detected, bridging initialize to server/discover")
+	} else {
+		s.log.Info("legacy client re-initialized, answering from server/discover again")
+	}
 	s.legacy = &legacyClient{clientInfo: p.ClientInfo, clientCaps: p.Capabilities}
-	s.log.Info("legacy client detected, bridging initialize to server/discover")
 
 	s.wg.Add(1)
 	go func() {

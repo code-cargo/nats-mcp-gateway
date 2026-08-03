@@ -171,10 +171,32 @@ func readLine(r *bufio.Reader, max int) ([]byte, error) {
 	}
 }
 
+// nullID is the one id that identifies nothing.
+const nullID = "null"
+
 func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []byte) {
-	// Legacy wing: a first-request initialize flips the shim into legacy
-	// mode; thereafter ping and logging/setLevel are answered locally.
-	if s.legacy == nil && msg.Method == mcpspec.MethodInitialize {
+	// Every response to a null-id request comes back as "id":null, so the
+	// client cannot tell which of its requests was answered — and the stream
+	// map is keyed by id, so two of them share one entry and a
+	// notifications/cancelled for one cancels whichever is registered. JSON-RPC
+	// 2.0 discourages null request ids for exactly this reason. Refusing is
+	// what makes the problem visible to the client; serving it loses a request
+	// to a collision instead.
+	if string(bytes.TrimSpace(msg.ID)) == nullID {
+		s.writeError(msg.ID, jsonrpc.CodeInvalidRequest,
+			"null is not a usable request id: responses could not be matched back to requests")
+		return
+	}
+
+	// Legacy wing: an initialize flips the shim into legacy mode; thereafter
+	// ping and logging/setLevel are answered locally. A REPEAT initialize is
+	// answered the same way rather than forwarded — there is no initialize on
+	// the 2026-07-28 wire, so forwarding one sends it to a subject no grant is
+	// written for, and where a broad grant does cover it the gateway's legacy
+	// bridge hands a second handshake to a subprocess that is already
+	// initialized. The client is also re-stating its identity, so the answer
+	// comes from the params it just sent.
+	if msg.Method == mcpspec.MethodInitialize {
 		s.engageLegacy(ctx, msg)
 		return
 	}
@@ -252,7 +274,14 @@ func (s *Shim) handleRequest(ctx context.Context, msg *jsonrpc.Message, body []b
 		defer s.wg.Done()
 		defer func() {
 			s.streamMu.Lock()
-			delete(s.streams, idKey)
+			// Only if this stream is still the one registered. A client that
+			// reuses an id while the first request is in flight replaces the
+			// entry, and an unconditional delete would then retire the LIVE
+			// request's route on the dead one's way out — leaving a request the
+			// client can still see running but can no longer cancel.
+			if s.streams[idKey] == stream {
+				delete(s.streams, idKey)
+			}
 			s.streamMu.Unlock()
 		}()
 		for f := range stream.C {

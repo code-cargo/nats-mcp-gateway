@@ -17,12 +17,20 @@
 // frame. It moves opaque JSON-RPC bytes and knows no MCP schema — when the
 // MCP spec moves, this package does not.
 //
-// One narrow exception: header VALUE encoding (mcpspec.EncodeHeaderValue).
-// This binding writes tool names and resource URIs into NATS headers, and a
-// value carrying CR/LF would corrupt the protocol frame, so the encoding is a
-// property of writing a header at all rather than of any MCP schema. It has to
-// live here because the subject's name token is derived from the RAW name —
-// encoding earlier would change the token and with it the permission check.
+// Two narrow exceptions, both properties of the binding rather than of MCP:
+//
+// Header VALUE encoding (mcpspec.EncodeHeaderValue). This binding writes tool
+// names and resource URIs into NATS headers, and a value carrying CR/LF would
+// corrupt the protocol frame, so the encoding is a property of writing a
+// header at all. It has to live here because the subject's name token is
+// derived from the RAW name — encoding earlier would change the token and with
+// it the permission check.
+//
+// The control subject's cancellation notification (mcpspec.NotifCancelled).
+// This binding defines {reply}.ctl and defines it as the cancellation channel,
+// so validating what arrives there is the binding checking its own control
+// plane. The alternative is cancelling on any byte that lands on a subject
+// inside the caller's inbox.
 package wire
 
 import (

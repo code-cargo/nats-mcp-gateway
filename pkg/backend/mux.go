@@ -223,8 +223,7 @@ func (m *Mux) readLoop() {
 			// block forever on a response that can never come.
 			m.log.Warn("rejecting server-initiated request", "method", msg.Method)
 			_ = m.conn.Write(context.Background(), jsonrpc.NewErrorResponse(
-				msg.ID, jsonrpc.CodeMethodNotFound,
-				"server-initiated requests are not supported by this gateway", nil,
+				msg.ID, jsonrpc.CodeMethodNotFound, MsgServerInitiatedUnsupported, nil,
 			))
 		default:
 		}

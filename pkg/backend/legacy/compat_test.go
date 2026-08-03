@@ -18,8 +18,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -485,6 +489,164 @@ func TestWriteFailureDoesNotLeakPending(t *testing.T) {
 	err := c.Write(context.Background(), req)
 	require.Error(t, err, "the write must surface its failure")
 	assert.Empty(t, c.pending, "a request that never left must leave no bookkeeping")
+}
+
+// stubConn is an inner legacy connection whose reads the test feeds by hand.
+type stubConn struct {
+	reads chan *jsonrpc.Message
+}
+
+func (s *stubConn) Write(context.Context, *jsonrpc.Message) error { return nil }
+
+func (s *stubConn) Read(ctx context.Context) (*jsonrpc.Message, error) {
+	select {
+	case m := <-s.reads:
+		return m, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (s *stubConn) Close() error { return nil }
+
+// A */list_changed must reach EVERY subscription that asked for it. It is the
+// only invalidation a 2025-11-25 server offers, so a subscriber that misses
+// one goes on serving its cached listing for the whole discovery TTL — five
+// minutes by default — with nothing to tell it or the client that the listing
+// is wrong.
+//
+// The fan-out queue holds 16 and Read is what drains it, but the fan-out runs
+// INSIDE Read: one list_changed with more than sixteen subscribers overflows
+// the queue in a single pass, and everything past the sixteenth was logged and
+// thrown away. Sixteen subscribers on one connection is an ordinary number —
+// backends are pooled per (server, tenant), so every client of a tenant using
+// a static-credential server shares one.
+func TestListChangedReachesEverySubscriber(t *testing.T) {
+	const subscribers = 40
+	stub := &stubConn{reads: make(chan *jsonrpc.Message, 1)}
+	c := &conn{
+		inner:      stub,
+		init:       &initResult{},
+		ttlMs:      300000,
+		cacheScope: mcpspec.CacheScopePrivate,
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		synth:      make(chan *jsonrpc.Message, 16),
+		listeners:  make(map[string]listenFilter),
+		pending:    make(map[string]string),
+	}
+	want := map[string]bool{}
+	for i := 0; i < subscribers; i++ {
+		key := strconv.Quote(fmt.Sprintf("sub-%d", i))
+		c.listeners[key] = listenFilter{Tools: true}
+		want[key] = true
+	}
+
+	stub.reads <- jsonrpc.NewNotification(mcpspec.NotifToolsListChanged, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	got := map[string]bool{}
+	for len(got) < subscribers {
+		msg, err := c.Read(ctx)
+		require.NoError(t, err,
+			"only %d of %d subscribers received the invalidation", len(got), subscribers)
+		require.Equal(t, mcpspec.NotifToolsListChanged, msg.Method)
+		var p struct {
+			Meta map[string]json.RawMessage `json:"_meta"`
+		}
+		require.NoError(t, json.Unmarshal(msg.Params, &p))
+		got[string(p.Meta[mcpspec.MetaSubscriptionID])] = true
+	}
+	assert.Equal(t, want, got)
+}
+
+// handshakePinger is a 2025-11-25 server that pings inside the handshake
+// window and blocks on the answer — it sends its InitializeResult only once
+// the ping has been responded to. Sending a ping there is legal: 2025-11-25
+// says a server SHOULD NOT send requests before the initialize response, and
+// names ping and logging as the exceptions.
+type handshakePinger struct {
+	initSeen chan struct{}
+	answered chan struct{}
+	once     sync.Once
+	step     int
+
+	mu        sync.Mutex
+	pingReply *jsonrpc.Message
+}
+
+func (c *handshakePinger) Write(_ context.Context, msg *jsonrpc.Message) error {
+	switch {
+	case msg.Kind() == jsonrpc.KindRequest && msg.Method == mcpspec.MethodInitialize:
+		close(c.initSeen)
+	case msg.Kind() == jsonrpc.KindResponse:
+		c.mu.Lock()
+		c.pingReply = msg
+		c.mu.Unlock()
+		c.once.Do(func() { close(c.answered) })
+	}
+	return nil
+}
+
+// Read is only ever called from the handshake's own goroutine, so step needs
+// no guarding.
+func (c *handshakePinger) Read(ctx context.Context) (*jsonrpc.Message, error) {
+	c.step++
+	switch c.step {
+	case 1:
+		select {
+		case <-c.initSeen:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return jsonrpc.NewRequest("srv-ping", mcpspec.MethodPing, nil), nil
+	case 2:
+		select {
+		case <-c.answered:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		result, _ := json.Marshal(map[string]any{
+			"protocolVersion": mcpspec.LegacyProtocolVersion,
+			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"serverInfo":      map[string]any{"name": "pinger"},
+		})
+		return jsonrpc.NewResponse(json.RawMessage(`"natsmcp-init"`), result), nil
+	default:
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+}
+
+func (c *handshakePinger) Close() error { return nil }
+
+// The mux answers a server-initiated request with -32601 so the subprocess is
+// never left blocking on a response that cannot come — but the mux does not
+// exist until the handshake has finished. Inside the handshake window the loop
+// skipped anything that was not the InitializeResult, so a server waiting on
+// its own request waited out the 30s handshake timeout and the whole
+// connection failed. The README promises the -32601 without qualifying it.
+func TestHandshakeAnswersServerInitiatedRequests(t *testing.T) {
+	c := &handshakePinger{
+		initSeen: make(chan struct{}),
+		answered: make(chan struct{}),
+	}
+	// Well under handshakeTimeout: a swallowed request has to fail this test
+	// promptly rather than sit out the real 30s.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	init, err := handshake(ctx, c)
+	require.NoError(t, err, "the handshake never answered the server's ping")
+	require.NotNil(t, init)
+	assert.Contains(t, string(init.Capabilities), "tools")
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	require.NotNil(t, c.pingReply, "the server-initiated request went unanswered")
+	assert.JSONEq(t, `"srv-ping"`, string(c.pingReply.ID), "the answer must echo the server's id")
+	require.NotNil(t, c.pingReply.Error)
+	assert.Equal(t, jsonrpc.CodeMethodNotFound, c.pingReply.Error.Code)
 }
 
 // failingConn is a backend.Conn whose writes always fail.

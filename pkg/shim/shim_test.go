@@ -54,6 +54,7 @@ type harness struct {
 	stdin  io.WriteCloser
 	lines  chan string
 	runErr chan error
+	shim   *Shim
 }
 
 func newHarness(t *testing.T, withGateway bool) *harness {
@@ -87,7 +88,7 @@ func newHarness(t *testing.T, withGateway bool) *harness {
 	stdoutR, stdoutW := io.Pipe()
 	s := New(wc, Config{Server: "fake"})
 
-	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1)}
+	h := &harness{stdin: stdinW, lines: make(chan string, 64), runErr: make(chan error, 1), shim: s}
 	go func() { h.runErr <- s.Run(context.Background(), stdinR, stdoutW) }()
 	go func() {
 		sc := bufio.NewScanner(stdoutR)
@@ -200,6 +201,87 @@ func TestShimCancelSuppressesResponse(t *testing.T) {
 	m, err := jsonrpc.Decode([]byte(line))
 	require.NoError(t, err)
 	assert.JSONEq(t, `"6"`, string(m.ID))
+}
+
+// Two requests sharing an id, the first finishing while the second is still
+// in flight. The stream map is keyed by id, so the second registration
+// replaces the first — and the first's cleanup then deleted the key regardless
+// of whose stream was behind it. The live request loses its only route back:
+// notifications/cancelled for it finds nothing and is dropped, so the client
+// can no longer cancel a request it can still see running.
+func TestFinishedRequestDoesNotUnregisterItsDuplicate(t *testing.T) {
+	h := newHarness(t, true)
+	const id = `"dup"`
+	// Both registrations happen on the Run loop in line order, so the wedge is
+	// unambiguously the one left in the map.
+	h.send(t, req("dup", "tools/list", ""))
+	h.send(t, req("dup", "tools/call", `"name":"wedge"`))
+
+	// The tools/list answer is the only line either request produces: wedge
+	// never responds. Seeing it means that request's pump has delivered its
+	// terminal frame and is running its cleanup.
+	line := h.next(t, 10*time.Second)
+	m, err := jsonrpc.Decode([]byte(line))
+	require.NoError(t, err)
+	require.JSONEq(t, id, string(m.ID))
+	require.Contains(t, string(m.Result), `"echo"`, "the finished request is the tools/list")
+
+	// A WINDOW, not a poll. The assertion is that the entry survives, and an
+	// entry that is still there because the cleanup has not run yet looks
+	// exactly like one the fix preserved — so a fixed sleep can only be too
+	// short, never too long, and its failure mode is a green test on a loaded
+	// machine. Never() keeps checking for the whole window instead: under the
+	// bug the entry vanishes the moment the finished request unwinds, and a
+	// wider window only makes that more certain to be seen.
+	assert.Never(t, func() bool {
+		h.shim.streamMu.Lock()
+		defer h.shim.streamMu.Unlock()
+		_, live := h.shim.streams[id]
+		return !live
+	}, 2*time.Second, 25*time.Millisecond,
+		"the finished request's cleanup unregistered the still-running one, which can no longer be cancelled")
+
+	// And the survivor is the LIVE request, not the finished one left behind by
+	// a delete that never ran at all — which would satisfy the check above
+	// while failing at the thing it is protecting. A finished stream has had
+	// its channel closed by the client pump; the wedge's is open and empty,
+	// since it never responds and keepalives are consumed inside the pump.
+	h.shim.streamMu.Lock()
+	stream := h.shim.streams[id]
+	h.shim.streamMu.Unlock()
+	require.NotNil(t, stream)
+	select {
+	case _, ok := <-stream.C:
+		assert.True(t, ok,
+			"the registered stream is the FINISHED request's, so the live one has no route back")
+	default: // open with nothing pending: the wedge, still running
+	}
+}
+
+// A null request id identifies nothing. Every response to it comes back as
+// "id":null, so the client cannot tell which request was answered — and the
+// shim's stream map, keyed by id, files every such request under one key, so a
+// notifications/cancelled for one cancels whichever happens to be registered.
+// Answering the request is what makes that visible to the client instead of
+// letting it lose a request to a collision.
+func TestNullRequestIDIsRefused(t *testing.T) {
+	h := newHarness(t, true)
+	h.send(t, `{"jsonrpc":"2.0","id":null,"method":"tools/list"}`)
+	h.send(t, `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"wedge"}}`)
+
+	for i := 0; i < 2; i++ {
+		line := h.next(t, 10*time.Second)
+		m, err := jsonrpc.Decode([]byte(line))
+		require.NoError(t, err)
+		assert.JSONEq(t, `null`, string(m.ID), "the refusal echoes the null id, as JSON-RPC requires")
+		require.NotNil(t, m.Error, "a null-id request must be refused, not served: %s", line)
+		assert.Equal(t, jsonrpc.CodeInvalidRequest, m.Error.Code)
+	}
+
+	h.shim.streamMu.Lock()
+	defer h.shim.streamMu.Unlock()
+	assert.NotContains(t, h.shim.streams, "null",
+		"no null-id request may reach the stream map, where they all share one key")
 }
 
 func TestShimNoGatewayYieldsLegibleError(t *testing.T) {

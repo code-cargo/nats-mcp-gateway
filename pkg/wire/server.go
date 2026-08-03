@@ -15,7 +15,9 @@
 package wire
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -28,6 +30,7 @@ import (
 	"github.com/nats-io/nats.go/micro"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/jsonrpc"
+	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
 
 const (
@@ -97,8 +100,10 @@ type ServerConfig struct {
 	Version string
 	// KeepAlive overrides DefaultKeepAlive when > 0.
 	KeepAlive time.Duration
-	// Logger receives the wire's own operational messages — today, refused
-	// reply subjects. slog.Default() when nil.
+	// Logger receives the wire's own operational messages: a refused reply
+	// subject, and a control subscription the gateway could not establish —
+	// conditions that degrade a request without failing it, which is exactly
+	// why they need somewhere to go. slog.Default() when nil.
 	Logger *slog.Logger
 	// Claims, when set, parks oversize responses in a claim store instead of
 	// failing them with ErrCodePayloadTooLarge — but only for callers that
@@ -373,18 +378,35 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		ctx, cancel := context.WithCancelCause(s.base)
 		defer cancel(nil)
 
-		// Control subject: any message on {reply}.ctl cancels this request.
-		ctlSub, err := s.nc.Subscribe(req.Reply()+ctlSuffix, func(*nats.Msg) {
+		// Control subject: a notifications/cancelled naming THIS request
+		// cancels it. The body is checked rather than assumed, because
+		// {reply}.ctl is an ordinary subject under the caller's inbox — a
+		// stray publish, a probe, or a cancellation meant for another request
+		// must not end a live call.
+		ctlSubject := req.Reply() + ctlSuffix
+		ctlSub, err := s.nc.Subscribe(ctlSubject, func(m *nats.Msg) {
+			if !isCancellation(m.Data, msg.ID) {
+				return
+			}
 			cancel(errClientCancelled)
 		})
-		if err == nil {
+		if err != nil {
+			// The request still runs — it just cannot be cancelled any more,
+			// and the keepalives would hide that for the whole stream, so the
+			// operator has to hear about it. A SUBSCRIBE the NATS server
+			// refuses does not land here (that arrives asynchronously on the
+			// connection); this is the local failures — closed connection,
+			// unusable subject.
+			s.log.Error("control subscription failed, this request cannot be cancelled",
+				"subject", ctlSubject, "err", err)
+		} else {
 			defer func() { _ = ctlSub.Unsubscribe() }()
 		}
 
 		// Keepalives until terminal.
 		kaDone := make(chan struct{})
 		defer close(kaDone)
-		go s.keepAliveLoop(req.Reply(), kaDone, w)
+		go s.keepAliveLoop(kaDone, w)
 
 		herr := handler(ctx, in, w)
 
@@ -403,6 +425,100 @@ func (s *Server) dispatch(prefix string, req micro.Request, handler Handler) {
 		}
 	}()
 }
+
+// isCancellation reports whether a control-subject message is a
+// notifications/cancelled naming the request with the given raw JSON-RPC id.
+//
+// Ids compare by DECODED VALUE, which is deliberately NOT what jsonrpc.IDKey
+// does. IDKey compares raw bytes, and everywhere else in this repo that is
+// right, because both sides of the comparison came out of the same decode.
+// Here they did not: a native client's request body is forwarded verbatim
+// while the cancellation naming it is re-encoded, and encoding/json escapes
+// <, > and & — so the same id arrives spelled two ways and IDKey calls them
+// different requests.
+//
+//	jsonrpc.IDKey:  "a<b" vs "a\u003cb" -> different
+//	isCancellation: "a<b" vs "a\u003cb" -> the same request
+//
+// A string "1" and a number 1 are still different requests, and so are 1 and
+// 1.0: sameRequestID keeps a number's literal via UseNumber, because the
+// client chose the spelling and it is the client's to keep.
+func isCancellation(data, id []byte) bool {
+	if len(id) == 0 {
+		return false
+	}
+	// Cheap reject ahead of the parsing. This runs on the NATS delivery
+	// goroutine over whatever a caller chose to publish to its own inbox, so
+	// the common non-cancellation — a stray publish, a probe, a flood — is
+	// turned away on a substring scan instead of two JSON decodes. A false
+	// positive costs only the work the checks below would have done anyway.
+	if !bytes.Contains(data, []byte(mcpspec.NotifCancelled)) {
+		return false
+	}
+	m, err := jsonrpc.Decode(data)
+	if err != nil || m.Kind() != jsonrpc.KindNotification || m.Method != mcpspec.NotifCancelled {
+		return false
+	}
+	var p struct {
+		RequestID json.RawMessage `json:"requestId"`
+	}
+	if json.Unmarshal(m.Params, &p) != nil || len(p.RequestID) == 0 {
+		return false
+	}
+	return sameRequestID(p.RequestID, id)
+}
+
+// sameRequestID reports whether two JSON-RPC ids denote the same request.
+//
+// Byte equality is not enough, because the two ids reaching this point did not
+// come out of the same encoder. A native client's request body is forwarded
+// VERBATIM, so its id is whatever that client wrote; the cancellation naming
+// it is re-encoded by Go somewhere along the way, and encoding/json escapes
+// <, > and & to \u003c, \u003e and \u0026 by default. An id carrying any of
+// them — a URL, an HTML fragment, anything a client derived from user text —
+// therefore arrives spelled two ways, and comparing the bytes drops the
+// cancellation. The request then runs to completion after the client asked it
+// to stop, which is the failure the ctl guard exists to prevent, reached from
+// the other side.
+//
+// Comparing the decoded values also settles 1 vs 1.0 vs 1e0 the way a reader
+// expects, since json.Number keeps the literal and two spellings of one number
+// are not the same id under JSON-RPC's "the client chose this string" rule.
+func sameRequestID(a, b []byte) bool {
+	// Decoded first, with no byte-equality shortcut ahead of it. A shortcut
+	// would answer before decodeID could refuse a value that is not an id at
+	// all, so `null` would name the request whose id is `null` — and
+	// jsonrpc.HasID counts a literal null as present, which is how such a
+	// request exists on the wire in the first place. That is the one id an
+	// attacker never has to guess.
+	da, err := decodeID(a)
+	if err != nil {
+		return false
+	}
+	db, err := decodeID(b)
+	if err != nil {
+		return false
+	}
+	return da == db
+}
+
+func decodeID(raw []byte) (any, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber() // a number's literal is its identity; float64 would round
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, err
+	}
+	switch v.(type) {
+	case string, json.Number:
+		return v, nil
+	}
+	// JSON-RPC 2.0 allows only a string or a number as an id; anything else
+	// cannot name a request and must not match one.
+	return nil, errNotAnID
+}
+
+var errNotAnID = errors.New("wire: id is neither a string nor a number")
 
 // beginRequest reserves the request's slot in the drain WaitGroup, reporting
 // false once Shutdown has stopped waiting for new work.
@@ -507,7 +623,7 @@ func (s *Server) refuseDrained(req micro.Request) {
 	_ = w.Err(ErrCodeStreamLost, "gateway draining, re-issue the request", nil)
 }
 
-func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWriter) {
+func (s *Server) keepAliveLoop(done <-chan struct{}, w *streamWriter) {
 	ticker := time.NewTicker(s.keepAlive)
 	defer ticker.Stop()
 	for {
@@ -515,13 +631,9 @@ func (s *Server) keepAliveLoop(reply string, done <-chan struct{}, w *streamWrit
 		case <-done:
 			return
 		case <-ticker.C:
-			if w.terminated() {
+			if !w.ka() {
 				return
 			}
-			_ = s.nc.PublishMsg(&nats.Msg{
-				Subject: reply,
-				Header:  nats.Header{HeaderFrame: []string{string(FrameKA)}},
-			})
 		}
 	}
 }
@@ -552,6 +664,21 @@ func (w *streamWriter) terminated() bool {
 }
 
 // claim marks the stream terminal; reports false if it already was.
+//
+// Two properties of this function are what order the frames on the reply
+// subject, and neither is local to it — change either and Msg/ka silently
+// start publishing behind the terminal frame:
+//
+//  1. done is set BEFORE the caller publishes its terminal frame. That is what
+//     makes a later Msg refuse rather than publish.
+//  2. the lock is released before that publish, and Msg/ka hold it ACROSS
+//     theirs. That is what makes claim block behind a notification already in
+//     flight instead of overtaking it.
+//
+// Together: every msg frame either completes before claim returns or never
+// goes out at all. So do not "tidy" this by setting done after the terminal
+// publish, and do not fold the publish into this function — holding the lock
+// across it would stall the keepalive loop behind whatever End is doing.
 func (w *streamWriter) claim() bool {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -562,8 +689,24 @@ func (w *streamWriter) claim() bool {
 	return true
 }
 
+// Msg publishes under the same lock the terminal frames claim, rather than
+// checking terminated() and publishing after releasing it. In that gap a
+// concurrent End can claim the stream and respond, putting this notification
+// on the reply subject BEHIND the terminal frame — where the consumer has
+// already stopped reading and the request is already answered. The proxy
+// reaches the gap for real: pkg/backend's mux hands a response to the blocked
+// Call and reads on immediately, so a backend notification arriving before
+// Call unregisters is dispatched here while the handler is inside End.
+//
+// The cost is deliberate: a publish that blocks on a slow connection now holds
+// up the terminal frame and the keepalives too. That is the right way round —
+// a terminal frame that overtook a stalled notification is the bug — and a
+// connection too backed up to accept a publish was going to stall the terminal
+// frame at the socket regardless.
 func (w *streamWriter) Msg(body []byte) error {
-	if w.terminated() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
 		return fmt.Errorf("wire: stream already terminated")
 	}
 	if max := w.nc.MaxPayload(); int64(len(body)) > max {
@@ -577,6 +720,28 @@ func (w *streamWriter) Msg(body []byte) error {
 		Data:    body,
 		Header:  nats.Header{HeaderFrame: []string{string(FrameMsg)}},
 	})
+}
+
+// ka publishes one keepalive, reporting whether the stream is still live. It
+// holds the lock across the publish for the same reason Msg does: once the
+// terminal frame is on the reply subject, nothing else may follow it.
+//
+// The bool says "not terminal yet", NOT "the keepalive was delivered" — the
+// publish error is dropped on purpose. A keepalive is a hint that resets the
+// caller's inactivity deadline; a connection that cannot carry one cannot
+// carry the response either, and that failure belongs to whoever is publishing
+// the response, not to a ticker.
+func (w *streamWriter) ka() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.done {
+		return false
+	}
+	_ = w.nc.PublishMsg(&nats.Msg{
+		Subject: w.req.Reply(),
+		Header:  nats.Header{HeaderFrame: []string{string(FrameKA)}},
+	})
+	return true
 }
 
 func (w *streamWriter) End(body []byte) error {
