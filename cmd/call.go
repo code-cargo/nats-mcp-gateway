@@ -31,6 +31,19 @@ func runCall(c *CallCmd, g *Globals) error {
 	if c.Creds != "" {
 		opts = append(opts, nats.UserCredentials(c.Creds))
 	}
+	if c.InboxPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+			return fmt.Errorf("--inbox-prefix: %w", err)
+		}
+		opts = append(opts, nats.CustomInboxPrefix(c.InboxPrefix))
+	}
+	// NewClient checks this too; checking it here as well is what names the
+	// flag that is wrong, the same way --inbox-prefix does above.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return fmt.Errorf("--subject-prefix: %w", err)
+		}
+	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
 		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
@@ -42,6 +55,12 @@ func runCall(c *CallCmd, g *Globals) error {
 	var params map[string]json.RawMessage
 	if err := json.Unmarshal([]byte(c.Params), &params); err != nil {
 		return fmt.Errorf("--params is not a JSON object: %w", err)
+	}
+	if params == nil {
+		// A JSON null decodes into a map cleanly and leaves it nil, so it is
+		// the one non-object --params the check above lets past. Read as "no
+		// params", the way the shim's injectMeta reads it.
+		params = map[string]json.RawMessage{}
 	}
 	var meta map[string]json.RawMessage
 	if raw, ok := params["_meta"]; ok {
@@ -69,7 +88,7 @@ func runCall(c *CallCmd, g *Globals) error {
 		name = s
 	}
 
-	cfg := wire.ClientConfig{Tenant: c.Tenant, User: c.User}
+	cfg := wire.ClientConfig{Prefix: c.SubjectPrefix, Tenant: c.Tenant, User: c.User}
 	if c.AcceptClaims {
 		js, err := jetstream.New(nc)
 		if err != nil {

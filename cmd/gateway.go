@@ -254,6 +254,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		User:       boot.user,
 		Version:    normalizeVersion(version),
 		Claims:     claims,
+		Logger:     log,
 	}, px.Handler())
 	if err != nil {
 		return err
@@ -370,6 +371,13 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	if c.InboxPrefix != "" {
 		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
 			return bootParams{}, fmt.Errorf("--inbox-prefix: %w", err)
+		}
+	}
+	// wire.Serve rejects this too — this is what names the flag, and what
+	// fails before we open a connection.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
 		}
 	}
 

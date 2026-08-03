@@ -84,6 +84,28 @@ func TestObjectClaimsPutFetch(t *testing.T) {
 	require.Error(t, err)
 }
 
+// claimMaxBody is enforced gateway-side in streamWriter.End, but the client is
+// what an object actually reaches, and it does not get to assume the producer
+// honoured the cap. Fetch used to hand the whole object to io.ReadAll however
+// big it was, so a claim reference pointing at a multi-GiB object was an OOM
+// on whatever process held the shim.
+func TestClaimFetchRefusesOversizeObject(t *testing.T) {
+	nc := jsNATS(t, 0)
+	js, err := jetstream.New(nc)
+	require.NoError(t, err)
+	oc := &ObjectClaims{JS: js, MaxAge: time.Minute}
+	ctx := context.Background()
+
+	// Straight to Put, which is exactly how an oversize object gets there:
+	// nothing on this side of the wire re-checks what End refused to park.
+	id, err := oc.Put(ctx, "acme", bytes.Repeat([]byte("x"), claimMaxBody+1))
+	require.NoError(t, err)
+
+	_, err = oc.Fetch(ctx, "acme", id)
+	require.Error(t, err, "an oversize claim must not be read into memory")
+	assert.Contains(t, err.Error(), "exceeds")
+}
+
 func TestClaimRoundTripOverWire(t *testing.T) {
 	nc := jsNATS(t, 64*1024)
 	js, err := jetstream.New(nc)

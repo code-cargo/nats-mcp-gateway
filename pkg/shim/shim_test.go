@@ -16,11 +16,15 @@ package shim
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -218,6 +222,103 @@ func TestShimCrashYieldsStreamLost(t *testing.T) {
 	require.NotNil(t, m.Error)
 	assert.Equal(t, wire.ErrCodeStreamLost, m.Error.Code)
 }
+
+// One client line past the cap must cost that line and nothing else. Read
+// through bufio.Scanner it cost the session: ErrTooLong ends the scan, Run
+// returns, and every concurrent request is abandoned with no error frame while
+// the MCP client watches its server process exit.
+func TestShimOversizeClientLineDoesNotEndTheSession(t *testing.T) {
+	h := newHarness(t, true)
+
+	// Written from its own goroutine: a shim that stops reading part-way
+	// through the line would otherwise wedge the test on the pipe rather than
+	// fail it.
+	go func() {
+		_, _ = h.stdin.Write(append(bytes.Repeat([]byte("x"), maxLineBytes+1), '\n'))
+		_, _ = h.stdin.Write([]byte(req("1", "tools/list", "") + "\n"))
+	}()
+
+	select {
+	case err := <-h.runErr:
+		t.Fatalf("the shim exited over one oversize line: %v", err)
+	case line, ok := <-h.lines:
+		require.True(t, ok, "shim stdout closed")
+		m, err := jsonrpc.Decode([]byte(line))
+		require.NoError(t, err)
+		require.Nil(t, m.Error, "the request behind the oversize line must be served normally: %s", line)
+		assert.JSONEq(t, `"1"`, string(m.ID))
+	case <-time.After(20 * time.Second):
+		t.Fatal("the shim stopped reading after the oversize line")
+	}
+}
+
+// The line reader is hand-rolled, so its edges are pinned here: the cap counts
+// the line and not its terminator, an oversize line costs only itself, and a
+// stream that ends mid-line still ends the loop.
+func TestReadLineSkipsOnlyTheOversizeLine(t *testing.T) {
+	const max = 8
+	read := func(in string) (lines []string, drops int, err error) {
+		r := bufio.NewReaderSize(strings.NewReader(in), 16)
+		for {
+			line, rerr := readLine(r, max)
+			if errors.Is(rerr, errLineTooLong) {
+				drops++
+				continue
+			}
+			if len(line) > 0 {
+				lines = append(lines, string(line))
+			}
+			if rerr != nil {
+				return lines, drops, rerr
+			}
+		}
+	}
+
+	// The oversize line must be longer than the READER'S BUFFER, not merely
+	// longer than the cap: ReadSlice only returns ErrBufferFull when the line
+	// outruns the buffer, and that refill loop is the only path an oversize
+	// line takes in production, where the cap is 16MiB and the buffer 64KiB.
+	// A line that fits the buffer exercises none of the draining.
+	lines, drops, err := read("a\n" + strings.Repeat("x", 40) + "\nb\n")
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{"a", "b"}, lines, "the lines around an oversize one are untouched")
+	assert.Equal(t, 1, drops)
+
+	lines, drops, err = read(strings.Repeat("y", max) + "\ntrailing")
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{strings.Repeat("y", max), "trailing"}, lines,
+		"a line exactly at the cap is kept, and so is an unterminated last line")
+	assert.Zero(t, drops)
+
+	// A stream cut off mid-oversize-line must report the drop and then stop,
+	// not spin on a reader that will never produce a newline.
+	lines, drops, err = read("a\n" + strings.Repeat("z", max+1))
+	assert.Equal(t, io.EOF, err)
+	assert.Equal(t, []string{"a"}, lines)
+	assert.Equal(t, 1, drops)
+
+	// The drop carries how far past the cap the line went: the cap alone is
+	// the one number the operator reading that log line already knows.
+	_, err = readLine(bufio.NewReaderSize(strings.NewReader(strings.Repeat("w", 40)+"\n"), 16), max)
+	require.ErrorIs(t, err, errLineTooLong)
+	assert.Contains(t, err.Error(), "40 bytes")
+}
+
+// EOF ends the loop without being reported; anything else is a real failure of
+// the client's pipe and has to reach Run's caller, or the shim exits 0 on a
+// broken stdin and whatever supervises it sees a clean shutdown.
+func TestRunReportsAReadFailure(t *testing.T) {
+	boom := errors.New("stdin exploded")
+	s := New(nil, Config{Server: "test", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	err := s.Run(context.Background(),
+		io.MultiReader(strings.NewReader("not json\n"), errReader{boom}), io.Discard)
+	assert.ErrorIs(t, err, boom)
+}
+
+// errReader fails every read, standing in for a pipe that breaks mid-session.
+type errReader struct{ err error }
+
+func (e errReader) Read([]byte) (int, error) { return 0, e.err }
 
 func TestShimInjectsMissingProtocolVersion(t *testing.T) {
 	h := newHarness(t, true)

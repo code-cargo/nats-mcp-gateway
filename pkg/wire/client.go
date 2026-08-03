@@ -86,6 +86,17 @@ type Client struct {
 
 // NewClient wraps an established NATS connection.
 func NewClient(nc *nats.Conn, cfg ClientConfig) (*Client, error) {
+	// The prefix is validated here rather than by each caller because
+	// BuildSubject checks every other token and pastes this one in unchecked:
+	// a trailing dot or a wildcard produces a subject nothing serves, and the
+	// caller is told -32011, "no gateway is serving this server". Blaming a
+	// healthy fleet is the worst answer a debugging tool can give, and it is
+	// what the shim and `natsmcp call` both gave.
+	if cfg.Prefix != "" {
+		if err := ValidateSubjectPrefix(cfg.Prefix); err != nil {
+			return nil, fmt.Errorf("wire: %w", err)
+		}
+	}
 	if cfg.Tenant == "" || !TokenSafe(cfg.Tenant) {
 		return nil, fmt.Errorf("wire: invalid tenant %q", cfg.Tenant)
 	}
@@ -278,6 +289,12 @@ func (c *Client) Do(ctx context.Context, req *Request) (*Stream, error) {
 	frames := make(chan Frame)
 	s := &Stream{C: frames, reply: reply, nc: c.nc, stop: func() { stop(nil) }}
 	go func() {
+		// streamCtx is a child of the CALLER's context, which typically
+		// outlives the request by a long way — the shim runs one context for
+		// the whole process. Releasing it here is what stops a completed
+		// request from staying registered on that parent for good; Close and
+		// the failure paths reach the same cancel, and it is idempotent.
+		defer stop(nil)
 		defer unregister()
 		c.pump(streamCtx, sub, frames)
 	}()
