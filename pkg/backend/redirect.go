@@ -47,9 +47,18 @@ import (
 // The rule kept here is the narrowest that closes all of it: a hop may change
 // the path, and nothing else. Same authority — host AND port, because on a pod
 // a different port is a different container and the sidecar next door is
-// exactly what an SSRF wants — and never a downgrade out of https.
-// A path redirect is the only one an MCP POST endpoint has any business
-// issuing, and 301/302/303 would turn the exchange into a GET anyway.
+// exactly what an SSRF wants — never a downgrade out of https, and never a
+// change of METHOD.
+//
+// That last one is not a formality. 301/302/303 rewrite the POST to a GET and
+// drop the body, which does not make them harmless — it is precisely what
+// leaves the backend's own GET surface readable through the gateway. The
+// authority checks bound such a hop to this backend's origin, but the injected
+// credential still rides along and the reply still reaches the caller as an
+// MCP result, so an MCP route that can be made to redirect becomes a read of
+// every GET-able path beside it. The exchange was lost either way: the
+// JSON-RPC body does not survive the rewrite, so refusing turns a confusing
+// answer into a legible error.
 func RefuseUnsafeRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) == 0 {
 		return nil
@@ -65,6 +74,17 @@ func RefuseUnsafeRedirect(req *http.Request, via []*http.Request) error {
 		return fmt.Errorf(
 			"refusing redirect from https to %q: the credential injected for this backend would cross the network in cleartext",
 			req.URL.Scheme,
+		)
+	}
+	// Go has already applied its redirect rules by the time this is called, so
+	// req.Method is the method the NEXT request would use: comparing it with
+	// the one that provoked the redirect detects the rewrite without needing
+	// the status code. Checking the immediately previous request is enough —
+	// any earlier hop that changed the method was refused at its own hop.
+	if prev := via[len(via)-1]; req.Method != prev.Method {
+		return fmt.Errorf(
+			"refusing redirect that rewrites %s to %s: the body is dropped and the reply would be another path's, read under this backend's injected credential",
+			prev.Method, req.Method,
 		)
 	}
 	if len(via) > 5 {

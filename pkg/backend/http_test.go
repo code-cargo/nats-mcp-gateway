@@ -1066,6 +1066,65 @@ func TestInjectedClientStillRefusesUnsafeRedirects(t *testing.T) {
 	assert.Nil(t, caller.CheckRedirect, "the caller's own client was mutated instead of copied")
 }
 
+// TestRedirectCannotRewriteTheMethod covers the hop that changes what the
+// exchange IS rather than where it goes.
+//
+// Go rewrites POST to GET on 301/302/303 and drops the body. Every authority
+// check still passes on a same-origin hop, so nothing else here stops it: the
+// injected credential rides along and the reply reaches the caller as an MCP
+// result, making an MCP route that can be made to redirect a read of every
+// GET-able path beside it. 307/308 preserve the method and stay allowed.
+func TestRedirectCannotRewriteTheMethod(t *testing.T) {
+	mk := func(method, u string) *http.Request {
+		r, err := http.NewRequest(method, u, nil)
+		require.NoError(t, err)
+		return r
+	}
+	assert.Error(t, RefuseUnsafeRedirect(
+		mk(http.MethodGet, "https://h/admin"), []*http.Request{mk(http.MethodPost, "https://h/mcp")}),
+		"a 301/302/303 rewrite of the POST must not be followed, same origin or not")
+	assert.NoError(t, RefuseUnsafeRedirect(
+		mk(http.MethodPost, "https://h/mcp/v2"), []*http.Request{mk(http.MethodPost, "https://h/mcp")}),
+		"307/308 keep the method, and a same-origin path hop is the one thing allowed")
+	assert.NoError(t, RefuseUnsafeRedirect(
+		mk(http.MethodGet, "https://h/mcp/"), []*http.Request{mk(http.MethodGet, "https://h/mcp")}),
+		"the SSE stream is a GET to begin with; a GET->GET path hop is unchanged")
+}
+
+// TestSameOriginRedirectCannotReadAnotherPath is the end-to-end form: the hop
+// never leaves the backend's own host and port, so the authority checks are
+// satisfied and only the method rule stands between a 302 and another path's
+// body being returned as this call's result.
+func TestSameOriginRedirectCannotReadAnotherPath(t *testing.T) {
+	var readSecret atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/secret", func(w http.ResponseWriter, r *http.Request) {
+		readSecret.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":"g1","result":{"secret":"internal"}}`))
+	})
+	mux.HandleFunc("/mcp", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/secret", http.StatusFound) // 302: Go rewrites POST to GET
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL + "/mcp", Headers: map[string]string{"Authorization": "Bearer SUPER-SECRET"}}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsList, nil), nil)
+	assert.Equal(t, int32(0), readSecret.Load(),
+		"a same-origin 302 turned the POST into a GET of another path")
+	if err == nil && resp != nil {
+		assert.NotContains(t, string(resp.Result), "internal",
+			"the other path's body reached the caller as an MCP result")
+	}
+}
+
 func TestRefuseUnsafeRedirect(t *testing.T) {
 	req := func(u string) *http.Request {
 		r, err := http.NewRequest(http.MethodPost, u, nil)
