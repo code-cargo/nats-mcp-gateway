@@ -15,10 +15,44 @@
 package cmd
 
 import (
+	"os"
 	"time"
 
 	"github.com/alecthomas/kong"
 )
+
+// credsEnvNames is the credentials env var under each subcommand's own
+// documented name, followed by the other subcommand's, which is accepted as
+// an alias. Setting the one you had read about on the wrong subcommand used
+// not to fail — it was ignored, and the process connected with no credentials
+// at all, which against a server permitting anonymous connections means a
+// shim that runs and quietly has no identity. Neither name is renamed:
+// a documented variable that stops working is a broken deployment.
+var (
+	gatewayCredsEnv = []string{"NATSMCP_NATS_CREDS", "NATSMCP_CREDS"}
+	clientCredsEnv  = []string{"NATSMCP_CREDS", "NATSMCP_NATS_CREDS"}
+)
+
+// credsFromEnv resolves the credentials path the tag-level env list could not.
+//
+// Kong takes the first name in an `env:"A,B"` list that is SET — it calls
+// os.LookupEnv and stops on ok, empty value or not. Set-but-empty is a shape
+// deployments produce by accident (a Kubernetes env entry sourced from a
+// secret key that is not populated yet, a shell exporting an unset variable),
+// and under it a blank primary shadows the alias this pair exists for, which
+// is the credential-less connect all over again. First NON-EMPTY is what the
+// pair was always meant to mean.
+func credsFromEnv(current string, names ...string) string {
+	if current != "" {
+		return current
+	}
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return current
+}
 
 // Globals holds flags shared by every subcommand.
 type Globals struct {
@@ -94,6 +128,12 @@ type GatewayCmd struct {
 	Version string `kong:"-"`
 }
 
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *GatewayCmd) AfterApply() error {
+	c.NatsCreds = credsFromEnv(c.NatsCreds, gatewayCredsEnv...)
+	return nil
+}
+
 func (c *GatewayCmd) Run(g *Globals) error {
 	return runGateway(c, g, c.Version)
 }
@@ -109,6 +149,12 @@ type ShimCmd struct {
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
 	AcceptClaims  bool   `help:"Accept claim-checked oversize responses (needs read access to this tenant's claim bucket)." env:"NATSMCP_ACCEPT_CLAIMS"`
+}
+
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *ShimCmd) AfterApply() error {
+	c.Creds = credsFromEnv(c.Creds, clientCredsEnv...)
+	return nil
 }
 
 func (c *ShimCmd) Run(g *Globals) error {
@@ -132,6 +178,12 @@ type CallCmd struct {
 	SubjectPrefix string `help:"Wire subject prefix." default:"mcp.v1" env:"NATSMCP_SUBJECT_PREFIX"`
 	InboxPrefix   string `help:"Custom NATS inbox prefix (per-tenant inbox isolation)." env:"NATSMCP_INBOX_PREFIX"`
 	AcceptClaims  bool   `help:"Accept claim-checked oversize responses." env:"NATSMCP_ACCEPT_CLAIMS"`
+}
+
+// AfterApply runs inside kong.Parse, and only for the selected command.
+func (c *CallCmd) AfterApply() error {
+	c.Creds = credsFromEnv(c.Creds, clientCredsEnv...)
+	return nil
 }
 
 func (c *CallCmd) Run(g *Globals) error {

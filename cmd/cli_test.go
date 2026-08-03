@@ -69,3 +69,28 @@ func TestCredsEnvVarPrefersTheSubcommandsOwnName(t *testing.T) {
 	cli = parseCLI(t, "shim", "--server", "s")
 	assert.Equal(t, "/creds/client.creds", cli.Shim.Creds)
 }
+
+// Kong stops at the first name in an env list that is SET, empty or not. A
+// blank primary is a shape deployments produce by accident — a Kubernetes env
+// entry sourced from a secret key that is not populated yet — and it would
+// otherwise shadow the alias the pair exists for, putting us back at the
+// credential-less connect this whole pair is meant to prevent.
+func TestCredsEnvVarIgnoresAnEmptyValueForTheOtherName(t *testing.T) {
+	t.Setenv("NATSMCP_NATS_CREDS", "")
+	t.Setenv("NATSMCP_CREDS", "/creds/client.creds")
+	cli := parseCLI(t, "gateway", "--config-subject", "cfg.get")
+	assert.Equal(t, "/creds/client.creds", cli.Gateway.NatsCreds)
+
+	t.Setenv("NATSMCP_NATS_CREDS", "/creds/gateway.creds")
+	t.Setenv("NATSMCP_CREDS", "")
+	cli = parseCLI(t, "shim", "--server", "s")
+	assert.Equal(t, "/creds/gateway.creds", cli.Shim.Creds)
+}
+
+// An explicit flag still wins over both names.
+func TestCredsFlagBeatsEitherEnvVar(t *testing.T) {
+	t.Setenv("NATSMCP_NATS_CREDS", "/creds/gateway.creds")
+	t.Setenv("NATSMCP_CREDS", "/creds/client.creds")
+	cli := parseCLI(t, "shim", "--server", "s", "--creds", "/creds/flag.creds")
+	assert.Equal(t, "/creds/flag.creds", cli.Shim.Creds)
+}
