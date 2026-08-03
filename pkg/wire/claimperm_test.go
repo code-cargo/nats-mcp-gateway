@@ -23,12 +23,13 @@ import (
 	"testing"
 	"time"
 
-	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 	"github.com/nats-io/nats-server/v2/server"
 	nats "github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/code-cargo/nats-mcp-gateway/internal/natstest"
 )
 
 // The rest of the suite runs as an unrestricted user, so nothing in it can tell
