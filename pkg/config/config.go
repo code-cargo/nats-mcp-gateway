@@ -228,8 +228,18 @@ func (a *Auth) validate(server string) error {
 		return fmt.Errorf("server %q: unknown auth mode %q", server, a.Mode)
 	}
 	if a.TTL != "" {
-		if _, err := time.ParseDuration(a.TTL); err != nil {
-			return fmt.Errorf("server %q: auth ttl: %w", server, err)
+		if err := validateDuration(fmt.Sprintf("server %q: auth ttl", server), a.TTL); err != nil {
+			return err
+		}
+	}
+	// The cred subject is a PUBLISH prefix ({subject}.{tenant}.{user}.{server})
+	// and NATS will not publish to a subject holding a wildcard. Unchecked, the
+	// mistake surfaces on the first credential resolution as "no responders
+	// available" — which points the operator at a missing controller instead of
+	// at this line.
+	if a.Subject != "" {
+		if err := wire.ValidateSubjectPrefix(a.Subject); err != nil {
+			return fmt.Errorf("server %q: auth subject: %w", server, err)
 		}
 	}
 	return nil
@@ -323,11 +333,30 @@ func parse(raw []byte, strict bool, resolve lookup) (*Config, error) {
 	return &cfg, nil
 }
 
+// validateDuration parses a config duration and rejects a negative one.
+//
+// Zero stays legal because it is the documented "use the default" sentinel:
+// every consumer of these fields tests <= 0 and substitutes its own default
+// (pool 5m/1h, cred file 1m, claim bucket 5m), and the equivalent flags say so
+// ("0 = pool default, 5m"). A negative value lands in that same branch — so
+// "-30m" is not a shorter TTL, it is the default TTL, silently, with nothing
+// logged for the operator who asked for something else.
+func validateDuration(what, v string) error {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return fmt.Errorf("%s: %w", what, err)
+	}
+	if d < 0 {
+		return fmt.Errorf("%s: must not be negative (got %q)", what, v)
+	}
+	return nil
+}
+
 func (c *Config) validate() error {
 	if cc := c.ClaimCheck; cc != nil {
 		if cc.MaxAge != "" {
-			if _, err := time.ParseDuration(cc.MaxAge); err != nil {
-				return fmt.Errorf("claimCheck.maxAge: %w", err)
+			if err := validateDuration("claimCheck.maxAge", cc.MaxAge); err != nil {
+				return err
 			}
 		}
 		if cc.MaxBytes < 0 {
@@ -335,13 +364,28 @@ func (c *Config) validate() error {
 		}
 	}
 	if c.Pool.IdleTTL != "" {
-		if _, err := time.ParseDuration(c.Pool.IdleTTL); err != nil {
-			return fmt.Errorf("pool.idleTtl: %w", err)
+		if err := validateDuration("pool.idleTtl", c.Pool.IdleTTL); err != nil {
+			return err
 		}
 	}
 	if c.Pool.MaxLifetime != "" {
-		if _, err := time.ParseDuration(c.Pool.MaxLifetime); err != nil {
-			return fmt.Errorf("pool.maxLifetime: %w", err)
+		if err := validateDuration("pool.maxLifetime", c.Pool.MaxLifetime); err != nil {
+			return err
+		}
+	}
+	// The wire prefix fronts every subscription this gateway binds, and it is
+	// the one setting nothing downstream re-checks: micro accepts "*" in an
+	// endpoint subject and NATS binds it, so an unvalidated "mcp.*" widens the
+	// authz-bearing subscription to every prefix in the account and never
+	// fails.
+	if c.NATS.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.NATS.SubjectPrefix); err != nil {
+			return fmt.Errorf("nats.subjectPrefix: %w", err)
+		}
+	}
+	if c.NATS.QueueGroup != "" {
+		if err := wire.ValidateQueueGroup(c.NATS.QueueGroup); err != nil {
+			return fmt.Errorf("nats.queueGroup: %w", err)
 		}
 	}
 	if c.NATS.InboxPrefix != "" {

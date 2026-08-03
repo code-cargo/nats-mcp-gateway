@@ -104,7 +104,7 @@ func runCall(c *CallCmd, g *Globals) error {
 	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
+		return connectFailure(c.NatsURL, err)
 	}
 	defer nc.Close()
 

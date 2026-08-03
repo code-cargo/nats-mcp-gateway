@@ -22,6 +22,7 @@ import (
 	"maps"
 	"os"
 	"os/signal"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -137,7 +138,10 @@ func poolFromConfig(p config.Pool) backend.PoolConfig {
 }
 
 func runGateway(c *GatewayCmd, g *Globals, version string) error {
-	log := NewLogger(g)
+	log, err := NewLogger(g)
+	if err != nil {
+		return err
+	}
 
 	kind, err := c.selectSource()
 	if err != nil {
@@ -170,7 +174,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}
 	nc, err := nats.Connect(boot.url, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", boot.url, err)
+		return connectFailure(boot.url, err)
 	}
 	defer nc.Close()
 
@@ -296,7 +300,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		}
 	}()
 
-	log.Info("gateway starting", "nats", boot.url, "source", kind.describe(c))
+	log.Info("gateway starting", "nats", redactNATSURL(boot.url), "source", kind.describe(c))
 
 	// Run the config loop. It returns when ctx is cancelled (signal) or on a
 	// fatal initial-config error.
@@ -364,6 +368,19 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	}
 	if c.ScopeUser != "" && !wire.TokenSafe(c.ScopeUser) {
 		return bootParams{}, fmt.Errorf("--scope-user %q is not subject-token safe (%s)", c.ScopeUser, `A-Za-z0-9_-`)
+	}
+	// The wire prefix has no downstream check at all: micro accepts a "*" in an
+	// endpoint subject and NATS binds it, so "mcp.*" would subscribe this
+	// instance to every prefix in the account without ever failing.
+	if c.SubjectPrefix != "" {
+		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
+			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
+		}
+	}
+	if c.QueueGroup != "" {
+		if err := wire.ValidateQueueGroup(c.QueueGroup); err != nil {
+			return bootParams{}, fmt.Errorf("--queue-group: %w", err)
+		}
 	}
 	// Validated here rather than left to nats.Connect: the option's own check
 	// misses spaces, and its "invalid custom prefix" names neither the setting
@@ -853,11 +870,30 @@ func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	})
 }
 
-// normalizeVersion maps build versions like "dev" onto a semver micro will
-// accept.
+// semVer is micro's own acceptance rule — semver.org's suggested regexp, the
+// one micro applies to ServerConfig.Version. Duplicated rather than inferred
+// because the fallback below is only safe if it catches EVERYTHING micro would
+// reject: a looser local test (say, "starts with a digit") passes strings like
+// "1.2" or "1.02.3" straight through to a rejection we exist to prevent.
+var semVer = regexp.MustCompile(`^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?(?:\+([0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*))?$`)
+
+// normalizeVersion maps a build version onto a semver micro will accept —
+// micro rejects a service whose Version is not semver, and that rejection
+// fails wire.Serve and with it the boot.
+//
+// Release tags are "vX.Y.Z" and the leading "v" is not part of semver, so it
+// is stripped rather than sent to the fallback: mapping every release to 0.0.0
+// left `nats micro list` reporting one version for the entire fleet, unable to
+// show which instances had taken a rollout.
+//
+// Anything that is not semver after that — the Makefile's "develop", a build
+// off an untagged tree, a release tag typed as "v1.2" — becomes 0.0.0, because
+// a boot failure is a worse answer than an unhelpful version. That matters
+// most for the typo'd tag: release.yml takes its tag as free text, so the
+// mistake is not caught until the shipped binary fails to serve.
 func normalizeVersion(v string) string {
-	if len(v) > 0 && v[0] >= '0' && v[0] <= '9' {
-		return v
+	if s := strings.TrimPrefix(v, "v"); semVer.MatchString(s) {
+		return s
 	}
 	return "0.0.0"
 }

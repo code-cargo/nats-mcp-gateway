@@ -227,6 +227,65 @@ func TestNATSInboxPrefixValidation(t *testing.T) {
 	}
 }
 
+// The wire subject prefix is the front of every subscription this gateway
+// binds, so it gets the same literal-token check the inbox prefix gets. A
+// wildcard is the dangerous form and the one nothing downstream catches:
+// "mcp.*" builds the endpoint subject "mcp.*.req.*.*.{server}.>", which micro
+// accepts and NATS happily binds — the gateway then receives (and answers)
+// traffic addressed to every other prefix in the account. The empty-token
+// forms at least fail, but only at the first config apply, as nats.go's bare
+// "invalid subject".
+func TestNATSSubjectPrefixValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"nats":{"subjectPrefix":"acme.mcp"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "acme.mcp", cfg.NATS.SubjectPrefix)
+
+	cfg, err = Parse([]byte(`{"servers":{}}`))
+	require.NoError(t, err)
+	assert.Empty(t, cfg.NATS.SubjectPrefix, "absent = the wire default prefix")
+
+	for _, bad := range []string{"mcp.*", "mcp.>", "mcp v1", "mcp.v1.", ".mcp.v1", "mcp..v1"} {
+		_, err = Parse([]byte(`{"nats":{"subjectPrefix":"` + bad + `"},"servers":{}}`))
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "nats.subjectPrefix", bad)
+	}
+}
+
+// A queue group name is matched LITERALLY — "mcpgw.*" is not a pattern, it is
+// a group whose name happens to contain a star — so a wildcard written in the
+// belief that it scopes subjects silently means something other than what it
+// says. The malformed forms do fail, but late and anonymously: micro rejects a
+// space at the first config apply as "invalid endpoint queue group", naming
+// neither the setting nor the value, with the process already connected.
+func TestNATSQueueGroupValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"nats":{"queueGroup":"mcpgw.acme.u_9f3a"},"servers":{}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "mcpgw.acme.u_9f3a", cfg.NATS.QueueGroup)
+
+	for _, bad := range []string{"mcpgw.*", "mcpgw.>", "mcp gw", "mcpgw.", "mcpgw..acme"} {
+		_, err = Parse([]byte(`{"nats":{"queueGroup":"` + bad + `"},"servers":{}}`))
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "nats.queueGroup", bad)
+	}
+}
+
+// auth.subject is the front of a PUBLISH subject
+// ({subject}.{tenant}.{user}.{server}), and NATS refuses to publish to a
+// subject containing a wildcard. Unvalidated, the failure surfaces on the
+// first credential resolution as "no responders available" — which sends the
+// operator looking for a missing controller rather than at their own config.
+func TestAuthSubjectValidation(t *testing.T) {
+	cfg, err := Parse([]byte(`{"servers":{"gh":{"command":"x","auth":{"mode":"nats","subject":"ctl.creds"}}}}`))
+	require.NoError(t, err)
+	assert.Equal(t, "ctl.creds", cfg.Servers["gh"].Auth.Subject)
+
+	for _, bad := range []string{"mcp.v1.cred.>", "mcp.v1.*.cred", "mcp.v1.cred.", "mcp v1.cred"} {
+		_, err = Parse([]byte(`{"servers":{"gh":{"command":"x","auth":{"mode":"nats","subject":"` + bad + `"}}}}`))
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "auth subject", bad)
+	}
+}
+
 func TestClaimCheckValidation(t *testing.T) {
 	cfg, err := Parse([]byte(`{"claimCheck":{"maxAge":"10m","maxBytes":1000000},"servers":{}}`))
 	require.NoError(t, err)
@@ -248,6 +307,34 @@ func TestClaimCheckValidation(t *testing.T) {
 	_, err = Parse([]byte(`{"claimCheck":{"maxBytes":-1},"servers":{}}`))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "maxBytes")
+}
+
+// time.ParseDuration accepts "-30m", so a negative duration used to validate
+// clean and then disappear: every consumer of these fields reads <= 0 as
+// "unset" and substitutes its own default (pool 5m/1h, cred file 1m, claim
+// bucket 5m). The operator who wrote a leading "-" got the default and no
+// signal that their setting had been discarded. Zero stays legal — it IS the
+// documented "use the default" sentinel ("0 = pool default, 5m") — but a
+// negative one cannot be anything but a mistake.
+func TestNegativeDurationsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		doc     string
+		wantErr string
+	}{
+		{`{"pool":{"idleTtl":"-30m"},"servers":{}}`, "pool.idleTtl"},
+		{`{"pool":{"maxLifetime":"-1h"},"servers":{}}`, "pool.maxLifetime"},
+		{`{"claimCheck":{"maxAge":"-5m"},"servers":{}}`, "claimCheck.maxAge"},
+		{`{"servers":{"gh":{"command":"x","auth":{"mode":"file","path":"/c","ttl":"-10s"}}}}`, "auth ttl"},
+	} {
+		_, err := Parse([]byte(tc.doc))
+		require.Error(t, err, tc.doc)
+		assert.Contains(t, err.Error(), tc.wantErr)
+		assert.Contains(t, err.Error(), "negative", tc.doc)
+	}
+
+	// Zero and positive values are untouched.
+	_, err := Parse([]byte(`{"pool":{"idleTtl":"0s","maxLifetime":"24h"},"claimCheck":{"maxAge":"0"},"servers":{}}`))
+	require.NoError(t, err)
 }
 
 func TestCacheScopeValidation(t *testing.T) {

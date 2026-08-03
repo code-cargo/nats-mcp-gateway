@@ -27,7 +27,10 @@ import (
 )
 
 func runShim(c *ShimCmd, g *Globals) error {
-	log := NewLogger(g) // stderr only: stdout is the MCP pipe
+	log, err := NewLogger(g) // stderr only: stdout is the MCP pipe
+	if err != nil {
+		return err
+	}
 
 	opts := []nats.Option{
 		nats.Name("natsmcp-shim-" + c.Server),
@@ -51,7 +54,7 @@ func runShim(c *ShimCmd, g *Globals) error {
 	}
 	nc, err := nats.Connect(c.NatsURL, opts...)
 	if err != nil {
-		return fmt.Errorf("connect NATS %s: %w", c.NatsURL, err)
+		return connectFailure(c.NatsURL, err)
 	}
 	defer nc.Close()
 
@@ -73,6 +76,6 @@ func runShim(c *ShimCmd, g *Globals) error {
 	}
 
 	s := shim.New(wc, shim.Config{Server: c.Server, Logger: log})
-	log.Info("shim running", "server", c.Server, "tenant", c.Tenant, "nats", c.NatsURL)
+	log.Info("shim running", "server", c.Server, "tenant", c.Tenant, "nats", redactNATSURL(c.NatsURL))
 	return s.Run(context.Background(), os.Stdin, os.Stdout)
 }

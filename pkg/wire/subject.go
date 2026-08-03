@@ -73,15 +73,39 @@ func TokenSafe(s string) bool {
 // doubled or trailing dot) subscribes to something other than what was
 // written. nats.CustomInboxPrefix catches the first three of those, but only
 // at connect time and with no mention of which setting was wrong.
+//
+// The WIRE prefix has no such downstream check at all: micro's endpoint-subject
+// check permits "*" anywhere and NATS binds the result, so "mcp.*" quietly
+// subscribes this instance to every prefix in the account.
 func ValidateSubjectPrefix(s string) error {
+	return validateTokenRun("subject prefix", s)
+}
+
+// ValidateQueueGroup checks that s is usable as a NATS queue group — the same
+// dotted run of literal tokens, for a different reason.
+//
+// A group name is compared LITERALLY: "mcpgw.*" is not a pattern, it is a
+// group whose name contains a star, so a wildcard written in the belief that
+// it scopes subjects does something other than what it says and nothing ever
+// complains. The malformed forms do fail, but late and anonymously — micro
+// rejects a space at the first config apply as "invalid endpoint queue group",
+// naming neither the setting nor the value, by which point the process has
+// connected and looks healthy.
+func ValidateQueueGroup(s string) error {
+	return validateTokenRun("queue group", s)
+}
+
+// validateTokenRun walks a dotted run of literal subject tokens. what names
+// the run in the error ("subject prefix", "queue group").
+func validateTokenRun(what, s string) error {
 	for _, tok := range strings.Split(s, ".") {
 		switch {
 		case tok == "":
-			return fmt.Errorf("invalid subject prefix %q: empty token (leading, doubled, or trailing dot)", s)
+			return fmt.Errorf("invalid %s %q: empty token (leading, doubled, or trailing dot)", what, s)
 		case strings.ContainsAny(tok, "*>"):
-			return fmt.Errorf("invalid subject prefix %q: wildcards (* and >) are not allowed", s)
+			return fmt.Errorf("invalid %s %q: wildcards (* and >) are not allowed", what, s)
 		case !TokenSafe(tok):
-			return fmt.Errorf("invalid subject prefix %q: token %q is not subject-token safe (%s)", s, tok, `A-Za-z0-9_-`)
+			return fmt.Errorf("invalid %s %q: token %q is not subject-token safe (%s)", what, s, tok, `A-Za-z0-9_-`)
 		}
 	}
 	return nil

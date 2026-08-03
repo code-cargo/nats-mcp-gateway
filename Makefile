@@ -24,7 +24,7 @@ GREEN := \033[32m
 RED := \033[31m
 RESET := \033[0m
 
-.PHONY: all build ci install-tools vet fmt fmt-check test test-ci tidy clean demo image
+.PHONY: all build ci install-tools vet fmt fmt-check test test-ci test-race tidy clean demo image
 
 .DEFAULT_GOAL := build
 
@@ -49,9 +49,15 @@ install-tools:
 $(bin_dir):
 	mkdir -p $@
 
+# -trimpath matches the Dockerfile: this target builds the RELEASED tarballs
+# (release.yml calls it per GOOS/GOARCH), and without it every panic trace and
+# every embedded file path in them names the runner's checkout directory. It
+# also makes the build reproducible from a different working directory, which
+# is what makes the attached provenance attestation independently checkable.
 build: | $(bin_dir)
 	@printf "${GREEN}Building $(BINARY)...${RESET}\n"
 	@CGO_ENABLED=0 go build \
+		-trimpath \
 		-ldflags="$(LDFLAGS)" \
 		-o "$(bin_dir)/$(BINARY)" . || \
 		(printf "${RED}Build failed for $(BINARY)${RESET}\n" && exit 1)
@@ -63,6 +69,14 @@ test:
 test-ci:
 	@printf "${GREEN}Running CI tests...${RESET}\n"
 	go run gotest.tools/gotestsum@latest --junitfile test-results.xml --format testdox -- ./...
+
+# Separate from test-ci, not folded into it: the race detector is the only
+# thing that reads the concurrency this codebase is built on (the pool's
+# reaper, the wire's per-request goroutines, the shim's stream map), and a
+# failure that shows up ONLY under -race should say so by which job went red.
+test-race:
+	@printf "${GREEN}Running race tests...${RESET}\n"
+	go test ./... -race -count=1
 
 vet:
 	$(call check_tool,staticcheck)

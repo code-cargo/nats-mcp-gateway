@@ -491,6 +491,52 @@ func TestBootParamsValidatesInboxPrefix(t *testing.T) {
 	assert.Empty(t, boot.inboxPrefix)
 }
 
+// The connect failure is the likeliest place a NATS URL is ever read by a
+// human, and until it was redacted it was also the likeliest place the
+// password leaked: a gateway that cannot reach NATS crash-loops, so the error
+// lands in a pod's event stream and in whatever the operator pastes into a
+// ticket.
+func TestConnectErrorRedactsPassword(t *testing.T) {
+	port := closedPort(t)
+	err := connectErr(t, "nats://gw:s3cr3t@127.0.0.1:"+port)
+	assert.NotContains(t, err.Error(), "s3cr3t")
+	assert.Contains(t, err.Error(), "nats://gw:xxxxx@127.0.0.1:"+port,
+		"the host and identity must survive: they are what the operator needs")
+}
+
+// The wire prefix and queue group get the same boot check as the inbox prefix,
+// and for a sharper reason: nothing downstream rejects a wildcard prefix.
+// "mcp.*" binds the endpoint subject "mcp.*.req.*.*.{server}.>" — micro accepts
+// it, NATS binds it, and this gateway then receives traffic addressed to every
+// other prefix in the account. The empty-token forms and a spaced queue group
+// do fail, but only at the first config apply, from nats.go and micro, naming
+// neither the setting nor the value.
+func TestBootParamsValidatesSubjectPrefixAndQueueGroup(t *testing.T) {
+	for _, bad := range []string{"mcp.*", "mcp.>", "mcp v1", "mcp.v1.", ".mcp.v1", "mcp..v1"} {
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", SubjectPrefix: bad}).bootParams(sourceFetch)
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "--subject-prefix", bad)
+	}
+	for _, bad := range []string{"mcpgw.*", "mcpgw.>", "mcp gw", "mcpgw.", "mcpgw..acme"} {
+		_, err := (&GatewayCmd{ConfigSubject: "cfg", QueueGroup: bad}).bootParams(sourceFetch)
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "--queue-group", bad)
+	}
+
+	boot, err := (&GatewayCmd{ConfigSubject: "cfg", SubjectPrefix: "acme.mcp", QueueGroup: "mcpgw.acme"}).
+		bootParams(sourceFetch)
+	require.NoError(t, err)
+	assert.Equal(t, "acme.mcp", boot.prefix)
+	assert.Equal(t, "mcpgw.acme", boot.queueGroup)
+
+	// Unset stays unset, so wire.Serve still applies its scope-aware queue
+	// group default.
+	boot, err = (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
+	require.NoError(t, err)
+	assert.Empty(t, boot.prefix)
+	assert.Empty(t, boot.queueGroup)
+}
+
 func writeConfig(t *testing.T, doc string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "gateway.json")
@@ -962,6 +1008,61 @@ func TestGatewayInlineConfigServesTenantScoped(t *testing.T) {
 	}
 	require.NotNil(t, last.Err, "another tenant must not reach the scoped pod")
 	assert.Equal(t, wire.ErrCodeNoGateway, last.Err.Code)
+}
+
+// Release tags are "vX.Y.Z", and the leading v sent every one of them to the
+// 0.0.0 fallback — so `nats micro list` reported 0.0.0 for the whole fleet and
+// could not tell a rolled-out build from the one it replaced, which is most of
+// what that command is for during a rollout.
+func TestNormalizeVersionKeepsReleaseTags(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"v1.2.3", "1.2.3"},
+		{"v1.2.3-rc.1", "1.2.3-rc.1"},
+		{"1.2.3", "1.2.3"},
+		{"v1.2.3+build.7", "1.2.3+build.7"},
+		// No semver reading: the Makefile's default, and a build off an
+		// untagged tree.
+		{"develop", "0.0.0"},
+		{"dev", "0.0.0"},
+		{"", "0.0.0"},
+		{"v", "0.0.0"},
+		// Stripping the "v" must not walk a MALFORMED tag past the fallback.
+		// release.yml takes its tag as free text, so each of these is one
+		// keystroke away from a real release — and each is rejected by micro,
+		// which would fail wire.Serve and with it the boot of the binary that
+		// release just shipped. The fallback is the whole point: an unhelpful
+		// version beats a gateway that will not start.
+		{"v1.2", "0.0.0"},
+		{"v2", "0.0.0"},
+		{"v1.02.3", "0.0.0"},  // semver forbids the leading zero
+		{"v1.2.3.4", "0.0.0"}, // a fourth component is not semver
+		{"v1.2.3_rc1", "0.0.0"},
+	} {
+		assert.Equal(t, tc.want, normalizeVersion(tc.in), tc.in)
+	}
+}
+
+// ...and the output still has to satisfy micro, which rejects a non-semver
+// Version outright. That check is why normalizeVersion exists, so stripping
+// the "v" must not walk past it: a rejected version fails wire.Serve, which
+// fails the boot.
+func TestNormalizeVersionSatisfiesMicro(t *testing.T) {
+	nc, _ := fetchNATS(t)
+	for _, v := range []string{
+		"v1.2.3", "v1.2.3-rc.1", "v1.2.3+build.7", "develop",
+		// The malformed tags go through micro too: the fallback is only worth
+		// anything if what it catches is exactly what micro would reject.
+		"v1.2", "v2", "v1.02.3", "v1.2.3.4", "v1.2.3_rc1",
+	} {
+		ws, err := wire.Serve(nc, wire.ServerConfig{
+			Version: normalizeVersion(v),
+			Servers: []string{"a"},
+		}, nil)
+		require.NoError(t, err, v)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		require.NoError(t, ws.Shutdown(ctx))
+		cancel()
+	}
 }
 
 func waitServing(t *testing.T, a *assembled, serverName string) {
