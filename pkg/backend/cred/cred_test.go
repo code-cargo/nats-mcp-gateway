@@ -603,6 +603,43 @@ func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {
 	assert.Equal(t, 6, inner.count(), "each invalidation must still re-resolve")
 }
 
+func TestInvalidateDoesNotCollapseTheRefreshCadence(t *testing.T) {
+	// Remembering what Invalidate dropped answers one question — did the
+	// material move — and must not be mistaken for an answer to the other. A
+	// refresh returning an unchanged ExpiresAt is unproductive and re-arms at a
+	// fixed skew cadence; a refetch after a 401 returning the same credential
+	// is not a refresh at all, and re-arming it that way would put an hour-long
+	// credential into a resolve every 30s for the rest of its life — trading a
+	// backend spawned per request for a credential source called per skew.
+	exp := time.Now().Add(time.Hour)
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": "Bearer constant"},
+			ExpiresAt: exp,
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, _, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	e := c.entry("t", "u", "s")
+	e.mu.Lock()
+	primed := e.refreshAt
+	e.mu.Unlock()
+	require.WithinDuration(t, exp, primed, 2*DefaultSkew,
+		"the lead window opens just before expiry, not just after the resolve")
+
+	c.Invalidate("t", "u", "s")
+	_, _, err = c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+
+	e.mu.Lock()
+	refetched := e.refreshAt
+	e.mu.Unlock()
+	assert.WithinDuration(t, primed, refetched, 2*DefaultSkew,
+		"a refetch after a 401 must leave the refresh-ahead where the credential's expiry put it")
+}
+
 func TestFailBackoffCaps(t *testing.T) {
 	assert.Equal(t, failBackoffBase, failBackoff(1))
 	assert.Equal(t, 2*failBackoffBase, failBackoff(2))

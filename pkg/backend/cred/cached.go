@@ -245,11 +245,19 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 	if !creds.ExpiresAt.IsZero() && !creds.ExpiresAt.After(now) {
 		return fmt.Errorf("cred: source returned credentials already expired at %s", creds.ExpiresAt.Format(time.RFC3339))
 	}
+	// Two questions, two different predecessors. Whether the MATERIAL moved is
+	// asked of whatever this entry last held, Invalidate's dropped copy
+	// included. Whether a REFRESH was productive is asked only of credentials
+	// the entry is still serving: an invalidated entry is not being refreshed,
+	// it is being refetched, and reading that refetch as an unproductive
+	// refresh would re-arm at a fixed skew cadence for the whole remaining life
+	// of a credential that has not even reached its lead window.
 	prev := e.creds
-	if prev == nil {
-		prev = e.gone
+	material := prev
+	if material == nil {
+		material = e.gone
 	}
-	if prev == nil || !maps.Equal(prev.Headers, creds.Headers) || !maps.Equal(prev.Env, creds.Env) {
+	if material == nil || !maps.Equal(material.Headers, creds.Headers) || !maps.Equal(material.Env, creds.Env) {
 		e.gen = int(globalGen.Add(1))
 	}
 	e.creds, e.gone = creds, nil
