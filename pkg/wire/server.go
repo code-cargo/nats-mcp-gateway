@@ -799,17 +799,14 @@ func (w *streamWriter) ka() bool {
 	return true
 }
 
-// End's size test decides which of two futures this stream gets, so it has to
-// weigh what NATS weighs: the end frame's headers share the body's
-// max_payload budget. Judging the body alone accepted everything in the last
-// endOverhead bytes below the limit, and those bodies took the path below —
-// terminal flag set, then a Respond that never reached the wire. dispatch
-// then found the stream already terminated and sent nothing, so the caller
-// spent its whole inactivity window to be told ErrCodeStreamLost: the one
-// code that promises a retry will help, on a response that would be refused
-// identically every time. Counting the headers keeps those bodies in the
-// oversize branch, where claim-check can still deliver them and
-// ErrCodePayloadTooLarge can at least name why not.
+// End's size test decides which of two futures this stream gets, so it weighs
+// what NATS weighs: the end frame's headers share the body's max_payload
+// budget. A body judged on its own can clear this check and still be refused
+// by publish — and by then the stream is claimed, so dispatch has nothing
+// left to send and the caller learns of it only by waiting out its inactivity
+// window. Counting the headers keeps those bodies in the oversize branch,
+// where claim-check can still deliver them and ErrCodePayloadTooLarge can at
+// least name why not.
 func (w *streamWriter) End(body []byte) error {
 	if max := w.nc.MaxPayload(); int64(len(body))+endOverhead > max {
 		// Claim-check: park the body and send only the reference — but only
@@ -852,32 +849,68 @@ func (w *streamWriter) errWithID(id []byte, code int, message string, data any) 
 	body, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, data))
 	if err != nil {
 		// The body could not be built, so the caller gets a canned one — and
-		// the code and message travel with it, because micro copies both into
-		// headers and a frame whose headers disagree with its body describes
-		// two different failures. Reassigning them also puts the size check
-		// below on the values actually being sent: skipping it here would
-		// leave the one path that can still publish an oversized terminal
-		// frame, which is the failure this whole guard exists to prevent.
+		// the id, code and message are reassigned to match it, because micro
+		// copies code and message into headers and a frame whose headers
+		// disagree with its body describes two different failures. It also
+		// puts the fitting below on the values actually being sent: skipping
+		// it here would leave the one path that can still publish an
+		// oversized terminal frame, which is what this guard exists to stop.
+		id, data = nil, nil
 		code, message = jsonrpc.CodeInternalError, "error encoding failed"
 		body = []byte(`{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"error encoding failed"}}`)
 	}
-	if max := w.nc.MaxPayload(); int64(len(body))+errOverhead(code, message) > max {
-		// This frame is the last thing the stream can say, and it carries the
-		// message twice — in the body and in micro's error header — so a
-		// handler error over about half of max_payload (a backend quoting the
-		// request back at us) would cost the caller the report as well as the
-		// response, and leave them waiting out the inactivity window for an
-		// ErrCodeStreamLost that invites a retry into the same wall. Nothing
-		// smaller follows a terminal frame, so spend the message to keep it.
-		// The id stays: the shim writes this body through to its client
-		// verbatim, which correlates on that id and nothing else.
-		message = fmt.Sprintf("error message dropped: %d bytes does not fit NATS max_payload %d", len(message), max)
-		if fitted, ferr := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, message, nil)); ferr == nil {
-			body = fitted
-		}
-	}
+	body, message = fitErrFrame(id, code, message, data, body, w.nc.MaxPayload())
 	return w.req.Error(strconv.Itoa(code), message, body,
 		micro.WithHeaders(micro.Headers{HeaderFrame: []string{string(FrameErr)}}))
+}
+
+// fitErrFrame sheds detail from an error response until the frame carrying it
+// fits max_payload, returning the body and the message to publish.
+//
+// An err frame is the last thing a stream can say and nothing smaller follows
+// it, so detail is spent to keep the frame itself. A refused terminal frame
+// leaves dispatch with a stream already claimed and nothing on the wire, and
+// the caller can only discover that by waiting out its whole inactivity
+// window — to be handed ErrCodeStreamLost, the one code that promises a retry
+// will help, on a response that would be refused identically every time.
+//
+// Detail goes in order of what dropping it buys back. Error data is
+// supplementary and costs body bytes only. The message costs double, because
+// micro's Request.Error copies it into the Nats-Service-Error header, so an
+// oversize handler error is charged to max_payload twice over — which is why
+// a handler error past roughly half the limit cannot be sent with its text
+// intact. Each drop is announced in what survives: silently returning a
+// smaller error than the one that occurred is how a caller ends up debugging
+// the wire instead of their request.
+//
+// The id is never shed, even as a last resort. It is the only part of this
+// body the caller can act on: the shim writes the body through to its client
+// verbatim and that client correlates on the id and nothing else, so a null
+// id strands the request where silence does not — silence still ends in an
+// inactivity timeout the shim reports against the RIGHT id. An id large
+// enough to fill the frame by itself (a band tens of bytes wide, since the
+// request carrying that id had to fit max_payload too) therefore keeps the
+// silent-until-timeout ending deliberately: slow and correct beats prompt and
+// uncorrelatable.
+func fitErrFrame(id []byte, code int, message string, data any, body []byte, max int64) ([]byte, string) {
+	fits := func(b []byte, m string) bool { return int64(len(b))+errOverhead(code, m) <= max }
+	if fits(body, message) {
+		return body, message
+	}
+	oversize := len(body)
+	if data != nil {
+		noted := message + " [error data omitted: does not fit NATS max_payload]"
+		if b, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, noted, nil)); err == nil && fits(b, noted) {
+			return b, noted
+		}
+	}
+	// Sized against the whole encoded response, not the message: whichever
+	// part was the bulk, what did not fit is this many bytes of error.
+	shed := fmt.Sprintf("error detail dropped: %d byte error response does not fit NATS max_payload %d", oversize, max)
+	if b, err := jsonrpc.Encode(jsonrpc.NewErrorResponse(id, code, shed, nil)); err == nil {
+		return b, shed
+	}
+	return body, message
 }
 
 // errOverhead is the header cost of an err frame. Unlike end and msg, whose

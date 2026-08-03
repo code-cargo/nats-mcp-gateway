@@ -121,7 +121,7 @@ func TestOversizeHandlerErrorStillTerminates(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, m.Error)
 	assert.Equal(t, jsonrpc.CodeInternalError, m.Error.Code)
-	assert.Contains(t, m.Error.Message, "error message dropped")
+	assert.Contains(t, m.Error.Message, "error detail dropped")
 	assert.Equal(t, `"1"`, m.IDKey(), "the id is what the caller correlates on; it survives")
 	assert.Less(t, time.Since(start), inactivity,
 		"the failure must be reported, not waited out on the inactivity deadline")
@@ -241,4 +241,69 @@ func TestRequestCeilingMovesWithToolName(t *testing.T) {
 	require.ErrorAs(t, err, &werr,
 		"the same body must be refused once Mcp-Name takes part of the budget")
 	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
+}
+
+// Error data is supplementary; the message is what the caller reads. When the
+// frame will not hold both, data goes first — and says so, because an error
+// that silently arrives smaller than the one that happened sends the caller
+// debugging the wire instead of their request.
+func TestOversizeErrorDataIsShedBeforeMessage(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return w.Err(jsonrpc.CodeInvalidParams, "params rejected",
+			map[string]string{"echo": strings.Repeat("d", boundaryMaxPayload)})
+	})
+
+	s, err := client(t, nc, 3*time.Second).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.Nil(t, frames[0].Err, "the gateway must send its own error frame")
+	m, err := jsonrpc.Decode(frames[0].Body)
+	require.NoError(t, err)
+	require.NotNil(t, m.Error)
+	assert.Equal(t, jsonrpc.CodeInvalidParams, m.Error.Code, "the code the handler chose survives")
+	assert.Contains(t, m.Error.Message, "params rejected", "so does the message")
+	assert.Contains(t, m.Error.Message, "error data omitted", "and the loss is stated")
+	assert.Empty(t, m.Error.Data)
+	assert.Equal(t, `"1"`, m.IDKey())
+}
+
+// A JSON-RPC id large enough to fill the err frame by itself cannot be
+// answered: shedding the id would produce a frame nobody can route, since the
+// shim writes this body through to a client that correlates on the id and
+// nothing else. The stream is left to end in the inactivity timeout instead,
+// which the shim DOES report against the right id — slow and correct rather
+// than prompt and uncorrelatable. This pins that as a decision, not an
+// oversight; a frame arriving here with a null id is a regression.
+func TestErrFrameNeverShedsTheID(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return errors.New("backend refused")
+	})
+
+	// The largest request this wire will carry, spent almost entirely on the id.
+	unnamed := wireHeaderBytes(
+		HeaderWire, WireVersion,
+		HeaderMethod, "tools/call",
+		HeaderProtocolVersion, "2026-07-28",
+	)
+	const envelope = `{"jsonrpc":"2.0","id":"","method":"tools/call"}`
+	id := strings.Repeat("i", boundaryMaxPayload-unnamed-len(envelope))
+	req := testRequest("1", "tools/call")
+	req.Body = []byte(`{"jsonrpc":"2.0","id":"` + id + `","method":"tools/call"}`)
+
+	const inactivity = 500 * time.Millisecond
+	s, err := client(t, nc, inactivity).Do(context.Background(), req)
+	require.NoError(t, err, "the request itself fits; only the answer does not")
+	frames := collect(t, s)
+
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	require.NotNil(t, frames[0].Err,
+		"nothing reached the wire, so the failure is the client's to synthesize")
+	assert.Equal(t, ErrCodeStreamLost, frames[0].Err.Code)
+	assert.Empty(t, frames[0].Body, "a null-id body would be worse than none")
 }
