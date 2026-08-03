@@ -935,55 +935,156 @@ func TestScrubURLsKeepsErrorsDiagnosable(t *testing.T) {
 	}
 }
 
-// TestNonTerminatingListingRecordsTruncation bounds what a backend can make
-// the gateway do by never ending its cursor.
-//
-// Concluding "no annotations" from a truncated read would be wrong — the pages
-// never seen may carry some — so the probe correctly declines to record that.
-// But leaving it at that means every -32020 starts another full sweep, and the
-// backend decides when the cursor ends, so the sweep never gets cheaper.
-// Recording the truncation separately is what lets the recovery give up on a
-// retry that cannot succeed without claiming knowledge it does not have.
-func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
-	var listPages atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// endlessCursorServer answers tools/list with a page that always names a next
+// cursor while endless is set, and rejects every tools/call whose
+// Mcp-Param-Region disagrees with its body — the two halves that together make
+// each rejection provoke a full paginated sweep. Clearing endless switches it
+// to a single terminating page carrying the annotation the calls need.
+func endlessCursorServer(listPages, callAttempts *atomic.Int32, endless *atomic.Bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		msg := &jsonrpc.Message{}
 		_ = json.NewDecoder(r.Body).Decode(msg)
-		listPages.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		if msg.Method == mcpspec.MethodToolsList {
+			listPages.Add(1)
+			page := `{"tools":[],"nextCursor":"more"}`
+			if !endless.Load() {
+				page = `{"resultType":"complete","tools":[{"name":"t","inputSchema":
+					{"type":"object","properties":{
+						"region":{"type":"string","x-mcp-header":"Region"}}}}]}`
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, json.RawMessage(page)))
+			_, _ = w.Write(resp)
+			return
+		}
+		callAttempts.Add(1)
+		var p struct {
+			Arguments map[string]any `json:"arguments"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		region, _ := p.Arguments["region"].(string)
+		if r.Header.Get("Mcp-Param-Region") != region {
+			w.WriteHeader(http.StatusBadRequest)
+			resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
+				msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil,
+			))
+			_, _ = w.Write(resp)
+			return
+		}
 		resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
-			json.RawMessage(`{"tools":[],"nextCursor":"more"}`)))
+			json.RawMessage(`{"resultType":"complete","content":[]}`)))
 		_, _ = w.Write(resp)
 	}))
+}
+
+// regionCallParams is a tools/call the endless-cursor server always rejects
+// until the gateway has learned to mirror `region` into a header.
+func regionCallParams(t *testing.T) json.RawMessage {
+	t.Helper()
+	params, err := json.Marshal(map[string]any{
+		"name": "t", "arguments": map[string]any{"region": "us-west1"},
+	})
+	require.NoError(t, err)
+	return params
+}
+
+// TestTruncatedListingDampsReProbing bounds what a backend can make the
+// gateway do by never ending its cursor.
+//
+// Every rejected call is entitled to ask whether the schema explains the
+// rejection, and answering costs a full paginated sweep of the toolset. A
+// backend whose cursor never terminates makes that sweep cost the page cap
+// every time, so without damping the gateway spends annotationProbeMaxPages
+// round trips per rejected call, forever, learning the same nothing.
+func TestTruncatedListingDampsReProbing(t *testing.T) {
+	var listPages, callAttempts atomic.Int32
+	var endless atomic.Bool
+	endless.Store(true)
+	srv := endlessCursorServer(&listPages, &callAttempts, &endless)
 	t.Cleanup(srv.Close)
 
 	b := &HTTPBackend{URL: srv.URL}
 	conn, err := b.Connect(context.Background())
 	require.NoError(t, err)
 	c := conn.(*httpConn)
-	t.Cleanup(func() { _ = c.Close() })
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
 
-	require.NoError(t, c.refreshAnnotations(context.Background(), 0))
+	const calls = 4
+	params := regionCallParams(t)
+	for i := range calls {
+		resp, err := m.Call(context.Background(),
+			jsonrpc.NewRequest(strconv.Itoa(i+1), mcpspec.MethodToolsCall, params), nil)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Error, "the backend rejects every call while its listing is unreadable")
+		require.Equal(t, mcpspec.ErrHeaderMismatch, resp.Error.Code)
+	}
+
+	assert.Equal(t, int32(calls), callAttempts.Load(),
+		"nothing was learned, so no call may be reissued")
+	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
+		"one sweep covers all %d rejections; a sweep apiece costs %d pages",
+		calls, calls*annotationProbeMaxPages)
 
 	c.mu.Lock()
-	known, truncated := c.annotationsKnown, c.annotationsTruncated
+	known := c.annotationsKnown
 	c.mu.Unlock()
-
 	assert.False(t, known,
 		"a listing that never ended is not evidence that the server publishes no annotations")
-	assert.True(t, truncated,
-		"the cap was hit with pages unread, and the recovery has to know that")
-	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
-		"the probe reads exactly the cap and stops")
+}
 
-	// The second probe is what the guard exists to prevent: it would read the
-	// same pages and stop in the same place.
-	before := listPages.Load()
+// TestTruncationDoesNotPermanentlyDisableRecovery is the other half: the
+// damping above must not become a latch.
+//
+// The listing belongs to the backend, and one that overran the page cap during
+// a deploy or a bad rollout can come back under it a minute later. A conn that
+// recorded the truncation once and refused ever to probe again would answer
+// -32020 to every tools/call for the rest of its life — with the fix sitting
+// one readable listing away.
+func TestTruncationDoesNotPermanentlyDisableRecovery(t *testing.T) {
+	var listPages, callAttempts atomic.Int32
+	var endless atomic.Bool
+	endless.Store(true)
+	srv := endlessCursorServer(&listPages, &callAttempts, &endless)
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	params := regionCallParams(t)
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.NotNil(t, resp.Error, "the probe could not reach the tool, so the call legitimately fails")
+	require.Equal(t, int32(annotationProbeMaxPages), listPages.Load())
+
+	// The backend's listing comes back under the cap, and the cooldown the
+	// truncation started runs out. Rewound rather than waited out: what is
+	// under test is that the window ends, not how long it is.
+	endless.Store(false)
 	c.mu.Lock()
-	skip := c.annotationsKnown || c.annotationsTruncated
+	c.annotationsTruncatedAt = time.Now().Add(-annotationTruncationCooldown - time.Second)
 	c.mu.Unlock()
-	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
-	assert.Equal(t, before, listPages.Load())
+
+	resp, err = m.Call(context.Background(),
+		jsonrpc.NewRequest("2", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error,
+		"the recovery must run again once the listing the truncation described is gone")
+	assert.Equal(t, int32(annotationProbeMaxPages+1), listPages.Load(),
+		"the second probe reads the one page the recovered listing has")
+
+	// And the recovered state is the ordinary one: the truncation is retired,
+	// not merely expired, so the next rejection is judged on what is known.
+	c.mu.Lock()
+	known, truncatedAt := c.annotationsKnown, c.annotationsTruncatedAt
+	c.mu.Unlock()
+	assert.True(t, known, "a listing read to its end settles the toolset")
+	assert.True(t, truncatedAt.IsZero(), "a terminating listing retires the truncation")
 }
 
 // TestRedirectCannotCarryTheCredentialAway covers the four things Go's default
