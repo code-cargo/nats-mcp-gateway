@@ -17,7 +17,9 @@ package reconcile
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -96,7 +98,7 @@ type stack struct {
 	pool *backend.Pool
 }
 
-func newStack(t *testing.T) *stack {
+func newStack(t *testing.T, log *slog.Logger) *stack {
 	t.Helper()
 	nc, _ := natstest.Run(t, nil)
 
@@ -120,8 +122,49 @@ func newStack(t *testing.T) *stack {
 		defer cancel()
 		_ = ws.Shutdown(ctx)
 	})
-	st.rec = New(ws, st.pool, nil)
+	st.rec = New(ws, st.pool, log)
 	return st
+}
+
+// logCapture records what an operator would actually see, so a test can assert
+// on a warning that has no other observable effect.
+type logCapture struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (c *logCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *logCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *logCapture) WithGroup(string) slog.Handler { return c }
+
+func (c *logCapture) Handle(_ context.Context, r slog.Record) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.records = append(c.records, r.Clone())
+	return nil
+}
+
+// warns renders each warn-or-worse record as message plus attributes — the
+// whole line, because the field names the warning carries are half of what
+// makes it actionable.
+func (c *logCapture) warns() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []string
+	for _, r := range c.records {
+		if r.Level < slog.LevelWarn {
+			continue
+		}
+		line := r.Message
+		r.Attrs(func(a slog.Attr) bool {
+			line += " " + a.String()
+			return true
+		})
+		out = append(out, line)
+	}
+	return out
 }
 
 func (st *stack) call(t *testing.T, tenant, serverName, tool string) wire.Frame {
@@ -161,7 +204,7 @@ func pidOf(t *testing.T, f wire.Frame) float64 {
 }
 
 func TestApplyAddChangeRemove(t *testing.T) {
-	st := newStack(t)
+	st := newStack(t, nil)
 
 	// Boot with server "a".
 	d, err := st.rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
@@ -196,7 +239,7 @@ func TestApplyAddChangeRemove(t *testing.T) {
 }
 
 func TestApplyUnchangedIsNoop(t *testing.T) {
-	st := newStack(t)
+	st := newStack(t, nil)
 	c := cfg(map[string]config.Server{"a": fakeSrv(nil)})
 	_, err := st.rec.Apply(c)
 	require.NoError(t, err)
@@ -207,6 +250,83 @@ func TestApplyUnchangedIsNoop(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, d.Empty())
 	assert.Equal(t, pid, pidOf(t, st.call(t, "acme", "a", "echo")), "no-op reload must not respawn")
+}
+
+// Editing the file's nats block and reloading changes nothing: the connection
+// and the wire's scope were fixed before the Reconciler existed. Today that is
+// also SILENT — the diff covers servers only, so an operator who drops
+// nats.tenant and HUPs sees "config unchanged" while the gateway goes on
+// serving every tenant.
+func TestApplyWarnsWhenNatsBlockDriftsFromBoot(t *testing.T) {
+	logs := &logCapture{}
+	st := newStack(t, slog.New(logs))
+
+	boot := config.NATS{Tenant: "acme", QueueGroup: "gw"}
+	_, err := st.rec.Apply(&config.Config{NATS: boot, Servers: map[string]config.Server{"a": fakeSrv(nil)}})
+	require.NoError(t, err)
+	require.Empty(t, logs.warns(), "the first revision is what the process booted on")
+
+	// A reload that leaves the block alone is not drift, however many times it
+	// happens.
+	_, err = st.rec.Apply(&config.Config{
+		NATS:    boot,
+		Servers: map[string]config.Server{"a": fakeSrv(nil), "b": fakeSrv(nil)},
+	})
+	require.NoError(t, err)
+	require.Empty(t, logs.warns(), "an unchanged nats block must not warn on every reload")
+
+	// Drop the tenant. Nothing in the server set moved, so this warning is the
+	// only signal the operator gets that the scope did not narrow.
+	d, err := st.rec.Apply(&config.Config{
+		NATS:    config.NATS{QueueGroup: "gw"},
+		Servers: map[string]config.Server{"a": fakeSrv(nil), "b": fakeSrv(nil)},
+	})
+	require.NoError(t, err)
+	assert.True(t, d.Empty(), "the server set is all the diff covers, and it did not change")
+	got := logs.warns()
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "tenant")
+	assert.NotContains(t, got[0], "queueGroup", "only the fields that actually moved")
+
+	// A later, unrelated edit reports the drift again: it is measured against
+	// what is RUNNING, so a second revision must not make it look settled.
+	_, err = st.rec.Apply(&config.Config{
+		NATS:    config.NATS{QueueGroup: "gw"},
+		Servers: map[string]config.Server{"a": fakeSrv(nil)},
+	})
+	require.NoError(t, err)
+	assert.Len(t, logs.warns(), 2, "the block is still diverged from the running connection")
+}
+
+// nats.url carries its password in the userinfo form and credsFile names a path
+// worth nothing to an attacker but everything to a log scraper, so the warning
+// names the fields that moved and never their values.
+func TestNatsDriftWarningNamesFieldsNotValues(t *testing.T) {
+	logs := &logCapture{}
+	st := newStack(t, slog.New(logs))
+
+	_, err := st.rec.Apply(&config.Config{NATS: config.NATS{URL: "nats://gw:s3cret@old:4222"}})
+	require.NoError(t, err)
+	_, err = st.rec.Apply(&config.Config{NATS: config.NATS{URL: "nats://gw:rotated@new:4222"}})
+	require.NoError(t, err)
+
+	got := logs.warns()
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "url")
+	assert.NotContains(t, got[0], "s3cret")
+	assert.NotContains(t, got[0], "rotated")
+}
+
+// config.NATS is all plain-tagged strings today, so marshalling emits every key
+// on both sides. The day a field is tagged omitempty it drops out of whichever
+// side it is empty on, and comparing over the boot side's keys alone would miss
+// it in exactly the direction that matters: booted without the field, reloaded
+// with it set — the narrowing edit. The warning would still fire (the struct
+// compare catches it) while naming nothing, so the comparison covers the union.
+func TestDriftFieldsCoversKeysPresentOnOneSideOnly(t *testing.T) {
+	boot := map[string]json.RawMessage{"same": []byte(`"x"`), "bootOnly": []byte(`"y"`)}
+	next := map[string]json.RawMessage{"same": []byte(`"x"`), "nextOnly": []byte(`"z"`)}
+	assert.Equal(t, []string{"bootOnly", "nextOnly"}, driftFields(boot, next))
 }
 
 func fakeSrv(extraEnv map[string]string) config.Server {
