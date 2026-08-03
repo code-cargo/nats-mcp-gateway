@@ -676,19 +676,141 @@ func TestCloseEndsInFlightExchanges(t *testing.T) {
 
 	require.NoError(t, conn.Close())
 
-	// Close returned, so nothing is still holding a socket on this conn's
-	// behalf — the WaitGroup it maintains is finally waited on somewhere.
+	// Both exchanges end, rather than sitting in a round trip nothing bounds.
+	// This says nothing about WHEN Close returned relative to them — cancelling
+	// alone satisfies it, because a cancelled round trip returns on its own.
+	// TestCloseWaitsForInflightExchange is what pins the drain.
 	drained := make(chan struct{})
 	go func() { c.inflight.Wait(); close(drained) }()
 	select {
 	case <-drained:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Close returned while its exchanges were still running")
+		t.Fatal("the cancelled exchanges never finished")
 	}
 
 	assert.Eventually(t, func() bool { return abandoned.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
 		"closing the conn must reach the backend as a disconnect, not leave the requests parked on it")
 }
+
+func TestCloseWaitsForInflightExchange(t *testing.T) {
+	// Close is what the pool calls to reclaim a backend, so "closed" has to
+	// mean the exchanges are off the wire and not merely cancelled: an exchange
+	// still inside io.ReadAll holds its socket until that read returns.
+	//
+	// The response body below stalls, and ignores cancellation while it does.
+	// That is the whole point: connCtx cancellation is not the same event as
+	// the exchange finishing, and a body that ends the moment it is cancelled
+	// cannot tell a Close that drains from one that only cancels and returns.
+	body := newStalledBody(`{"jsonrpc":"2.0","id":"1","result":{"resultType":"complete","tools":[]}}`)
+	t.Cleanup(body.release)
+
+	// Never dialed: the transport answers every request itself.
+	b := &HTTPBackend{
+		URL:    "http://stalled.invalid",
+		Client: &http.Client{Transport: &stalledTransport{body: body}},
+	}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	select {
+	case <-body.reading:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never reached the response body")
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		assert.NoError(t, conn.Close())
+	}()
+
+	// Well inside terminateGrace, so a Close that blocks correctly is still
+	// blocked here and only a Close that skipped the drain has returned.
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an exchange was still in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	body.release()
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		// Anything this slow is Close outwaiting the grace, which is the
+		// timeout path, not the drain: the exchange finishes in microseconds
+		// once the body is released.
+		t.Fatal("Close did not return once its exchange finished")
+	}
+}
+
+func TestAwaitInflightGivesUpAtGrace(t *testing.T) {
+	// The other half of the contract: a backend that never lets go must cost
+	// the pool a bounded wait, not a permanent one. terminateGrace is a package
+	// constant, so Close's own bound cannot be shortened for a test without a
+	// multi-second sleep — but the bound is a parameter here, which is the
+	// level the behavior actually lives at.
+	b := &HTTPBackend{URL: "http://unused.invalid"}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+
+	c.inflight.Add(1)
+	assert.False(t, c.awaitInflight(50*time.Millisecond),
+		"a wedged exchange must be abandoned when the grace expires")
+
+	c.inflight.Done()
+	assert.True(t, c.awaitInflight(10*time.Second),
+		"a drained conn must not be reported as still in flight")
+}
+
+// stalledTransport answers every request with a stalled body, so an exchange
+// can be held past teardown without a server that has to be torn down too.
+type stalledTransport struct{ body *stalledBody }
+
+func (t *stalledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       t.body,
+		Request:    req,
+	}, nil
+}
+
+// stalledBody blocks in Read until released, then yields its payload. Reads
+// are what the exchange goroutine is doing when Close arrives, and this one
+// does not end on cancellation — see TestCloseWaitsForInflightExchange.
+type stalledBody struct {
+	reading   chan struct{}
+	released  chan struct{}
+	readOnce  sync.Once
+	closeOnce sync.Once
+	rest      io.Reader
+}
+
+func newStalledBody(payload string) *stalledBody {
+	return &stalledBody{
+		reading:  make(chan struct{}),
+		released: make(chan struct{}),
+		rest:     strings.NewReader(payload),
+	}
+}
+
+// release is idempotent so a failing test's cleanup cannot double-close it.
+func (b *stalledBody) release() { b.closeOnce.Do(func() { close(b.released) }) }
+
+func (b *stalledBody) Read(p []byte) (int, error) {
+	b.readOnce.Do(func() { close(b.reading) })
+	<-b.released
+	return b.rest.Read(p)
+}
+
+func (b *stalledBody) Close() error { return nil }
 
 func TestCallerCancellationEndsItsExchange(t *testing.T) {
 	// The other end of the same leak: the conn stays open and healthy, so
