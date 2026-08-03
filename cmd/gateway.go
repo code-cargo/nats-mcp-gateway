@@ -119,6 +119,11 @@ type bootParams struct {
 	// sources): bootParams has to parse it to read pool/claimCheck, so the
 	// source reuses that parse rather than doing a second one.
 	inline *config.Config
+	// ignoredFlags are the file-source settings supplied by an env var the shim
+	// and call commands share, which this source drops instead of refusing.
+	// Dropping them silently is what left an unfenced inbox with nothing in the
+	// log to explain it, so runGateway says so at boot.
+	ignoredFlags []string
 }
 
 // poolFromConfig converts the config schema's pool block to the pool's own
@@ -156,6 +161,9 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	boot, err := c.bootParams(kind)
 	if err != nil {
 		return err
+	}
+	for _, ignored := range boot.ignoredFlags {
+		log.Warn("file source ignores a setting supplied by a shared environment variable", "detail", ignored)
 	}
 
 	opts := []nats.Option{nats.Name("natsmcp-gateway"), nats.MaxReconnects(-1)}
@@ -351,9 +359,11 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 			}
 			boot.claimMaxBytes = cc.MaxBytes
 		}
-		if err := c.checkFileSourceFlags(boot); err != nil {
+		ignored, err := c.checkFileSourceFlags(boot)
+		if err != nil {
 			return bootParams{}, err
 		}
+		boot.ignoredFlags = ignored
 		return boot, nil
 	}
 	// Fetch and inline sources: connection, prefix, queue group and scope come
@@ -500,8 +510,8 @@ const (
 // steer the fetch source's own polling, the job --reload-interval does for this
 // source, and nothing about the connection, the scope or the served subjects
 // rides on them.
-func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
-	var dropped []string
+func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) ([]string, error) {
+	var dropped, ignored []string
 	// flag and env are how the operator supplied the value; field is the
 	// document key that governs instead. inDoc is what that key resolved to,
 	// which is the whole point of the message: it names the value in force.
@@ -512,9 +522,32 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 		dropped = append(dropped, fmt.Sprintf("--%s=%s (%s) but %s=%s",
 			flag, settingValue(got), env, field, settingValue(inDoc)))
 	}
-	check("nats-url", "NATSMCP_NATS_URL", "nats.url",
+	// checkShared is check for a setting whose env var the shim and call
+	// commands read too. One value exported once for a host is the ordinary
+	// deployment — the README's own layout runs a shim beside a file-source
+	// gateway — so a value that arrived that way is reported and dropped
+	// rather than refused: refusing breaks a working fleet to correct a
+	// setting this source was never going to read, which is the trade the
+	// comment above already declines to make. An explicit flag still fails,
+	// because that one was aimed at this process.
+	checkShared := func(flag, env, field string, conflict bool, got, inDoc string) {
+		if !conflict {
+			return
+		}
+		if suppliedByEnv(env, got) {
+			ignored = append(ignored, fmt.Sprintf("--%s=%s (%s) is ignored by the file source; %s=%s is in force",
+				flag, settingValue(got), env, field, settingValue(inDoc)))
+			return
+		}
+		check(flag, env, field, conflict, got, inDoc)
+	}
+	checkShared("nats-url", "NATSMCP_NATS_URL", "nats.url",
 		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url)
-	check("nats-creds", "NATSMCP_NATS_CREDS", "nats.credsFile",
+	// Either name may have supplied this: the pair are aliases of each other on
+	// every subcommand, so the message has to name the one the operator
+	// actually exported. Naming the other sends them to unset a variable they
+	// never set, which does not clear the error.
+	checkShared("nats-creds", credsEnvName(c.NatsCreds), "nats.credsFile",
 		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile)
 	// Against the prefix the wire will actually bind, for the same reason the
 	// queue group and the pool are: wire.Serve owns this default, so a document
@@ -523,10 +556,10 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 	if effPrefix == "" {
 		effPrefix = wire.DefaultPrefix
 	}
-	check("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
+	checkShared("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
 		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != effPrefix,
 		c.SubjectPrefix, effPrefix)
-	check("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
+	checkShared("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
 		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
 	// Compared against the group the wire will actually join, not against the
 	// document's silence: wire.DefaultQueueGroup owns this default precisely so
@@ -587,10 +620,31 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 	}
 
 	if len(dropped) == 0 {
-		return nil
+		return ignored, nil
 	}
-	return fmt.Errorf("config: %s: %s — the file source takes its connection, scope, pool and claim-check settings from this document; set them there, or drop the flag and its env var (only --config-subject and --config-json read them)",
+	return ignored, fmt.Errorf("config: %s: %s — the file source takes its connection, scope, pool and claim-check settings from this document; set them there, or drop the flag and its env var (only --config-subject and --config-json read them)",
 		c.Config, strings.Join(dropped, "; "))
+}
+
+// suppliedByEnv reports whether name is what gave this setting its value, so a
+// variable exported once for a whole host can be told apart from a flag aimed
+// at this process. Kong has already collapsed the two into one field by the
+// time anything here runs, and an operator who passes the flag AND exports the
+// same value gets the gentler of the two readings, which is the right way for
+// this to be wrong.
+func suppliedByEnv(name, got string) bool {
+	return got != "" && os.Getenv(name) == got
+}
+
+// credsEnvName is the credentials variable that actually supplied the value,
+// preferring the gateway's own documented name when both are set to it.
+func credsEnvName(got string) string {
+	for _, name := range gatewayCredsEnv {
+		if suppliedByEnv(name, got) {
+			return name
+		}
+	}
+	return gatewayCredsEnv[0]
 }
 
 // settingValue renders a setting for that error, quoting strings so an empty

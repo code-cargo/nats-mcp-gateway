@@ -1010,3 +1010,47 @@ func TestShortLivedCredsDoNotChurnSpawns(t *testing.T) {
 	pid1 := pidOf()
 	assert.Equal(t, pid1, pidOf(), "an entry spawned inside the skew window must live to the literal expiry, not respawn per request")
 }
+
+// An entry installed by a spawn whose caller has already given up has never
+// been through Get, so nothing but the entry literal marks it young. Left at
+// the zero Time, lastUsed reads as ~2000 years idle and the reaper collects the
+// backend on its very next tick — which is precisely the subprocess runSpawn
+// keeps alive so that the next request starts warm.
+func TestAnUnattendedSpawnIsNotBornIdle(t *testing.T) {
+	gate := make(chan struct{})
+	var arrived atomic.Int32
+	p := NewPool(PoolConfig{IdleTTL: 5 * time.Minute}, func(Key) (Backend, error) {
+		return &gatedBackend{Backend: fakeBackend(nil), arrived: &arrived, gate: gate}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "t"}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := make(chan error, 1)
+	go func() {
+		_, _, err := p.Get(ctx, key)
+		got <- err
+	}()
+	require.Eventually(t, func() bool { return arrived.Load() == 1 },
+		10*time.Second, time.Millisecond, "the spawn never reached Connect")
+
+	// The caller loses patience while the backend is still coming up. The
+	// spawn runs on regardless: that is the whole point of it owning its own
+	// context.
+	cancel()
+	require.Error(t, <-got)
+	close(gate)
+
+	require.Eventually(t, func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return p.entries[key] != nil
+	}, 10*time.Second, time.Millisecond, "the spawn never installed its entry")
+
+	p.reap()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.NotNil(t, p.entries[key],
+		"a backend that had just finished starting was reaped as idle for over %s", 5*time.Minute)
+}

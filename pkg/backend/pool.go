@@ -446,8 +446,16 @@ func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, erro
 			}
 		}
 		e = &entry{
-			key:      key,
-			mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			key: key,
+			mux: NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			// lastUsed starts at born, not at the zero Time. The reaper reads
+			// now.Sub(e.lastUsed) and nothing else marks an entry young, so a
+			// zero value here is ~2000 years idle: an entry installed by a spawn
+			// whose caller has already given up would be reaped on the very next
+			// tick, which is precisely the backend runSpawn keeps alive so the
+			// next request starts warm. Get sets it again on the way through;
+			// this is the value that has to survive an unattended spawn.
+			lastUsed: born,
 			born:     born,
 			deadline: deadline,
 			sem:      make(chan struct{}, p.cfg.MaxConcurrent),

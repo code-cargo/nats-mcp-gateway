@@ -1539,3 +1539,67 @@ func TestTokenSourceDoesNotEchoTheResolverDetail(t *testing.T) {
 	assert.NotContains(t, err.Error(), "arn:aws:iam", "an internal identity reached the caller")
 	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
 }
+
+// The shim's own credentials variable must not refuse the gateway's boot. The
+// README runs both on one host, and #17 made each subcommand accept the other's
+// name so a value on the "wrong" one stops being silently ignored — which
+// handed the file-source guard a variable it then read as a conflicting
+// fetch-only flag. Every deployment matching the documented layout failed to
+// boot on upgrade, and the error named NATSMCP_NATS_CREDS, which the operator
+// had never set.
+func TestSharedEnvVarsDoNotRefuseTheFileSourceBoot(t *testing.T) {
+	clearNATSMCPEnv(t)
+	path := writeConfig(t, `{"servers":{}}`)
+
+	parse := func(t *testing.T) *GatewayCmd {
+		t.Helper()
+		var cli CLI
+		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, err)
+		_, err = parser.Parse([]string{"gateway", "--config", path})
+		require.NoError(t, err)
+		return &cli.Gateway
+	}
+
+	for _, tc := range []struct {
+		name, env, value, mentions string
+	}{
+		{"shim credentials", "NATSMCP_CREDS", "/creds/client.creds", "nats.credsFile"},
+		{"gateway credentials", "NATSMCP_NATS_CREDS", "/creds/gw.creds", "nats.credsFile"},
+		{"inbox prefix", "NATSMCP_INBOX_PREFIX", "_INBOX_acme", "nats.inboxPrefix"},
+		{"nats url", "NATSMCP_NATS_URL", "nats://prod:4222", "nats.url"},
+		{"subject prefix", "NATSMCP_SUBJECT_PREFIX", "mcp.v2", "nats.subjectPrefix"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			boot, err := parse(t).bootParams(sourceFile)
+			require.NoError(t, err, "a variable shared with the shim must not refuse the boot")
+			require.Len(t, boot.ignoredFlags, 1, "dropping it silently is what left an unfenced inbox unexplained")
+			assert.Contains(t, boot.ignoredFlags[0], tc.env, "the warning must name the variable actually exported")
+			assert.Contains(t, boot.ignoredFlags[0], tc.mentions)
+		})
+	}
+
+	// The same setting aimed at THIS process still fails: an argv the operator
+	// typed is not one exported once for the host, and silently dropping it
+	// would be the original defect.
+	t.Run("explicit flag still refuses", func(t *testing.T) {
+		var cli CLI
+		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, err)
+		_, err = parser.Parse([]string{"gateway", "--config", path, "--inbox-prefix", "_INBOX_acme"})
+		require.NoError(t, err)
+		_, err = cli.Gateway.bootParams(sourceFile)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nats.inboxPrefix")
+	})
+
+	// Scope is untouched by any of this: it is the reason the guard exists, it
+	// is gateway-only, and an unscoped boot serves every tenant.
+	t.Run("scope still refuses", func(t *testing.T) {
+		t.Setenv("NATSMCP_SCOPE_TENANT", "acme")
+		_, err := parse(t).bootParams(sourceFile)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nats.tenant")
+	})
+}
