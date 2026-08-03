@@ -153,6 +153,12 @@ type spawn struct {
 	// stale is set (under p.mu) when EvictServer retires the key while this
 	// spawn runs: what it produces was built from the superseded definition.
 	stale bool
+	// built is when the factory handed back this spawn's backend — the
+	// in-flight spawn's counterpart to entry.born, and what evictServer filters
+	// on for the same reason. Written under p.mu once the factory returns; the
+	// zero value means the definition may still be read, so a since-filtered
+	// eviction has to assume the worst of it.
+	built time.Time
 }
 
 type entry struct {
@@ -391,6 +397,15 @@ func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, erro
 		p.releasePending(key.Tenant)
 		return nil, err
 	}
+	// Stamped after the factory read the definition and before Connect, which
+	// is the slow half: a cold `npx` spawn is minutes of Connect behind a
+	// definition read microseconds after the Get. Stamping it later would date
+	// this spawn by how long the subprocess took to come up and put it inside
+	// eviction windows that opened long after its definition was fixed.
+	p.mu.Lock()
+	sp.built = time.Now()
+	p.mu.Unlock()
+
 	conn, err := b.Connect(ctx)
 	if err != nil {
 		// Unconditional: ctx is the pool's, so nothing in this count is a
@@ -661,11 +676,20 @@ func (p *Pool) evictServer(server string, since time.Time) {
 			delete(p.broken, k)
 		}
 	}
-	// A spawn already running for this server captured the OLD definition.
-	// Marking it stale makes it close what it produces rather than install
-	// it, so the Get waiting behind it retries onto the new definition.
+	// A spawn already running for this server captured the definition live when
+	// its factory ran. Marking it stale makes it close what it produces rather
+	// than install it, so the Get waiting behind it retries onto the new
+	// definition.
+	//
+	// Filtered by the same cutoff as the entries, and owed to the caller for the
+	// same reason: a spawn whose definition was read before the window opened is
+	// provably from the config that is live again, and discarding it costs a
+	// waiting Get one of its getMaxAttempts and restarts a cold subprocess that
+	// was about to finish. An unstamped spawn has not finished reading a
+	// definition yet, so it may still read the one being undone — that one is
+	// stale whatever the cutoff.
 	for k, sp := range p.spawning {
-		if k.Server == server {
+		if k.Server == server && (sp.built.IsZero() || sp.built.After(since)) {
 			sp.stale = true
 		}
 	}

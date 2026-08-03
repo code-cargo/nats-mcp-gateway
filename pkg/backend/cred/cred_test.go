@@ -230,6 +230,79 @@ echo "{\"env\":{\"HOME\":\"$HOME\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
 	assert.Equal(t, real, c.Env["HOME"])
 }
 
+// The private home is half a boundary. A helper is third-party code that is
+// under no obligation to write absolute paths, and whatever it writes relative
+// lands where it was started — which, unless it is told otherwise, is the
+// gateway's own working directory, at the gateway's uid. StdioBackend points a
+// spawned server at its workdir for the same reason.
+func TestExecRunsInItsOwnDirectory(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+: > stray-file
+echo "{\"env\":{\"CWD\":\"$(pwd)\"},\"expiresAt\":\"2100-01-01T00:00:00Z\"}"
+`), 0o755))
+
+	gatewayCwd, err := os.Getwd()
+	require.NoError(t, err)
+	stray := filepath.Join(gatewayCwd, "stray-file")
+	t.Cleanup(func() { _ = os.Remove(stray) })
+
+	c, err := (&Exec{Command: script}).Resolve(ctxT(t), "acme", "u1", "srv")
+	require.NoError(t, err)
+	assert.NotEqual(t, gatewayCwd, c.Env["CWD"], "the helper ran in the gateway's working directory")
+	assert.NoFileExists(t, stray, "a relative-path write by the helper landed among the gateway's files")
+	// Per run and removed with the run, like the home it is.
+	_, err = os.Stat(c.Env["CWD"])
+	assert.True(t, os.IsNotExist(err), "the helper's working directory outlived the run")
+}
+
+// The wait delay decides whether a helper that leaves something on stdout is a
+// failed resolve or a wedged one, so its length is a property of the HELPER: a
+// wrapper whose child holds the pipe for longer than the default resolved
+// successfully before the bound existed and cannot resolve at all after it.
+// Configurable for that helper, and short for the operator who would rather
+// fail fast — the wait is charged to a cache mutex either way.
+func TestExecWaitDelayIsConfigurable(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(script, []byte(`#!/bin/sh
+sleep "$HOLD" &
+echo $! > "$READY"
+echo '{"env":{"TOKEN":"tok"},"expiresAt":"2100-01-01T00:00:00Z"}'
+`), 0o755))
+	helper := func(hold string, delay time.Duration) *Exec {
+		return &Exec{
+			Command:   script,
+			Env:       map[string]string{"READY": ready, "HOLD": hold},
+			Timeout:   time.Minute,
+			WaitDelay: delay,
+		}
+	}
+
+	t.Run("shorter than the child holds", func(t *testing.T) {
+		start := time.Now()
+		err := awaitResolve(t, startResolve(context.Background(), helper("60", 50*time.Millisecond)),
+			10*time.Second, "the configured wait delay was not what ended the wait")
+		require.ErrorIs(t, err, exec.ErrWaitDelay)
+		// Which bound ended it is the whole question, and here only the clock
+		// can answer: both bounds produce this same error. The margin is 40x
+		// the configured delay and well under the default it has to beat.
+		assert.Less(t, time.Since(start), 2*time.Second,
+			"the wait ran to the default instead of the configured delay")
+		assertReaped(t, readPID(t, ready))
+	})
+
+	// Longer than the child holds AND longer than the default, which is the
+	// helper the fixed bound broke: it prints its credentials, exits, and the
+	// child it forgot to detach releases stdout a second past the default.
+	t.Run("longer than the child holds", func(t *testing.T) {
+		err := awaitResolve(t, startResolve(context.Background(), helper("4", 30*time.Second)),
+			20*time.Second, "a helper within its configured wait delay never resolved")
+		require.NoError(t, err, "the configured wait delay was ignored in favour of the default")
+	})
+}
+
 func TestFile(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "u1.json"),
@@ -719,7 +792,90 @@ func TestInvalidateThenIdenticalMaterialKeepsGeneration(t *testing.T) {
 		assert.Equal(t, gen1, gen,
 			"re-resolving the same material after a 401 must not mint a new generation")
 	}
-	assert.Equal(t, 6, inner.count(), "each invalidation must still re-resolve")
+	// The first invalidation refetches; the four behind it are inside the window
+	// that refetch bought by coming back with the same credential. Serving the
+	// rejected credentials there is the point — the caller gets the backend's
+	// 401 without an IdP round-trip in front of it.
+	assert.Equal(t, 2, inner.count(),
+		"a rejection the source cannot answer must not reach it once per request")
+}
+
+// Invalidate is the one path that both drops the cache and clears the failure
+// backoff, and a backend rejecting the credentials on every request calls it on
+// every request. Unlimited, that is a fresh IdP resolve per request with the
+// guard that exists to prevent exactly that cleared each time — resolution runs
+// outside the pool's circuit breaker, so this backoff is the only thing between
+// a credential source and the gateway's full request rate.
+func TestInvalidateIsRateLimitedByAFutileRefetch(t *testing.T) {
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": "Bearer constant"},
+			ExpiresAt: time.Now().Add(time.Hour),
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, err := c.Resolve(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	// The rejection of material nobody has judged yet: acted on at once.
+	c.Invalidate("t", "u", "s")
+	_, err = c.Resolve(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	require.Equal(t, 2, inner.count(), "the first rejection must refetch immediately")
+
+	// That refetch answered nothing, and the request rate carries on.
+	for range 50 {
+		c.Invalidate("t", "u", "s")
+		got, resolveErr := c.Resolve(ctxT(t), "t", "u", "s")
+		require.NoError(t, resolveErr)
+		require.Equal(t, "Bearer constant", got.Headers["Authorization"],
+			"the cached credentials must keep serving inside the window")
+	}
+	assert.Equal(t, 2, inner.count(), "a 401 loop drove one credential-source resolve per request")
+
+	// The other half: the backoff Invalidate clears is the one a failing source
+	// is throttled by, so a rate-limited invalidation must leave it standing.
+	e := c.entry("t", "u", "s")
+	e.mu.Lock()
+	e.fails, e.retryAt = 4, time.Now().Add(10*time.Second)
+	e.mu.Unlock()
+	c.Invalidate("t", "u", "s")
+	e.mu.Lock()
+	fails, retryAt := e.fails, e.retryAt
+	e.mu.Unlock()
+	assert.Equal(t, 4, fails, "a rate-limited invalidation reset the failure count")
+	assert.False(t, retryAt.IsZero(), "a rate-limited invalidation cleared the failure backoff")
+}
+
+// The rate limit is bought by a refetch that returned the same credential, so
+// it must never be paid by the case Invalidate exists for. A rotation is a
+// rejection whose refetch DOES have something new to return: the material
+// moves, the generation moves, the pool keys a new backend on it — and the next
+// rejection after that is about a credential nothing has judged yet.
+func TestInvalidateStaysPromptAcrossRotations(t *testing.T) {
+	var n atomic.Int64
+	inner := &countingResolver{next: func(string) (*Credentials, error) {
+		return &Credentials{
+			Headers:   map[string]string{"Authorization": fmt.Sprintf("Bearer rotation-%d", n.Add(1))},
+			ExpiresAt: time.Now().Add(time.Hour),
+		}, nil
+	}}
+	c := Cached(inner, 0)
+
+	_, gen, err := c.ResolveGen(ctxT(t), "t", "u", "s")
+	require.NoError(t, err)
+	seen := map[int]bool{gen: true}
+
+	for range 5 {
+		c.Invalidate("t", "u", "s")
+		creds, g, resolveErr := c.ResolveGen(ctxT(t), "t", "u", "s")
+		require.NoError(t, resolveErr)
+		require.Falsef(t, seen[g], "rotated material was served under generation %d twice", g)
+		seen[g] = true
+		assert.Equal(t, fmt.Sprintf("Bearer rotation-%d", n.Load()), creds.Headers["Authorization"],
+			"a rotation must reach the caller on the request that follows the rejection")
+	}
+	assert.Equal(t, 6, inner.count(), "a rotation was withheld by the rate limit a 401 loop is for")
 }
 
 func TestInvalidateDoesNotCollapseTheRefreshCadence(t *testing.T) {

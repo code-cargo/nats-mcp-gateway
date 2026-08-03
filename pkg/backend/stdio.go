@@ -312,18 +312,22 @@ func (c *stdioConn) waitDead(d time.Duration) bool {
 
 // signalGroup signals the whole process group so grandchildren die too.
 //
-// The group is addressed by the leader's pid, and a pid stops being ours the
-// moment the kernel reaps it — after which this call can reach a group
-// belonging to something else entirely. Close only escalates to here when the
-// process was still alive a grace period ago, so the exposure is a subprocess
-// exiting just as that period expires; declining once the exit is known keeps
-// the signal in that window from being sent at all.
+// Sent even when the leader is already known to have exited, because that is
+// the case this exists for: an `npx` that exec'd node leaves the group
+// populated after the leader goes, and Close reaches here only once a grace
+// period expired with the subprocess still alive. Declining on an exit
+// observed between that timeout and this call would make Close return having
+// signalled nothing at all, and the grandchild outlives the gateway.
 //
-// It narrows the race rather than closing it. Closing it would need the pid
-// held against reuse until we are done with it, and the reap happens inside
-// os/exec's Wait, which tells us nothing until it returns.
+// The group is addressed by the leader's pid, which the kernel takes back when
+// it reaps that process — but not while the group it names still has members,
+// which is exactly when this signal has something to reach. An empty group
+// frees the pgid and this becomes a kill on a number nothing holds (ESRCH);
+// reaching a stranger through it would need the pid space to wrap between
+// os/exec's reap and the syscall below. Close's own escalation order is what
+// keeps that window a few instructions wide.
 func (c *stdioConn) signalGroup(sig syscall.Signal) {
-	if c.cmd.Process == nil || c.Dead() {
+	if c.cmd.Process == nil {
 		return
 	}
 	// Negative pid = the process group created by Setpgid.

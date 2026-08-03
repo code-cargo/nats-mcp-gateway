@@ -19,7 +19,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -116,35 +118,48 @@ func TestFailedConnectLeavesNothingBehind(t *testing.T) {
 	assert.Empty(t, entries, "the workdir outlived the failed connect")
 }
 
-// Close escalates to a process-GROUP kill, addressed by the leader's pid.
-// Once that leader has been reaped the pid belongs to the kernel again, and
-// signalling it then can reach a group that has nothing to do with us. The
-// race cannot be closed from Go — the pid is freed inside os/exec's Wait, and
-// nothing tells us so until Wait returns — but the branch where we already
-// know the process is gone can be, and it is the branch the escalation
-// reaches when a subprocess dies right as the grace period expires.
+// Close escalates to a process-GROUP kill because the process that has to die
+// is often not the one we started: `npx` execs node, a wrapper script forks
+// its server. The leader exiting while that child runs on is the whole reason
+// the group signal exists, so it has to be sent on exactly the state where the
+// leader is known to be gone — Close reaches the escalation only after a grace
+// period expired with the subprocess alive, and a leader that exits in the
+// instant between leaves Close with nothing else that reaches the child.
 //
-// The victim here stands in for whatever inherited the recycled pid.
-func TestSignalGroupSkipsAProcessAlreadyKnownDead(t *testing.T) {
-	victim := exec.Command("/bin/sleep", "30")
-	victim.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	require.NoError(t, victim.Start())
-	reaped := make(chan struct{})
-	go func() { _ = victim.Wait(); close(reaped) }()
-	t.Cleanup(func() {
-		_ = syscall.Kill(-victim.Process.Pid, syscall.SIGKILL)
-		<-reaped
-	})
+// The fixture is that shape: a shell that backgrounds a sleep, detaches its
+// stdio so the leader's exit is not held up by the pipes it inherited, and
+// exits.
+func TestSignalGroupStillReachesAChildOfADeadLeader(t *testing.T) {
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	conn, err := (&StdioBackend{
+		Command: "/bin/sh",
+		Args:    []string{"-c", "sleep 60 >/dev/null 2>&1 </dev/null & echo $! >" + pidFile},
+	}).Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*stdioConn)
+	require.Eventually(t, c.Dead, 10*time.Second, time.Millisecond, "the leader never exited")
 
-	c := &stdioConn{cmd: victim, dead: make(chan struct{})}
-	close(c.dead) // waitLoop has seen the exit: this pid is no longer ours
+	var child int
+	require.Eventually(t, func() bool {
+		b, readErr := os.ReadFile(pidFile)
+		if readErr != nil {
+			return false
+		}
+		child, _ = strconv.Atoi(strings.TrimSpace(string(b)))
+		return child > 0
+	}, 10*time.Second, time.Millisecond, "the fixture never recorded its child")
+	t.Cleanup(func() { _ = syscall.Kill(child, syscall.SIGKILL) })
+
+	// Without this the test would pass on a fixture whose child was never in
+	// the group, proving nothing about the signal that addresses the group.
+	pgid, err := syscall.Getpgid(child)
+	require.NoError(t, err)
+	require.Equal(t, c.cmd.Process.Pid, pgid, "the fixture's child left the leader's process group")
+
 	c.signalGroup(syscall.SIGKILL)
-
-	select {
-	case <-reaped:
-		t.Fatal("signalGroup killed a process group its own subprocess no longer owned")
-	case <-time.After(250 * time.Millisecond):
-	}
+	assert.Eventually(t, func() bool { return syscall.Kill(child, 0) != nil },
+		10*time.Second, time.Millisecond,
+		"Close signalled nothing and the grandchild outlived the gateway")
 }
 
 func TestMuxConcurrentCallsCorrelate(t *testing.T) {
@@ -401,6 +416,74 @@ func TestEvictServerSince(t *testing.T) {
 	// The zero cutoff means everything, which is how EvictServer is built on it.
 	p.EvictServerSince("a", time.Time{})
 	assert.NotEqual(t, before, pidOf("a", "acme"), "the zero cutoff must spare nothing")
+}
+
+// The cutoff has to mean the same thing for a spawn still running as it does
+// for an entry already installed, because the promise is about the DEFINITION a
+// backend was built from and not about when it finished starting. Connect is
+// the slow half — a cold `npx` server is seconds to minutes of it — so the
+// spawn a rollback is most likely to catch mid-flight is one whose definition
+// was read long before the failed revision existed. Discarding it fails the Get
+// waiting behind it with errEntryRetired, spending one of three attempts, and
+// starts that same cold subprocess again from zero.
+func TestEvictServerSinceSparesASpawnOlderThanTheWindow(t *testing.T) {
+	// A spawn held in Connect, with arrived reporting that its factory has
+	// already run: the definition is read, the subprocess is still coming up.
+	gatedPool := func(t *testing.T) (*Pool, *atomic.Int32, chan struct{}) {
+		t.Helper()
+		arrived := &atomic.Int32{}
+		gate := make(chan struct{})
+		p := NewPool(PoolConfig{}, func(Key) (Backend, error) {
+			return &gatedBackend{Backend: fakeBackend(nil), arrived: arrived, gate: gate}, nil
+		}, nil)
+		t.Cleanup(p.Shutdown)
+		return p, arrived, gate
+	}
+
+	get := func(p *Pool, key Key) <-chan error {
+		done := make(chan error, 1)
+		go func() {
+			_, release, err := p.Get(context.Background(), key)
+			if err == nil {
+				release()
+			}
+			done <- err
+		}()
+		return done
+	}
+
+	key := Key{Server: "a", Tenant: "acme"}
+
+	t.Run("older than the window", func(t *testing.T) {
+		p, arrived, gate := gatedPool(t)
+		done := get(p, key)
+		require.Eventually(t, func() bool { return arrived.Load() == 1 },
+			10*time.Second, time.Millisecond, "the spawn never reached Connect")
+
+		// Everything from here stands in for the failed revision's window: this
+		// spawn's definition was read before it opened.
+		p.EvictServerSince("a", time.Now())
+		close(gate)
+
+		require.NoError(t, <-done)
+		assert.Equal(t, int32(1), arrived.Load(),
+			"a spawn from the definition that is live again was discarded and started over")
+	})
+
+	t.Run("inside the window", func(t *testing.T) {
+		p, arrived, gate := gatedPool(t)
+		windowStart := time.Now()
+		done := get(p, key)
+		require.Eventually(t, func() bool { return arrived.Load() == 1 },
+			10*time.Second, time.Millisecond, "the spawn never reached Connect")
+
+		p.EvictServerSince("a", windowStart)
+		close(gate)
+
+		require.NoError(t, <-done)
+		assert.Equal(t, int32(2), arrived.Load(),
+			"a spawn that may have been built from the rolled-back revision was installed anyway")
+	})
 }
 
 func TestPoolTenantQuota(t *testing.T) {

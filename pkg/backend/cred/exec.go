@@ -25,11 +25,12 @@ import (
 	"time"
 )
 
-// helperWaitDelay bounds how long Resolve waits for the helper's stdout to
-// close after the helper itself is gone. Nothing should still hold that pipe
-// once the process it belongs to has exited or been killed, so this is a
-// grace period and not a budget — the same role terminateGrace plays in
-// StdioBackend, and the same length.
+// helperWaitDelay is the default bound on how long Resolve waits for the
+// helper's stdout to close after the helper itself is gone. Nothing should
+// still hold that pipe once the process it belongs to has exited or been
+// killed, so this is a grace period and not a budget — the same role
+// terminateGrace plays in StdioBackend, and the same length. Exec.WaitDelay
+// raises it for a helper that disagrees.
 const helperWaitDelay = 3 * time.Second
 
 // killHelperGroup SIGKILLs the helper's process group — the helper and
@@ -95,9 +96,20 @@ type Exec struct {
 	// these. Naming HOME here overrides the private one, for a helper that
 	// genuinely needs a populated home directory.
 	Env map[string]string
-	// Timeout bounds one helper run (default 30s), plus helperWaitDelay when
-	// something the helper spawned is still holding its stdout open.
+	// Timeout bounds one helper run (default 30s). It bounds the helper
+	// itself; anything the helper spawned that is still holding stdout after
+	// the helper exits is bounded by WaitDelay instead, and reaching THAT
+	// bound fails the resolve rather than extending this one.
 	Timeout time.Duration
+	// WaitDelay bounds the wait for stdout to close once the helper is gone
+	// (default helperWaitDelay). Reaching it fails the resolve — what was read
+	// may be a prefix of the credentials — and reclaims whatever still holds
+	// the pipe, so a helper whose child legitimately holds stdout for longer
+	// needs this raised past that or it can never succeed. It is bounded at all
+	// because the wait is taken under the cache's per-key mutex, which no
+	// context can interrupt: an unbounded one wedges that key for the life of
+	// the gateway instead of failing and backing off.
+	WaitDelay time.Duration
 }
 
 // Resolve implements Resolver.
@@ -105,6 +117,10 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	timeout := e.Timeout
 	if timeout <= 0 {
 		timeout = 30 * time.Second
+	}
+	waitDelay := e.WaitDelay
+	if waitDelay <= 0 {
+		waitDelay = helperWaitDelay
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -124,6 +140,13 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	defer func() { _ = os.RemoveAll(home) }()
 
 	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
+	// The same directory again as the working directory, which is the other
+	// half of that boundary and the one StdioBackend already draws (cmd.Dir =
+	// workDir). Without it the helper runs in the gateway's cwd, so every
+	// relative path it writes — a token cache, an SDK's debug log, a scratch
+	// file it forgets — lands among the gateway's own files under the
+	// gateway's uid.
+	cmd.Dir = home
 	// The subprocess discipline StdioBackend uses, for the same reason:
 	// helpers are wrapper scripts that fork. New process group so the timeout
 	// reaches the children (killing the helper alone leaves them running and
@@ -134,7 +157,7 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	// the life of the gateway instead of failing and backing off.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return cancelHelper(cmd.Process) }
-	cmd.WaitDelay = helperWaitDelay
+	cmd.WaitDelay = waitDelay
 	cmd.Env = []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + home,
