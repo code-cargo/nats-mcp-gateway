@@ -478,7 +478,10 @@ NATSMCP_CONFIG_JSON='{"servers":{…}}' natsmcp gateway # inline; fixed for the 
 Note: only the **file** source reads connection settings (URL, prefix, queue
 group, inbox prefix, scope) from the document's `nats` block. The fetch and
 inline sources take those from flags/env — the document supplies only the
-server set.
+server set. Passing one of those flags (or its `NATSMCP_*` env var) alongside
+`--config` is **rejected at boot** unless the document already carries that same
+value — the mirror of the inline source rejecting a `nats` block. A scope
+injected as pod env is therefore never silently dropped, in either direction.
 
 `--inbox-prefix` / `NATSMCP_INBOX_PREFIX` (file source: `nats.inboxPrefix`)
 sets the prefix for this process's own request/reply inboxes — the config
