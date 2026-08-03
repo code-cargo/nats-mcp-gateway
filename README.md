@@ -261,6 +261,23 @@ ceremony. Set `"allowPlaintext": true` on a server when something outside the
 gateway's view encrypts the hop — a service mesh sidecar, a tunnel — and it
 covers that one server's `url` and `tokenUrl` only.
 
+> **Upgrading:** this rejects the WHOLE config, not the offending server, and
+> the fetch source revalidates on every reload — so one un-migrated `http://`
+> url takes down every other server on that gateway. Fix the config before
+> rolling the binary: add `allowPlaintext` where the hop is genuinely
+> encrypted elsewhere, `https` everywhere else. An older gateway ignores
+> `allowPlaintext`, so the config change is safe to land first.
+
+Redirects are refused unless the hop changes nothing but the path. Go's
+default policy is written for a browser: it keeps `Authorization` across an
+`https`→`http` downgrade and across a hop to a *subdomain*, never strips the
+request body (which for the OAuth client is the refresh token), and hands the
+final response back to the caller. A gateway holding someone else's
+credential cannot follow those rules, so a hop to a different host, a
+different port, or out of `https` fails the request instead. If a backend
+sits behind something that redirects to a canonical host, point `url` at
+where it lands.
+
 ### Caching hints
 
 2026-07-28 requires `ttlMs` and `cacheScope` on every cacheable result
