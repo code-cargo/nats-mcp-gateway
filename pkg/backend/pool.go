@@ -194,7 +194,6 @@ func (p *Pool) Get(ctx context.Context, key Key) (*Mux, func(), error) {
 // get is one attempt at Get, reporting errEntryRetired when the caller should
 // start over.
 func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
-	var superseded []*Mux
 	p.mu.Lock()
 	e := p.entries[key]
 	// Past-deadline entries are replaced here, not only by the reaper: its
@@ -212,6 +211,20 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 		e = nil
 	}
 	if e == nil {
+		// Retire what this generation supersedes BEFORE the cap is measured.
+		// Those entries can never be dispatched to again, so counting them
+		// counts backends that exist only until the reaper notices. Measured
+		// with them still in it, a tenant already at MaxProcsPerTenant cannot
+		// rotate a credential at all: the new generation is a new key, the
+		// predecessor it is replacing still occupies the cap, and every
+		// request for that server is refused until the IdleTTL reaps an entry
+		// nothing could have reached anyway.
+		for _, m := range p.retireSupersededLocked(key) {
+			// Off the request path: closing a stdio backend escalates through
+			// SIGTERM to SIGKILL and can take seconds, and the caller waiting
+			// on this Get has nothing to do with the credentials that rotated.
+			go func(m *Mux) { _ = m.Close() }(m)
+		}
 		if br := p.broken[key]; br != nil && time.Now().Before(br.openUntil) {
 			p.mu.Unlock()
 			return nil, nil, fmt.Errorf("backend: circuit open for %s/%s until %s (%d consecutive spawn failures)",
@@ -244,8 +257,11 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 		// The entry counts for itself from here, whichever branch below wins.
 		p.releasePendingLocked(key.Tenant)
 		delete(p.broken, key)
-		// Lost the race with another Get? Keep ours anyway under its key —
-		// simplest correct behavior; the reaper collects extras.
+		// Lost the race with another Get? Adopt the entry that landed first
+		// and close the connection we just opened. Keeping both would put a
+		// second subprocess under one key with nothing to reach it — the cap
+		// counts it, the reaper collects it, and the tenant pays for it in
+		// between.
 		if cur := p.entries[key]; cur != nil && !cur.mux.Dead() {
 			e = cur
 			go func(c Conn) { _ = c.Close() }(conn)
@@ -276,7 +292,6 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 				sem:      make(chan struct{}, p.cfg.MaxConcurrent),
 			}
 			p.entries[key] = e
-			superseded = p.retireSupersededLocked(key)
 		}
 	}
 	e.lastUsed = time.Now()
@@ -284,12 +299,6 @@ func (p *Pool) get(ctx context.Context, key Key) (*Mux, func(), error) {
 	sem := e.sem
 	mux := e.mux
 	p.mu.Unlock()
-	for _, m := range superseded {
-		// Off the request path: closing a stdio backend escalates through
-		// SIGTERM to SIGKILL and can take seconds, and the caller waiting on
-		// this Get has nothing to do with the credentials that rotated.
-		go func(m *Mux) { _ = m.Close() }(m)
-	}
 
 	select {
 	case sem <- struct{}{}:

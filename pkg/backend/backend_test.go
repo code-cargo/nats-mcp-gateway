@@ -348,6 +348,39 @@ func TestNewGenerationRetiresTheEntryItSupersedes(t *testing.T) {
 	release()
 }
 
+// TestRotationIsNotRefusedByTheCapItsPredecessorOccupies is the same failure
+// as above met from the other side: not a tenant filling its cap with dead
+// generations, but a tenant already at the cap for legitimate reasons trying
+// to rotate one credential.
+//
+// Retiring after the spawn cannot help there, because the cap is measured
+// BEFORE the spawn — so the entry that is about to be superseded is still
+// counted, and the rotation is refused by the predecessor it was about to
+// replace. Nothing recovers it until the IdleTTL reaps an entry that was
+// already unreachable: the proxy resolves before it keys, so no later request
+// can carry the old generation.
+func TestRotationIsNotRefusedByTheCapItsPredecessorOccupies(t *testing.T) {
+	p := NewPool(PoolConfig{MaxProcsPerTenant: 1, IdleTTL: time.Hour}, poolFactory, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "acme", CredSet: "u1", CredVersion: 1}
+	_, release, err := p.Get(context.Background(), key)
+	require.NoError(t, err)
+	release()
+
+	rotated := key
+	rotated.CredVersion = 2
+	_, release, err = p.Get(context.Background(), rotated)
+	require.NoError(t, err,
+		"a rotation must not be refused by the cap its own superseded entry is holding")
+	release()
+
+	p.mu.Lock()
+	live := len(p.entries)
+	p.mu.Unlock()
+	assert.Equal(t, 1, live, "the superseded entry must not have survived the rotation")
+}
+
 // gatedBackend holds Connect open until released, so every racing Get sits
 // inside the window between the tenant check and the insert at the same time.
 // Connect really does take that long in production — it spawns an npx or uvx
