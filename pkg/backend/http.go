@@ -100,6 +100,11 @@ type httpConn struct {
 	mu        sync.Mutex
 	sessionID string
 	inflight  sync.WaitGroup
+	// closing latches Close's arrival, so admitting an exchange (the Add on
+	// inflight) and draining them (the Wait) cannot interleave. connCtx alone
+	// cannot do this: a Write may pass a context check and reach its Add after
+	// Wait has already started on a zero counter, which that Wait will not see.
+	closing bool
 
 	// annotations maps a tool name to its honored x-mcp-header parameters,
 	// learned from tools/list responses passing through. A tool with no
@@ -165,8 +170,19 @@ func (c *httpConn) Write(ctx context.Context, msg *jsonrpc.Message) error {
 	// background so Write keeps the Conn contract (non-blocking beyond the
 	// POST itself). The request is (re)built inside so the single 401 retry
 	// gets a fresh body reader and freshly-resolved headers.
-	exchange, done := c.exchangeContext(ctx, msg)
+	//
+	// Admission is latched against Close under c.mu, not against connCtx: a
+	// WaitGroup counter raised after Wait has begun on a zero counter is not
+	// seen by that Wait, so a Write that had already passed a bare context
+	// check could start an exchange behind the drain Close just reported.
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return ErrConnDead
+	}
 	c.inflight.Add(1)
+	c.mu.Unlock()
+	exchange, done := c.exchangeContext(ctx, msg)
 	go func() {
 		defer c.inflight.Done()
 		defer done()
@@ -537,6 +553,12 @@ var urlInText = regexp.MustCompile(`[a-zA-Z][a-zA-Z0-9+.-]*://[^\s"'` + "`" + `]
 // which backend could not be reached, which is the whole content of a
 // transport error. Userinfo and query string are what a secret is expanded
 // into, and neither tells the caller anything it is owed.
+//
+// The path is kept, which bounds what this can promise: a deployment that puts
+// its secret in the path rather than the query (a webhook-shaped URL), or an
+// error quoting a file:// URI, still passes that through. Keeping the path is
+// the deliberate half of the trade — "which backend" is unreadable without it —
+// so a secret belongs in a header or the query string, not in the path.
 func scrubURLs(s string) string {
 	return urlInText.ReplaceAllStringFunc(s, func(raw string) string {
 		// Trailing punctuation belongs to the sentence, not the URL.
@@ -566,14 +588,15 @@ func scrubURLs(s string) string {
 
 func (c *httpConn) Close() error {
 	c.closeOnce.Do(func() {
-		// Ends every exchange before anything else: the DELETE below is a
-		// courtesy call, and a request wedged against this backend must not be
-		// what decides whether it goes out.
-		c.connCancel()
-
+		// Shuts the door before anything else, so no exchange can be admitted
+		// behind the drain below, and ends the ones already through it: the
+		// DELETE that follows is a courtesy call, and a request wedged against
+		// this backend must not be what decides whether it goes out.
 		c.mu.Lock()
+		c.closing = true
 		sid := c.sessionID
 		c.mu.Unlock()
+		c.connCancel()
 		if c.backend.Legacy && sid != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -611,7 +634,10 @@ func (c *httpConn) Close() error {
 	return nil
 }
 
-// awaitInflight reports whether every exchange finished within d.
+// awaitInflight reports whether every exchange finished within d. On timeout
+// the waiter outlives this call, which is bounded rather than leaked: the
+// exchanges it waits on all run under connCtx, already cancelled by Close, and
+// cancelling a request aborts the body read holding its socket.
 func (c *httpConn) awaitInflight(d time.Duration) bool {
 	drained := make(chan struct{})
 	go func() {
