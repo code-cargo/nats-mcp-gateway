@@ -270,6 +270,15 @@ func TestRejectedURLsAreRedacted(t *testing.T) {
 			`{"servers":{"s":{"transport":"http","url":"http://` + pass + `@internal.example.com/mcp"}}}`,
 			"internal.example.com",
 		},
+		{
+			// An opaque URL parses without error and populates neither User
+			// nor RawQuery, so every redaction branch finds nothing to do and
+			// the credential went out whole — into a message configsource
+			// re-logs on every poll tick.
+			"opaque url",
+			`{"servers":{"s":{"transport":"http","url":"ftp:svcacct:` + pass + `@files.example.com/mcp"}}}`,
+			"ftp",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			_, err := Parse([]byte(tt.raw))

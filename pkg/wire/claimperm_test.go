@@ -406,3 +406,32 @@ func TestEagerDeleteIsBoundedAndLatchesOff(t *testing.T) {
 	}
 	assert.True(t, claimObjectExists(t, admin, second))
 }
+
+// A caller whose context ends is not a statement about whether this identity
+// may delete. Latching on it would let one impatient MCP client disable eager
+// cleanup for every tenant the process serves, for the life of the process.
+//
+// Staged deterministically rather than by racing a cancel against a fetch: the
+// read-only client grant makes the delete hang to its own bound every time (a
+// refused publish is never answered), so a caller deadline shorter than that
+// bound always expires inside the delete and never inside the body read.
+func TestCallerCancellationDoesNotLatchOffEagerDelete(t *testing.T) {
+	_, url := claimPermNATS(t)
+	_, gw, _ := dialClaim(t, url, claimUserGateway)
+	_, client, _ := dialClaim(t, url, claimUserClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), claimPermTimeout)
+	defer cancel()
+	id, err := gw.Put(ctx, claimPermTenant, []byte("payload"))
+	require.NoError(t, err)
+
+	short, shortCancel := context.WithTimeout(ctx, 300*time.Millisecond)
+	defer shortCancel()
+	body, err := client.Fetch(short, claimPermTenant, id)
+	require.NoError(t, err, "the body is read long before the caller's deadline")
+	require.Equal(t, []byte("payload"), body)
+	require.Error(t, short.Err(), "the caller's deadline must have expired inside the delete")
+
+	assert.False(t, client.noEagerDelete.Load(),
+		"a caller's own deadline disabled eager cleanup for every tenant this process serves")
+}

@@ -321,6 +321,15 @@ func redactURL(raw string) string {
 		}
 		return redacted
 	}
+	if u.Opaque != "" {
+		// An opaque URL ("ftp:user:pw@h/p") parses without error and populates
+		// neither User nor RawQuery, so every branch below finds nothing and
+		// the whole credential goes out verbatim. Nothing here can locate the
+		// parts of a form net/url declined to break up, and this reaches a
+		// message pkg/configsource re-logs on every poll tick, so keep the
+		// scheme — which is what the rejection is usually about — and drop it.
+		return u.Scheme + ":" + redacted
+	}
 	if u.User != nil {
 		if _, hasPass := u.User.Password(); hasPass {
 			// The username stays: "connecting as the wrong identity" is a

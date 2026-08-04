@@ -29,6 +29,39 @@ import (
 // somebody's actual password.
 const redacted = "xxxxx"
 
+// userinfoEnd returns the index of the "@" that ends a URL's userinfo, or -1
+// when there is none. u is the URL with any scheme already removed.
+//
+// Two heuristics, because neither alone is safe, and this is textual for the
+// reason redactNATSURL is: a credential that breaks net/url parsing is exactly
+// the one that must not be passed through.
+//
+// The authority ends at the first "/", so looking only there is right whenever
+// the URL is well-formed, and it keeps a credential-FREE URL whose PATH holds
+// an "@" — "https://h:443/u/a@b" — from reading as userinfo of "h:443/u/a"
+// and reporting the port and half the path as the redaction.
+//
+// But a password may contain an unescaped "/", which puts the "@" that ends
+// the userinfo BEHIND that bound: "nats://gw:aB3/xY9@host" has no "@" in its
+// authority at all, and stopping there returns the whole credential unredacted.
+// Base64 passwords carry "/" routinely. So when the authority holds no "@",
+// the whole remainder is searched before giving up.
+//
+// The fallback re-admits the path case: an "@" in a path is redacted as though
+// it were a credential. That asymmetry is deliberate. Guessing wrong in this
+// direction costs an operator the host and part of the path from one log line;
+// guessing wrong in the other prints a password.
+func userinfoEnd(u string) int {
+	authority := u
+	if slash := strings.IndexByte(u, '/'); slash >= 0 {
+		authority = u[:slash]
+	}
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		return at
+	}
+	return strings.LastIndex(u, "@")
+}
+
 // redactNATSURL strips credentials from a NATS URL (or comma-separated
 // cluster list, which is how nats.go takes one) for logging. A URL with no
 // credential comes back byte-for-byte, so the ordinary case still logs what
@@ -48,18 +81,7 @@ func redactNATSURL(raw string) string {
 			// scheme-less URL carries userinfo just the same.
 			scheme, u = u[:n+3], u[n+3:]
 		}
-		// Userinfo lives in the authority, and the authority ends at the first
-		// "/". Searching the whole remainder instead lets a credential-FREE
-		// URL whose PATH carries an "@" — "https://h:443/u/a@b" — read as
-		// userinfo of "h:443/u/a", and the port and half the path come back to
-		// the operator as the redaction. Nothing leaks; the line just stops
-		// saying where the process was trying to connect, which is all it was
-		// there to say.
-		authority := u
-		if slash := strings.IndexByte(u, '/'); slash >= 0 {
-			authority = u[:slash]
-		}
-		at := strings.LastIndex(authority, "@")
+		at := userinfoEnd(u)
 		if at < 0 {
 			continue
 		}
@@ -250,18 +272,20 @@ func warnPlaintextNATSURL(log *slog.Logger, raw string) {
 			// plaintext scheme too.
 			scheme, rest = "nats", u
 		}
-		if !strings.EqualFold(scheme, "nats") {
+		// "ws" alongside "nats" because it is the other unencrypted hop nats.go
+		// will take, and it sends the password exactly as nats:// does. "tls"
+		// and "wss" are the decisions already made correctly.
+		if !strings.EqualFold(scheme, "nats") && !strings.EqualFold(scheme, "ws") {
 			continue
 		}
-		authority := rest
-		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
-			authority = rest[:slash]
-		}
-		at := strings.LastIndex(authority, "@")
+		at := userinfoEnd(rest)
 		if at < 0 {
 			continue
 		}
-		host := authority[at+1:]
+		host := rest[at+1:]
+		if slash := strings.IndexByte(host, '/'); slash >= 0 {
+			host = host[:slash]
+		}
 		if h, _, err := net.SplitHostPort(host); err == nil {
 			host = h
 		}

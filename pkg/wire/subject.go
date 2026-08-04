@@ -79,7 +79,7 @@ func TokenSafe(s string) bool {
 // check permits "*" anywhere and NATS binds the result, so "mcp.*" quietly
 // subscribes this instance to every prefix in the account.
 func ValidateSubjectPrefix(s string) error {
-	return validateTokenRun("subject prefix", s, wireTokenSafe)
+	return validateTokenRun("subject prefix", s, wireTokenSafe, "")
 }
 
 // ValidateQueueGroup checks that s is usable as a NATS queue group — the same
@@ -93,7 +93,7 @@ func ValidateSubjectPrefix(s string) error {
 // naming neither the setting nor the value, by which point the process has
 // connected and looks healthy.
 func ValidateQueueGroup(s string) error {
-	return validateTokenRun("queue group", s, wireTokenSafe)
+	return validateTokenRun("queue group", s, wireTokenSafe, "")
 }
 
 // ValidateInboxPrefix checks an inbox prefix, which is held to the narrow
@@ -101,13 +101,16 @@ func ValidateQueueGroup(s string) error {
 // setting has been validated since before it had company, and no deployment
 // was relying on a wider one.
 func ValidateInboxPrefix(s string) error {
-	return validateTokenRun("inbox prefix", s, TokenSafe)
+	return validateTokenRun("inbox prefix", s, TokenSafe, `A-Za-z0-9_-`)
 }
 
 // validateTokenRun walks a dotted run of literal subject tokens. what names
 // the run in the error ("subject prefix", "queue group"); safe decides the
-// alphabet, which differs by who wrote the value.
-func validateTokenRun(what, s string, safe func(string) bool) error {
+// alphabet, which differs by who wrote the value; alphabet spells that
+// alphabet out for the caller whose rule is small enough to state, and is
+// empty for the ones whose rule is "what the wire carries" — naming a set
+// there would be a longer and less true answer than naming what is wrong.
+func validateTokenRun(what, s string, safe func(string) bool, alphabet string) error {
 	for _, tok := range strings.Split(s, ".") {
 		switch {
 		case tok == "":
@@ -115,6 +118,9 @@ func validateTokenRun(what, s string, safe func(string) bool) error {
 		case strings.ContainsAny(tok, "*>"):
 			return fmt.Errorf("invalid %s %q: wildcards (* and >) are not allowed", what, s)
 		case !safe(tok):
+			if alphabet != "" {
+				return fmt.Errorf("invalid %s %q: token %q is not usable as a subject token (%s)", what, s, tok, alphabet)
+			}
 			return fmt.Errorf("invalid %s %q: token %q is not usable as a subject token", what, s, tok)
 		}
 	}

@@ -101,11 +101,18 @@ func TestRedactNATSURL(t *testing.T) {
 		// which is exactly when a redactor that leaned on net/url would give
 		// up and pass the secret through.
 		{"tls://gw:s3c@r3t@nats:4222", "tls://gw:xxxxx@nats:4222"},
-		// A credential-free URL whose PATH carries an "@". The password span
-		// is bounded by "/" so the authority survives: an operator reading a
-		// connect failure needs the host and port intact, and reporting the
-		// port as "xxxxx" reads as a redaction that fired on nothing.
-		{"https://h:443/u/a@b.example", "https://h:443/u/a@b.example"},
+		// A "/" in the password puts the "@" that ends the userinfo BEHIND the
+		// authority bound, so a scan that stops at the first "/" finds no
+		// credential and returns the whole thing. Base64 passwords carry "/"
+		// routinely, and this printed one to the boot log.
+		{"nats://gw:aB3/s3cr3t@nats:4222", "nats://gw:xxxxx@nats:4222"},
+		{"nats://s3cr3t/x@nats:4222", "nats://xxxxx@nats:4222"},
+		// A credential-FREE URL whose PATH carries an "@" is redacted as
+		// though it were one, and that is the deliberate side of the trade: a
+		// password may contain "/", which puts the "@" ending its userinfo
+		// behind the authority, so the scan cannot stop there. Mangling one
+		// log line is recoverable; printing a password is not.
+		{"https://h:443/u/a@b.example", "https://h:xxxxx@b.example"},
 	} {
 		got := redactNATSURL(tc.raw)
 		assert.Equal(t, tc.want, got, tc.raw)
@@ -266,10 +273,12 @@ func TestWarnPlaintextNATSURL(t *testing.T) {
 		warn bool
 	}{
 		{"nats://gw:s3cr3t@prod:4222", true},
-		{"gw:s3cr3t@prod:4222", true},        // nats.go supplies the scheme
-		{"nats://t0ken@prod:4222", true},     // colon-less userinfo is the token
-		{"nats://prod:4222", false},          // a creds file is not sent in the clear
-		{"tls://gw:s3cr3t@prod:4222", false}, // already encrypted
+		{"nats://gw:aB3/s3cr3t@prod:4222", true}, // "/" in the password
+		{"ws://gw:s3cr3t@prod:8080", true},       // the other unencrypted hop
+		{"gw:s3cr3t@prod:4222", true},            // nats.go supplies the scheme
+		{"nats://t0ken@prod:4222", true},         // colon-less userinfo is the token
+		{"nats://prod:4222", false},              // a creds file is not sent in the clear
+		{"tls://gw:s3cr3t@prod:4222", false},     // already encrypted
 		{"nats://gw:s3cr3t@127.0.0.1:4222", false},
 		{"nats://gw:s3cr3t@localhost:4222", false},
 		{"", false},

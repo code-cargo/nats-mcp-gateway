@@ -1889,6 +1889,12 @@ func TestApplyRevisionReportsOnlyWhatApplied(t *testing.T) {
 	assert.Equal(t, 1, pruned)
 	assert.Contains(t, buf.String(), "gh", "the per-user servers are named once they are being served")
 
+	// A nil revision is one Apply accepts — "every server removed" — so this
+	// callback sees it on the success path and must not dereference it.
+	pruned = 0
+	require.NotPanics(t, func() { require.NoError(t, run(nil)) })
+	assert.Equal(t, 1, pruned, "a nil revision still retires the resolvers of the servers it removed")
+
 	// And the fetch source's next tick says nothing new.
 	before := buf.Len()
 	require.NoError(t, run(perUser(t)))

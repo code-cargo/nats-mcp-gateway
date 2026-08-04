@@ -249,10 +249,17 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 	// Eager cleanup; TTL is the backstop when this is denied or we die here.
 	if !o.noEagerDelete.Load() {
 		dctx, dcancel := context.WithTimeout(ctx, claimEagerDeleteTimeout)
-		if err := obs.Delete(dctx, id); err != nil {
+		err := obs.Delete(dctx, id)
+		dcancel()
+		// Latched only for a failure of OURS. The caller's context ending is
+		// the ordinary shape of an MCP client that cancelled or went away
+		// microseconds after its body was read, and it says nothing about
+		// whether this identity may delete — reading it as a refusal would let
+		// one impatient client disable eager cleanup for every tenant this
+		// process serves, for the rest of its life.
+		if err != nil && ctx.Err() == nil {
 			o.noEagerDelete.Store(true)
 		}
-		dcancel()
 	}
 	return body, nil
 }

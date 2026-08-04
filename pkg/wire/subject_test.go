@@ -194,3 +194,12 @@ func TestOperatorTokenRunsAcceptWhatTheWireCarries(t *testing.T) {
 	assert.Error(t, ValidateInboxPrefix("_INBOX.acme/1"))
 	assert.NoError(t, ValidateInboxPrefix("_INBOX_acme.u_9f3a"))
 }
+
+// The inbox prefix is the one of the three still held to a small alphabet, so
+// its rejection can state that alphabet — which is the piece of information
+// that actually fixes the value.
+func TestInboxPrefixRejectionNamesItsAlphabet(t *testing.T) {
+	err := ValidateInboxPrefix("_INBOX.acme/1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `A-Za-z0-9_-`)
+}

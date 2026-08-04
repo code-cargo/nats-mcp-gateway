@@ -342,7 +342,16 @@ func applyRevision(log *slog.Logger, apply func(*config.Config) (reconcile.Delta
 		if _, err := apply(cfg); err != nil {
 			return err
 		}
-		prune(cfg.Servers)
+		// Apply takes a nil revision as "every server removed", and the
+		// configsource package doc advertises a fetch returning (nil, nil) as
+		// the way to write one — so this callback sees nil on a revision that
+		// APPLIED, and dereferencing it here would take the process down one
+		// statement after the apply succeeded.
+		var servers map[string]config.Server
+		if cfg != nil {
+			servers = cfg.Servers
+		}
+		prune(servers)
 		perUserWarned = warnPerUserGrain(log, cfg, perUserWarned)
 		return nil
 	}

@@ -792,8 +792,9 @@ form](#configuration) and [`allowPlaintext`](#configuration).
   Anything it left running that inherited that pipe — a daemon it starts on
   demand, an agent — holds it open, and reaching the delay fails the resolve
   and SIGKILLs the helper's process group rather than waiting out `Timeout`.
-  The bound is fixed; no config field raises it. Give such a child its own
-  stdout (`>/dev/null 2>&1` in the wrapper).
+  The default is 3s. Raise it with `auth.waitDelay` on that server when the
+  child legitimately holds the pipe longer, or give it its own stdout
+  (`>/dev/null 2>&1` in the wrapper) so it never holds the helper's at all.
 - **Claim-check store operations do not observe the drain.** Parking an
   oversize body, and deleting one whose stream ended before its reference
   went out, each run on the request's own goroutine under a private 30s bound

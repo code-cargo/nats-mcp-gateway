@@ -596,10 +596,18 @@ func TestRepeatedFailingRevisionEvictsOnce(t *testing.T) {
 	assert.Equal(t, []evictCall{{server: "a"}}, pool.calls())
 }
 
-// Closing a backend waits out its terminate grace. An apply that pays that
-// under the lock that serializes applies makes it the next reload's latency
-// too, so the pool work runs with the lock released.
-func TestEvictionRunsWithTheApplyLockReleased(t *testing.T) {
+// An apply's eviction runs under the same lock as the state change that
+// decided it, and that ordering is the point rather than an accident.
+//
+// It was split off once so a queued reload would not wait out the previous
+// one's terminate grace. That split published inside the critical section and
+// evicted outside it, so a later revision could go live and then have its
+// backends killed by the earlier apply's eviction — with no window to bound it
+// for an adopted revision, which evicts unconditionally. Run applies serially
+// in one goroutine, so the latency it bought is a shape the gateway never
+// produces, while the race it opened is exactly what concurrent Apply is
+// supposed to be safe for.
+func TestEvictionRunsBeforeTheNextApplyCanPublish(t *testing.T) {
 	rec, pool := newRecordingStack(t, nil)
 
 	_, err := rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(nil)}))
@@ -611,26 +619,32 @@ func TestEvictionRunsWithTheApplyLockReleased(t *testing.T) {
 		once.Do(func() { close(entered) })
 		<-release
 	}
-	defer close(release)
 
-	// A reload that evicts, held open inside the pool.
 	go func() { _, _ = rec.Apply(cfg(map[string]config.Server{"a": fakeSrv(map[string]string{"EXTRA": "1"})})) }()
 	<-entered
 
-	// The next reload goes ahead rather than waiting out the previous one's
-	// subprocesses: Current is what the pool factory and every later diff read,
-	// so a reload that cannot publish has not happened.
+	published := make(chan struct{})
 	go func() {
+		defer close(published)
 		_, _ = rec.Apply(cfg(map[string]config.Server{
 			"a": fakeSrv(map[string]string{"EXTRA": "1"}),
 			"b": fakeSrv(nil),
 		}))
 	}()
-	require.Eventually(t, func() bool {
-		cur := rec.Current()
-		return cur != nil && len(cur.Servers) == 2
-	}, 2*time.Second, 10*time.Millisecond,
-		"a reload must not wait out the previous one's evictions to take effect")
+
+	// Nothing of the second apply is visible while the first is still inside
+	// the pool: a revision that went live here would be one the eviction still
+	// running behind it could reach.
+	select {
+	case <-published:
+		t.Fatal("a revision was published while a previous apply's eviction was still running")
+	case <-time.After(200 * time.Millisecond):
+	}
+	assert.Len(t, rec.Current().Servers, 1)
+
+	close(release)
+	<-published
+	assert.Len(t, rec.Current().Servers, 2)
 }
 
 // The drift warning is about an EDIT the operator made, and #24 made a refused
@@ -679,29 +693,4 @@ func fakeSrv(extraEnv map[string]string) config.Server {
 		Command:   os.Args[0],
 		Env:       extraEnv,
 	}
-}
-
-// evictMu is taken inside transition and released by Apply, which cannot
-// register its deferred unlock until transition has returned. A panic unwinding
-// through that hand-off would carry the lock off with it and every later Apply
-// would block on it forever. Nothing in this repo recovers, so such a panic
-// ends the process today — this pins the pairing against the day something
-// does, which is not the day to find out.
-func TestPanicInTransitionDoesNotStrandEvictMu(t *testing.T) {
-	r := New(nil, &recordingPool{}, nil)
-	func() {
-		defer func() {
-			require.NotNil(t, recover(), "the panic must still propagate, not be swallowed")
-		}()
-		// ws is nil, so SetServers panics once the diff is non-empty.
-		_, _ = r.Apply(&config.Config{Servers: map[string]config.Server{"a": {Command: "x"}}})
-	}()
-
-	// TryLock answers the only question here — is the lock free — directly.
-	// A goroutine racing a timeout answers it too, at the cost of an empty
-	// critical section, which staticcheck reads as the mistake it usually is
-	// (SA2001) and which takes three seconds to report a failure. Nothing
-	// unlocks it afterwards: r is discarded with the test.
-	assert.True(t, r.evictMu.TryLock(),
-		"evictMu was stranded by the panic; every later Apply would block on it")
 }

@@ -50,15 +50,21 @@ type Reconciler struct {
 
 	cur atomic.Pointer[config.Config]
 
-	// mu serializes an apply's state change — the wire update and the publish
-	// through cur — so concurrent reloads can't interleave them.
+	// mu serializes Apply end to end — the diff, the wire update, the publish
+	// through cur, AND the eviction those decide on.
+	//
+	// Holding it across the eviction costs latency: closing a backend waits out
+	// its terminate grace, and a queued apply pays for it. That was split off
+	// once, onto a second lock taken under this one and released after the pool
+	// work, and it is back because the split is unsound and buys nothing here.
+	// Unsound: an apply publishes inside the critical section but evicts after
+	// leaving it, so a later apply's revision can go live first and then have
+	// its backends killed by the earlier apply's eviction — which for an
+	// adopted revision has no window to be bounded by. Buys nothing: Run
+	// applies serially in one goroutine, so a queued apply waiting on the lock
+	// is a shape the gateway never produces. Concurrent Apply is what this
+	// lock is FOR, and it is exactly the case the split broke.
 	mu sync.Mutex
-
-	// evictMu orders the pool work two applies decide on. It is taken under mu
-	// and released once that work has run, so the eviction itself runs with mu
-	// free: closing a backend waits out its terminate grace, and an apply that
-	// paid that under mu would hand its cost to the next reload.
-	evictMu sync.Mutex
 
 	// bootNATS is the `nats` block of the FIRST applied revision — the settings
 	// the connection and wire server handed to New were built from; bootSeen
@@ -124,12 +130,9 @@ func (d Delta) Empty() bool {
 // otherwise ignored — that connection cannot be rebuilt underneath a serving
 // process.
 func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	d, ev, err := r.transition(next)
-	// The pool work runs here, with mu released and evictMu still held from
-	// inside transition. An eviction closes subprocesses and waits out the
-	// terminate grace; that is not a cost to hold the apply lock across, but
-	// two applies' pool work still has to run in apply order.
-	defer r.evictMu.Unlock()
 	r.evict(ev)
 	return d, err
 }
@@ -142,24 +145,10 @@ type eviction struct {
 	// matches every backend, which is what an adopted revision wants; a
 	// rollback sets the window in which its rejected revision was reachable.
 	since time.Time
-	// live is the config the rollback restored, and the one that must still be
-	// current for a windowed eviction to mean anything. Nil is a real value —
-	// the first apply has no predecessor — so since is what says whether the
-	// check applies.
-	live *config.Config
 }
 
-// evict runs the pool work, with mu released.
+// evict runs the pool work the transition decided on, under mu.
 func (r *Reconciler) evict(ev eviction) {
-	// A windowed eviction stands down if another apply published while this one
-	// waited for evictMu. since bounds it from BELOW only, so measured against
-	// a newer live config it would drop backends that config legitimately owns
-	// — the in-flight kill the bound exists to prevent. The apply that
-	// published evicted whatever its own diff called changed; the rest is
-	// serving what it should.
-	if !ev.since.IsZero() && r.cur.Load() != ev.live {
-		return
-	}
 	for _, name := range ev.servers {
 		if ev.since.IsZero() {
 			r.pool.EvictServer(name)
@@ -169,33 +158,10 @@ func (r *Reconciler) evict(ev eviction) {
 	}
 }
 
-// transition is the half of Apply that has to be serialized against another
-// apply: the diff, the wire update and the publish through cur, and nothing
-// that waits on a subprocess. It returns with evictMu held, for Apply to
-// release once the pool work it returned has run.
+// transition decides what one revision changes: the diff, the wire update and
+// the publish through cur. Called with mu held; the eviction it returns runs
+// under the same lock, so nothing it decided can be overtaken before it runs.
 func (r *Reconciler) transition(next *config.Config) (Delta, eviction, error) {
-	r.mu.Lock()
-	defer func() {
-		// The hand-off has to be total. evictMu is taken here and released by
-		// Apply, which cannot register its own deferred unlock until this
-		// function has RETURNED — so a panic unwinding through here would take
-		// evictMu with nothing left to release it, and every later Apply would
-		// block on it forever. Nothing in this repo recovers, so today that
-		// panic ends the process either way; the pairing is written out anyway
-		// because the day something does recover is not the day to discover
-		// this. Unwinding gives mu back and re-panics, untouched.
-		if p := recover(); p != nil {
-			r.mu.Unlock()
-			panic(p)
-		}
-		// Taken under mu and released by Apply once the pool work has run: the
-		// order two applies decide their evictions in is the order those
-		// evictions run in, while the next apply's state change goes ahead
-		// rather than waiting out this one's subprocesses.
-		r.evictMu.Lock()
-		r.mu.Unlock()
-	}()
-
 	// A nil revision is a legitimate one — "every server removed" — and the
 	// package doc advertises a fetch returning (nil, nil) as the way to write
 	// one. Substituting an empty config keeps the nil out of everything this
@@ -276,11 +242,7 @@ func (r *Reconciler) transition(next *config.Config) (Delta, eviction, error) {
 		// afterwards, and nothing collects that one. Closing it for real means
 		// stamping entries with the revision they were built from and rejecting
 		// stale inserts — the pool has no such notion today.
-		ev := eviction{
-			servers: concat(d.Changed, d.Added),
-			since:   windowStart,
-			live:    prev,
-		}
+		ev := eviction{servers: concat(d.Changed, d.Added), since: windowStart}
 		// Named separately from the caller's own failure line, which knows only
 		// that the apply returned an error: "the last good config keeps
 		// serving" is the whole truth about the wire and none of it about the
