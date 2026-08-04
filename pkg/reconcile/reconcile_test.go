@@ -697,15 +697,11 @@ func TestPanicInTransitionDoesNotStrandEvictMu(t *testing.T) {
 		_, _ = r.Apply(&config.Config{Servers: map[string]config.Server{"a": {Command: "x"}}})
 	}()
 
-	locked := make(chan struct{})
-	go func() {
-		defer close(locked)
-		r.evictMu.Lock()
-		r.evictMu.Unlock()
-	}()
-	select {
-	case <-locked:
-	case <-time.After(3 * time.Second):
-		t.Fatal("evictMu was stranded by the panic; every later Apply would block on it")
-	}
+	// TryLock answers the only question here — is the lock free — directly.
+	// A goroutine racing a timeout answers it too, at the cost of an empty
+	// critical section, which staticcheck reads as the mistake it usually is
+	// (SA2001) and which takes three seconds to report a failure. Nothing
+	// unlocks it afterwards: r is discarded with the test.
+	assert.True(t, r.evictMu.TryLock(),
+		"evictMu was stranded by the panic; every later Apply would block on it")
 }
