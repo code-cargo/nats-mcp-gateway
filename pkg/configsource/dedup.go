@@ -25,10 +25,16 @@ import (
 )
 
 // changeFilter is the content-hash change detection every built-in source
-// shares: it suppresses a revision whose content matches the last one the
-// source emitted.
+// shares: it suppresses a revision whose content matches the last one that
+// Watch emitted.
 //
-// The baseline is what the source last EMITTED, which is not the same thing as
+// One per Watch, never one per source. Watch promises its consumer that the
+// first Update is the initial config, and a baseline shared between two Watches
+// hands the second one whatever the first had already emitted — so a source
+// watched twice tells its second consumer nothing until the config next
+// changes. See filterSet, which is what a source holds instead.
+//
+// The baseline is what the Watch last EMITTED, which is not the same thing as
 // what the gateway is running — so Run tells it when an emitted revision failed
 // to apply. Without that, a single failed apply would record content the
 // gateway never adopted, and every later redelivery of that same content —
@@ -83,10 +89,61 @@ func (f *changeFilter) retry() (refire bool) {
 	return refire
 }
 
+// filterSet is what a built-in source embeds: the change filters of the Watches
+// that are live on it right now.
+//
+// The split is forced by where each half belongs. A baseline belongs to a
+// Watch, because Watch owes its consumer an initial config and a shared
+// baseline swallows the second one. Retry belongs to the SOURCE, because
+// Retryable is a method set on the source and Run holds nothing finer-grained
+// to call it on. So a retry re-arms every live Watch: one whose consumer did
+// not fail re-emits content that consumer already has, which costs it a no-op
+// apply — against a retry suppressed at the one Watch that did fail, which
+// strands a gateway on a config it never adopted.
+type filterSet struct {
+	mu      sync.Mutex
+	filters map[*changeFilter]struct{}
+}
+
+// attach returns one Watch's filter and the func that unregisters it. Call it
+// in Watch itself rather than in the goroutine, so a Retry arriving the instant
+// Watch returns cannot land before the filter exists.
+func (s *filterSet) attach() (*changeFilter, func()) {
+	f := &changeFilter{}
+	s.mu.Lock()
+	if s.filters == nil {
+		s.filters = make(map[*changeFilter]struct{})
+	}
+	s.filters[f] = struct{}{}
+	s.mu.Unlock()
+	return f, func() {
+		s.mu.Lock()
+		delete(s.filters, f)
+		s.mu.Unlock()
+	}
+}
+
+// retry drops every live Watch's baseline, reporting whether any of them had a
+// trigger suppressed in the meantime and so needs one fired in its place.
+func (s *filterSet) retry() (refire bool) {
+	s.mu.Lock()
+	live := make([]*changeFilter, 0, len(s.filters))
+	for f := range s.filters {
+		live = append(live, f)
+	}
+	s.mu.Unlock()
+	for _, f := range live {
+		if f.retry() {
+			refire = true
+		}
+	}
+	return refire
+}
+
 // Retry implements Retryable. A source whose trigger repeats on its own — a
 // ticker — recovers a suppressed trigger on the next tick and needs nothing
 // more; one that does not must override this. See File.Retry.
-func (f *changeFilter) Retry() { f.retry() }
+func (s *filterSet) Retry() { s.retry() }
 
 // Dedup wraps a Source so identical consecutive configs are suppressed by
 // content hash. Push-based sources (an event fires, re-fetch, emit) can over-
@@ -99,15 +156,17 @@ func Dedup(src Source) Source {
 
 type dedupSource struct {
 	src Source
-	changeFilter
+	filterSet
 }
 
 // Watch implements Source.
 func (d *dedupSource) Watch(ctx context.Context) <-chan Update {
 	in := d.src.Watch(ctx)
 	out := make(chan Update)
+	filter, release := d.attach()
 	go func() {
 		defer close(out)
+		defer release()
 		for {
 			select {
 			case <-ctx.Done():
@@ -116,7 +175,7 @@ func (d *dedupSource) Watch(ctx context.Context) <-chan Update {
 				if !ok {
 					return
 				}
-				if u.Err == nil && !d.changed(u.Config) {
+				if u.Err == nil && !filter.changed(u.Config) {
 					continue
 				}
 				send(ctx, out, u)
@@ -130,7 +189,7 @@ func (d *dedupSource) Watch(ctx context.Context) <-chan Update {
 // dedup on its own, and a baseline cleared on only one of the two layers still
 // swallows the retry at the other.
 func (d *dedupSource) Retry() {
-	d.changeFilter.Retry()
+	d.filterSet.Retry()
 	if r, ok := d.src.(Retryable); ok {
 		r.Retry()
 	}

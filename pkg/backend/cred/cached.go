@@ -101,12 +101,20 @@ type cacheEntry struct {
 	// the entry moved on — otherwise a slow refresh completing after a
 	// foreground re-resolve (or a 401 Invalidate) would overwrite fresher
 	// credentials with staler ones, last-writer-wins.
-	epoch    uint64
-	jitter   time.Duration
-	fails    int
-	lastErr  error
-	retryAt  time.Time
-	lastUsed time.Time // guarded by CachedResolver.mu, not entry.mu
+	epoch  uint64
+	jitter time.Duration
+	fails  int
+	// futile counts consecutive Invalidate-forced refetches that came back with
+	// the material they were meant to replace, and invalidateAt is how long the
+	// latest one buys: until it passes, Invalidate is a no-op and the cached
+	// credentials keep being served. This is the negative cache's counterpart
+	// for the rejection path — fails/retryAt throttle a source that will not
+	// answer, these throttle one that answers with the same thing.
+	futile       int
+	invalidateAt time.Time
+	lastErr      error
+	retryAt      time.Time
+	lastUsed     time.Time // guarded by CachedResolver.mu, not entry.mu
 }
 
 // Cached wraps inner. skew <= 0 uses DefaultSkew.
@@ -257,8 +265,24 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 	if material == nil {
 		material = e.gone
 	}
-	if material == nil || !maps.Equal(material.Headers, creds.Headers) || !maps.Equal(material.Env, creds.Env) {
+	moved := material == nil || !maps.Equal(material.Headers, creds.Headers) || !maps.Equal(material.Env, creds.Env)
+	if moved {
 		e.gen = int(globalGen.Add(1))
+	}
+	// Whether the refetch an Invalidate forced was worth making. The same
+	// material back means the backend that rejected these headers is about to
+	// reject them again, and that rejection arrives as the next Invalidate — so
+	// rate-limit the next one, or a backend stuck on 401 drives one IdP resolve
+	// per request with the failure backoff cleared each time. Material that
+	// MOVED lifts the limit wherever it came from: a rotation that landed
+	// through refresh-ahead ends the loop just as well as one a refetch found,
+	// and after it the next rejection is about a credential nobody has judged.
+	switch {
+	case moved:
+		e.futile, e.invalidateAt = 0, time.Time{}
+	case prev == nil && e.gone != nil:
+		e.futile++
+		e.invalidateAt = now.Add(failBackoff(e.futile))
 	}
 	e.creds, e.gone = creds, nil
 	e.epoch++
@@ -286,6 +310,12 @@ func (c *CachedResolver) store(e *cacheEntry, creds *Credentials, now time.Time)
 // backend rejects the credentials mid-life (HTTP 401). The dropped material
 // is remembered, unused, until the next resolve decides whether the
 // generation moved.
+//
+// Rate-limited by what the LAST forced refetch produced, and only by that: the
+// first rejection of any material is always acted on immediately, because a
+// genuine rotation is exactly a rejection whose refetch has something new to
+// return. It is the refetch that returns the same credential again which buys
+// a window, and inside it this is a no-op.
 func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	c.mu.Lock()
 	e := c.entries[cacheKey{tenant, user, server}]
@@ -294,9 +324,33 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 		return
 	}
 	e.mu.Lock()
-	if e.creds != nil {
-		e.gone = e.creds
+	defer e.mu.Unlock()
+	// Dropping the cache is only free while the source has something else to
+	// give. Without this, a backend rejecting every request clears the backoff
+	// on every request — the one guard between a credential source and the
+	// gateway's full request rate, since resolution happens outside the pool's
+	// circuit breaker. Serving the cached (rejected) credentials inside the
+	// window gives the caller the backend's own 401 promptly instead of an IdP
+	// round-trip and then the same 401.
+	if time.Now().Before(e.invalidateAt) {
+		return
 	}
+	// Nothing cached to drop: either a previous Invalidate dropped it and no
+	// refetch has answered, or the source has never answered at all. The
+	// promise still holds — the next resolve refetches immediately, backoff
+	// cleared — because that is how a key recovers the moment its source does.
+	// But it is bounded here rather than in store, which a FAILED refetch
+	// never reaches: without a window, a source that is down has its backoff
+	// cleared by every rejection at request rate, which is the hammering the
+	// window exists to stop.
+	if e.creds == nil {
+		e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
+		e.futile++
+		e.invalidateAt = time.Now().Add(failBackoff(e.futile))
+		e.epoch++
+		return
+	}
+	e.gone = e.creds
 	e.creds = nil
 	// The count as well as the deadline, because the next deadline is computed
 	// from the count. Clearing only retryAt admits one immediate attempt and
@@ -305,7 +359,6 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	// should have come after one second.
 	e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
 	e.epoch++ // any in-flight refresh launched before this is now stale
-	e.mu.Unlock()
 }
 
 func (c *CachedResolver) entry(tenant, user, server string) *cacheEntry {

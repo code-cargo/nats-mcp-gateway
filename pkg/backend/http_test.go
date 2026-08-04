@@ -676,19 +676,147 @@ func TestCloseEndsInFlightExchanges(t *testing.T) {
 
 	require.NoError(t, conn.Close())
 
-	// Close returned, so nothing is still holding a socket on this conn's
-	// behalf — the WaitGroup it maintains is finally waited on somewhere.
+	// Both exchanges end, rather than sitting in a round trip nothing bounds.
+	// This says nothing about WHEN Close returned relative to them — cancelling
+	// alone satisfies it, because a cancelled round trip returns on its own.
+	// TestCloseWaitsForInflightExchange is what pins the drain.
 	drained := make(chan struct{})
 	go func() { c.inflight.Wait(); close(drained) }()
 	select {
 	case <-drained:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Close returned while its exchanges were still running")
+		t.Fatal("the cancelled exchanges never finished")
 	}
 
 	assert.Eventually(t, func() bool { return abandoned.Load() == 2 }, 10*time.Second, 10*time.Millisecond,
 		"closing the conn must reach the backend as a disconnect, not leave the requests parked on it")
 }
+
+func TestCloseWaitsForInflightExchange(t *testing.T) {
+	// Close is what the pool calls to reclaim a backend, so "closed" has to
+	// mean the exchanges are off the wire and not merely cancelled: an exchange
+	// still inside io.ReadAll holds its socket until that read returns.
+	//
+	// The response body below stalls, and ignores cancellation while it does.
+	// That is the whole point: connCtx cancellation is not the same event as
+	// the exchange finishing, and a body that ends the moment it is cancelled
+	// cannot tell a Close that drains from one that only cancels and returns.
+	body := newStalledBody(`{"jsonrpc":"2.0","id":"1","result":{"resultType":"complete","tools":[]}}`)
+	t.Cleanup(body.release)
+
+	// Never dialed: the transport answers every request itself.
+	b := &HTTPBackend{
+		URL:    "http://stalled.invalid",
+		Client: &http.Client{Transport: &stalledTransport{body: body}},
+	}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, conn.Write(ctx, jsonrpc.NewRequest("1", mcpspec.MethodToolsList, json.RawMessage(`{}`))))
+	select {
+	case <-body.reading:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the exchange never reached the response body")
+	}
+
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() {
+		defer close(closed)
+		assert.NoError(t, conn.Close())
+	}()
+
+	// Well inside terminateGrace, so a Close that blocks correctly is still
+	// blocked here and only a Close that skipped the drain has returned.
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an exchange was still in flight")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	body.release()
+	select {
+	case <-closed:
+		// Drained or timed out are the two ways to arrive here, and they are
+		// told apart by the clock rather than by a bound on the wait: the
+		// exchange finishes in microseconds once the body is released, while
+		// the timeout path cannot return before terminateGrace is up. Waiting
+		// generously and then asserting on elapsed keeps a loaded runner from
+		// reading as the failure it is supposed to detect.
+		assert.Less(t, time.Since(start), terminateGrace,
+			"Close returned no sooner than the grace deadline, so it timed out rather than drained")
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close did not return once its exchange finished")
+	}
+}
+
+func TestAwaitInflightGivesUpAtGrace(t *testing.T) {
+	// The other half of the contract: a backend that never lets go must cost
+	// the pool a bounded wait, not a permanent one. terminateGrace is a package
+	// constant, so Close's own bound cannot be shortened for a test without a
+	// multi-second sleep — but the bound is a parameter here, which is the
+	// level the behavior actually lives at.
+	b := &HTTPBackend{URL: "http://unused.invalid"}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+
+	c.inflight.Add(1)
+	assert.False(t, c.awaitInflight(50*time.Millisecond),
+		"a wedged exchange must be abandoned when the grace expires")
+
+	c.inflight.Done()
+	assert.True(t, c.awaitInflight(10*time.Second),
+		"a drained conn must not be reported as still in flight")
+}
+
+// stalledTransport answers every request with a stalled body, so an exchange
+// can be held past teardown without a server that has to be torn down too.
+type stalledTransport struct{ body *stalledBody }
+
+func (t *stalledTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		_ = req.Body.Close()
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       t.body,
+		Request:    req,
+	}, nil
+}
+
+// stalledBody blocks in Read until released, then yields its payload. Reads
+// are what the exchange goroutine is doing when Close arrives, and this one
+// does not end on cancellation — see TestCloseWaitsForInflightExchange.
+type stalledBody struct {
+	reading   chan struct{}
+	released  chan struct{}
+	readOnce  sync.Once
+	closeOnce sync.Once
+	rest      io.Reader
+}
+
+func newStalledBody(payload string) *stalledBody {
+	return &stalledBody{
+		reading:  make(chan struct{}),
+		released: make(chan struct{}),
+		rest:     strings.NewReader(payload),
+	}
+}
+
+// release is idempotent so a failing test's cleanup cannot double-close it.
+func (b *stalledBody) release() { b.closeOnce.Do(func() { close(b.released) }) }
+
+func (b *stalledBody) Read(p []byte) (int, error) {
+	b.readOnce.Do(func() { close(b.reading) })
+	<-b.released
+	return b.rest.Read(p)
+}
+
+func (b *stalledBody) Close() error { return nil }
 
 func TestCallerCancellationEndsItsExchange(t *testing.T) {
 	// The other end of the same leak: the conn stays open and healthy, so
@@ -935,55 +1063,156 @@ func TestScrubURLsKeepsErrorsDiagnosable(t *testing.T) {
 	}
 }
 
-// TestNonTerminatingListingRecordsTruncation bounds what a backend can make
-// the gateway do by never ending its cursor.
-//
-// Concluding "no annotations" from a truncated read would be wrong — the pages
-// never seen may carry some — so the probe correctly declines to record that.
-// But leaving it at that means every -32020 starts another full sweep, and the
-// backend decides when the cursor ends, so the sweep never gets cheaper.
-// Recording the truncation separately is what lets the recovery give up on a
-// retry that cannot succeed without claiming knowledge it does not have.
-func TestNonTerminatingListingRecordsTruncation(t *testing.T) {
-	var listPages atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+// endlessCursorServer answers tools/list with a page that always names a next
+// cursor while endless is set, and rejects every tools/call whose
+// Mcp-Param-Region disagrees with its body — the two halves that together make
+// each rejection provoke a full paginated sweep. Clearing endless switches it
+// to a single terminating page carrying the annotation the calls need.
+func endlessCursorServer(listPages, callAttempts *atomic.Int32, endless *atomic.Bool) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		msg := &jsonrpc.Message{}
 		_ = json.NewDecoder(r.Body).Decode(msg)
-		listPages.Add(1)
 		w.Header().Set("Content-Type", "application/json")
+		if msg.Method == mcpspec.MethodToolsList {
+			listPages.Add(1)
+			page := `{"tools":[],"nextCursor":"more"}`
+			if !endless.Load() {
+				page = `{"resultType":"complete","tools":[{"name":"t","inputSchema":
+					{"type":"object","properties":{
+						"region":{"type":"string","x-mcp-header":"Region"}}}}]}`
+			}
+			resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID, json.RawMessage(page)))
+			_, _ = w.Write(resp)
+			return
+		}
+		callAttempts.Add(1)
+		var p struct {
+			Arguments map[string]any `json:"arguments"`
+		}
+		_ = json.Unmarshal(msg.Params, &p)
+		region, _ := p.Arguments["region"].(string)
+		if r.Header.Get("Mcp-Param-Region") != region {
+			w.WriteHeader(http.StatusBadRequest)
+			resp, _ := jsonrpc.Encode(jsonrpc.NewErrorResponse(
+				msg.ID, mcpspec.ErrHeaderMismatch, "missing Mcp-Param-Region", nil,
+			))
+			_, _ = w.Write(resp)
+			return
+		}
 		resp, _ := jsonrpc.Encode(jsonrpc.NewResponse(msg.ID,
-			json.RawMessage(`{"tools":[],"nextCursor":"more"}`)))
+			json.RawMessage(`{"resultType":"complete","content":[]}`)))
 		_, _ = w.Write(resp)
 	}))
+}
+
+// regionCallParams is a tools/call the endless-cursor server always rejects
+// until the gateway has learned to mirror `region` into a header.
+func regionCallParams(t *testing.T) json.RawMessage {
+	t.Helper()
+	params, err := json.Marshal(map[string]any{
+		"name": "t", "arguments": map[string]any{"region": "us-west1"},
+	})
+	require.NoError(t, err)
+	return params
+}
+
+// TestTruncatedListingDampsReProbing bounds what a backend can make the
+// gateway do by never ending its cursor.
+//
+// Every rejected call is entitled to ask whether the schema explains the
+// rejection, and answering costs a full paginated sweep of the toolset. A
+// backend whose cursor never terminates makes that sweep cost the page cap
+// every time, so without damping the gateway spends annotationProbeMaxPages
+// round trips per rejected call, forever, learning the same nothing.
+func TestTruncatedListingDampsReProbing(t *testing.T) {
+	var listPages, callAttempts atomic.Int32
+	var endless atomic.Bool
+	endless.Store(true)
+	srv := endlessCursorServer(&listPages, &callAttempts, &endless)
 	t.Cleanup(srv.Close)
 
 	b := &HTTPBackend{URL: srv.URL}
 	conn, err := b.Connect(context.Background())
 	require.NoError(t, err)
 	c := conn.(*httpConn)
-	t.Cleanup(func() { _ = c.Close() })
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
 
-	require.NoError(t, c.refreshAnnotations(context.Background(), 0))
+	const calls = 4
+	params := regionCallParams(t)
+	for i := range calls {
+		resp, err := m.Call(context.Background(),
+			jsonrpc.NewRequest(strconv.Itoa(i+1), mcpspec.MethodToolsCall, params), nil)
+		require.NoError(t, err)
+		require.NotNil(t, resp.Error, "the backend rejects every call while its listing is unreadable")
+		require.Equal(t, mcpspec.ErrHeaderMismatch, resp.Error.Code)
+	}
+
+	assert.Equal(t, int32(calls), callAttempts.Load(),
+		"nothing was learned, so no call may be reissued")
+	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
+		"one sweep covers all %d rejections; a sweep apiece costs %d pages",
+		calls, calls*annotationProbeMaxPages)
 
 	c.mu.Lock()
-	known, truncated := c.annotationsKnown, c.annotationsTruncated
+	known := c.annotationsKnown
 	c.mu.Unlock()
-
 	assert.False(t, known,
 		"a listing that never ended is not evidence that the server publishes no annotations")
-	assert.True(t, truncated,
-		"the cap was hit with pages unread, and the recovery has to know that")
-	assert.Equal(t, int32(annotationProbeMaxPages), listPages.Load(),
-		"the probe reads exactly the cap and stops")
+}
 
-	// The second probe is what the guard exists to prevent: it would read the
-	// same pages and stop in the same place.
-	before := listPages.Load()
+// TestTruncationDoesNotPermanentlyDisableRecovery is the other half: the
+// damping above must not become a latch.
+//
+// The listing belongs to the backend, and one that overran the page cap during
+// a deploy or a bad rollout can come back under it a minute later. A conn that
+// recorded the truncation once and refused ever to probe again would answer
+// -32020 to every tools/call for the rest of its life — with the fix sitting
+// one readable listing away.
+func TestTruncationDoesNotPermanentlyDisableRecovery(t *testing.T) {
+	var listPages, callAttempts atomic.Int32
+	var endless atomic.Bool
+	endless.Store(true)
+	srv := endlessCursorServer(&listPages, &callAttempts, &endless)
+	t.Cleanup(srv.Close)
+
+	b := &HTTPBackend{URL: srv.URL}
+	conn, err := b.Connect(context.Background())
+	require.NoError(t, err)
+	c := conn.(*httpConn)
+	m := NewMux(conn, nil)
+	t.Cleanup(func() { _ = m.Close() })
+
+	params := regionCallParams(t)
+	resp, err := m.Call(context.Background(),
+		jsonrpc.NewRequest("1", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.NotNil(t, resp.Error, "the probe could not reach the tool, so the call legitimately fails")
+	require.Equal(t, int32(annotationProbeMaxPages), listPages.Load())
+
+	// The backend's listing comes back under the cap, and the cooldown the
+	// truncation started runs out. Rewound rather than waited out: what is
+	// under test is that the window ends, not how long it is.
+	endless.Store(false)
 	c.mu.Lock()
-	skip := c.annotationsKnown || c.annotationsTruncated
+	c.annotationsTruncatedAt = time.Now().Add(-annotationTruncationCooldown - time.Second)
 	c.mu.Unlock()
-	assert.True(t, skip, "the recovery must decline a re-probe that cannot learn anything")
-	assert.Equal(t, before, listPages.Load())
+
+	resp, err = m.Call(context.Background(),
+		jsonrpc.NewRequest("2", mcpspec.MethodToolsCall, params), nil)
+	require.NoError(t, err)
+	require.Nil(t, resp.Error,
+		"the recovery must run again once the listing the truncation described is gone")
+	assert.Equal(t, int32(annotationProbeMaxPages+1), listPages.Load(),
+		"the second probe reads the one page the recovered listing has")
+
+	// And the recovered state is the ordinary one: the truncation is retired,
+	// not merely expired, so the next rejection is judged on what is known.
+	c.mu.Lock()
+	known, truncatedAt := c.annotationsKnown, c.annotationsTruncatedAt
+	c.mu.Unlock()
+	assert.True(t, known, "a listing read to its end settles the toolset")
+	assert.True(t, truncatedAt.IsZero(), "a terminating listing retires the truncation")
 }
 
 // TestRedirectCannotCarryTheCredentialAway covers the four things Go's default

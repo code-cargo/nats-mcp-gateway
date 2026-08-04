@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -692,7 +693,7 @@ func TestRetryDeliversARevisionThatHashesLikeNothing(t *testing.T) {
 	require.True(t, f.changed(nil), "the first revision is always a change")
 	require.False(t, f.changed(nil), "an unchanged revision is suppressed")
 
-	f.Retry()
+	f.retry()
 	assert.True(t, f.changed(nil),
 		"a retry must re-deliver the revision whose apply failed, whatever it hashes to")
 }
@@ -719,21 +720,188 @@ func TestRetryReportsATriggerSpentWhileTheApplyFailed(t *testing.T) {
 // during a failing apply is simply gone. Retry has to fire one in its place.
 func TestFileRetryRefiresASpentTrigger(t *testing.T) {
 	f := NewFile(filepath.Join(t.TempDir(), "gw.json"), 0)
+	// The baseline belongs to a Watch, so stand in for one rather than reaching
+	// through the source.
+	filter, release := f.attach()
+	defer release()
+	reload, unwatch := f.addWatcher()
+	defer unwatch()
 
-	require.True(t, f.changed(cfgWith("a")), "the revision Run is applying")
-	require.False(t, f.changed(cfgWith("a")), "a HUP lands mid-apply and is swallowed")
+	require.True(t, filter.changed(cfgWith("a")), "the revision Run is applying")
+	require.False(t, filter.changed(cfgWith("a")), "a HUP lands mid-apply and is swallowed")
 
 	f.Retry()
 	// require, not assert: the drain below would block forever otherwise, and a
 	// regression should fail the test, not hang the package.
-	require.Len(t, f.reload, 1, "Retry must replace the trigger the suppressed emit spent")
+	require.Len(t, reload, 1, "Retry must replace the trigger the suppressed emit spent")
 
 	// It must not manufacture one, either — that is what keeps a config that
 	// fails every time from spinning: the re-fired reload emits (the baseline
 	// is clear), which is not a suppression, so the next failure re-arms
 	// nothing.
-	<-f.reload
-	require.True(t, f.changed(cfgWith("a")))
+	<-reload
+	require.True(t, filter.changed(cfgWith("a")))
 	f.Retry()
-	assert.Empty(t, f.reload, "Retry must not invent a trigger when none was lost")
+	assert.Empty(t, reload, "Retry must not invent a trigger when none was lost")
+}
+
+// Watch owes EVERY consumer an initial config — "the first Update is the
+// initial config" is the whole contract an embedder writes a Source against.
+// A change-detection baseline shared across Watches breaks it: the second Watch
+// finds its content already recorded as emitted and says nothing until the
+// config next changes, which for a settled deployment is never. cmd calls Watch
+// once per process, so this is felt only by the embedders the package doc
+// invites.
+func TestSecondWatchGetsItsOwnInitialConfig(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "gw.json")
+	require.NoError(t, os.WriteFile(path,
+		[]byte(`{"servers":{"a":{"transport":"stdio","command":"cmd-a"}}}`), 0o600))
+
+	sources := map[string]Source{
+		"file": NewFile(path, 0),
+		"poll": Poll(time.Hour, func(context.Context) (*config.Config, error) { return cfgWith("a"), nil }),
+		// An over-emitting push source, which is what Dedup is for: the same
+		// revision arrives on both Watches, and only the filter decides.
+		"dedup": Dedup(SourceFunc(func(ctx context.Context) <-chan Update {
+			out := make(chan Update)
+			go func() {
+				defer close(out)
+				for {
+					select {
+					case out <- Update{Config: cfgWith("a")}:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			return out
+		})),
+	}
+
+	for name, src := range sources {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+
+			initial := func(ch <-chan Update, which string) {
+				t.Helper()
+				select {
+				case u := <-ch:
+					require.NoError(t, u.Err)
+					assert.Equal(t, []string{"a"}, names(u.Config), which)
+				case <-time.After(5 * time.Second):
+					t.Fatalf("%s never received an initial config", which)
+				}
+			}
+			initial(src.Watch(ctx), "the first Watch")
+			initial(src.Watch(ctx), "a second Watch")
+		})
+	}
+}
+
+// errCapture records the error lines an operator would actually see.
+type errCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (c *errCapture) Enabled(context.Context, slog.Level) bool { return true }
+
+func (c *errCapture) WithAttrs([]slog.Attr) slog.Handler { return c }
+
+func (c *errCapture) WithGroup(string) slog.Handler { return c }
+
+func (c *errCapture) Handle(_ context.Context, r slog.Record) error {
+	if r.Level < slog.LevelError {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lines = append(c.lines, r.Message)
+	return nil
+}
+
+func (c *errCapture) got() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.lines...)
+}
+
+// A revision that keeps failing repeats this line on every trigger, so what it
+// says is what an operator concludes. "Keeping last good config" is the whole
+// truth about the wire and none of it about the backend pools, which the apply
+// may well have touched on its way to failing — and Run cannot know, because
+// apply is a func. So it says where the answer is instead of implying there is
+// nothing to answer.
+func TestRunFailedApplyLineDoesNotImplyTheBackendsWereUntouched(t *testing.T) {
+	logs := &errCapture{}
+	rec := newApplyRecorder()
+	rec.reject.Store(true)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	_ = Run(ctx, slog.New(logs), SourceFunc(func(ctx context.Context) <-chan Update {
+		out := make(chan Update)
+		go func() {
+			defer close(out)
+			for _, c := range []*config.Config{cfgWith("a"), cfgWith("a", "b")} {
+				select {
+				case out <- Update{Config: c}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			<-ctx.Done()
+		}()
+		return out
+	}), func(c *config.Config) error {
+		if len(c.Servers) == 1 {
+			return nil // serving, so the next failure is not fatal
+		}
+		return rec.apply(c)
+	})
+
+	got := logs.got()
+	require.Len(t, got, 1)
+	assert.Contains(t, got[0], "backend pools",
+		"the line has to point at what the apply did to the pools, not just the wire")
+}
+
+// Reload has to reach every live Watch. One shared trigger channel delivers a
+// SIGHUP to whichever goroutine happens to receive it, so a second Watch never
+// re-reads the file — the same contract the per-Watch baseline exists to keep,
+// broken one layer down.
+func TestFileReloadReachesEveryWatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gw.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"servers":{"a":{"transport":"stdio","command":"cmd-a"}}}`), 0o600))
+	f := NewFile(path, 0) // HUP-only: the mode where a lost trigger is lost for good
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, second := f.Watch(ctx), f.Watch(ctx)
+
+	for i, ch := range []<-chan Update{first, second} {
+		select {
+		case u := <-ch:
+			require.NoError(t, u.Err)
+			require.NotNil(t, u.Config, "watch %d got no initial config", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("watch %d never received its initial config", i)
+		}
+	}
+
+	require.NoError(t, os.WriteFile(path, []byte(`{"servers":{"b":{"transport":"stdio","command":"cmd-b"}}}`), 0o600))
+	f.Reload()
+
+	for i, ch := range []<-chan Update{first, second} {
+		select {
+		case u := <-ch:
+			require.NoError(t, u.Err)
+			_, ok := u.Config.Servers["b"]
+			assert.True(t, ok, "watch %d got the wrong revision", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("watch %d never saw the reload: one shared trigger reaches one watcher", i)
+		}
+	}
 }

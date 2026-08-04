@@ -107,9 +107,31 @@ func IsTerminal(err error) bool {
 	return errors.As(err, &t)
 }
 
-// FailureRef mints the correlation token for one resolve failure: the caller
-// is told the ref, the gateway logs the ref beside the real error, and the
-// two are joined by an operator holding a user's screenshot.
+// Unavailable marks a resolve failure whose Message has ALREADY been rendered
+// for the caller — by CallerMessage, which is the only thing that should build
+// one. The pool's factory sits below the layer that owns wire error codes, so
+// without a marker everything it returns reaches the caller as "the stream
+// broke, re-issue", and a client switching on that code retries forever
+// against a refusal that never clears.
+//
+// It lives here rather than in the layer that reads it because this package
+// already owns the vocabulary — ErrIdentityRequired, IsTerminal,
+// CallerMessage, FailureRef — and because a factory is written by whoever
+// embeds the pool: making them import the proxy to say "these credentials are
+// unavailable" points the dependency the wrong way.
+type Unavailable struct{ Message string }
+
+func (e *Unavailable) Error() string { return e.Message }
+
+// FailureRef mints the correlation token for one caller-facing refusal: the
+// caller is told the ref, the gateway logs the ref beside the real error, and
+// the two are joined by an operator holding a user's screenshot.
+//
+// It lives here because credential resolution is where withholding the detail
+// started, but nothing about it is credential-specific and pkg/proxy uses it
+// for the pool and backend failures that withhold their detail for the same
+// reason. One generator on purpose: an operator matching a ref from a
+// screenshot should not have to know which subsystem minted it.
 func FailureRef() string {
 	return strconv.FormatUint(rand.Uint64(), 36)
 }

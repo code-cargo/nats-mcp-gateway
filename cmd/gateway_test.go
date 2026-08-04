@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1507,6 +1508,235 @@ func TestBuildBackendRefusesAPerUserServerKeyedWithoutAUser(t *testing.T) {
 		"the resolver must not be asked for the placeholder identity at all")
 }
 
+// TestCredentialEnvCannotRedirectCodeExecution holds a credential resolver to
+// supplying credentials rather than code.
+//
+// The reply's env becomes the backend subprocess's whole environment, merged
+// last so it wins, so a loader or runtime startup variable in it is code
+// execution in the gateway pod at the gateway's uid. That promotes a
+// compromised cred controller (mode "nats") or whatever writes a mounted
+// credentials file (mode "file") from "supplies credentials" to "runs code
+// here" — and neither of those is the party that authored the config.
+func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
+	const secret = "tok-do-not-log"
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	resolver := cred.Cached(cred.ResolveFunc(
+		func(context.Context, string, string, string) (*cred.Credentials, error) {
+			return &cred.Credentials{Env: map[string]string{
+				"GITHUB_TOKEN":          secret,
+				"LD_PRELOAD":            "/tmp/evil.so",
+				"DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+				"PATH":                  "/tmp/evil/bin",
+				"HOME":                  "/tmp/evil",
+				"NODE_OPTIONS":          "--require /tmp/evil.js",
+				"PYTHONPATH":            "/tmp/evil",
+				"BASH_ENV":              "/tmp/evil.sh",
+				"PERL5OPT":              "-Mevil",
+				"BASH_FUNC_ls%%":        "() { evil; }",
+				"LOCPATH":               "/tmp/evil",
+				"NLSPATH":               "/tmp/evil/%N",
+				"GLIBC_TUNABLES":        "glibc.malloc.check=1",
+				// npx is the README's own stdio shape, and npm takes its whole
+				// config from the environment — folding case on the prefix, so
+				// no list of spellings would have covered it.
+				"npm_config_script_shell": "/tmp/evil.sh",
+				"NPM_CONFIG_NODE_OPTIONS": "--require /tmp/evil.js",
+				"NpM_cOnFiG_script_shell": "/tmp/evil.sh",
+				"NOT=A KEY":               "x",
+			}}, nil
+		}), 0)
+	_, gen, err := resolver.ResolveGen(context.Background(), "acme", "u1", "github")
+	require.NoError(t, err)
+
+	// A modern server, so the backend is the StdioBackend itself rather than
+	// the legacy bridge wrapping it, and its env can be read directly.
+	srv := config.Server{
+		Protocol: mcpspec.ProtocolVersion, Command: "true",
+		// The config's own env is NOT filtered: a document that names the
+		// command already chooses what runs, and an operator tuning their own
+		// server's runtime must keep working.
+		Env:  map[string]string{"NODE_OPTIONS": "--max-old-space-size=4096", "AWS_REGION": "us-east-1"},
+		Auth: &config.Auth{Mode: config.AuthNATS},
+	}
+	b, err := buildBackend(
+		backend.Key{Server: "github", Tenant: "acme", CredSet: "u1", CredVersion: gen},
+		srv, resolver, log,
+	)
+	require.NoError(t, err)
+	sb, ok := b.(*backend.StdioBackend)
+	require.True(t, ok, "expected the stdio backend itself, got %T", b)
+
+	assert.Equal(t, secret, sb.Env["GITHUB_TOKEN"], "a credential must still reach the backend")
+	assert.Equal(t, "us-east-1", sb.Env["AWS_REGION"])
+	assert.Equal(t, "--max-old-space-size=4096", sb.Env["NODE_OPTIONS"],
+		"the resolver must not override what the config asked for, but the config's own value stands")
+	for _, key := range []string{
+		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME",
+		"PYTHONPATH", "BASH_ENV", "PERL5OPT", "BASH_FUNC_ls%%", "NOT=A KEY",
+		"npm_config_script_shell", "NPM_CONFIG_NODE_OPTIONS", "NpM_cOnFiG_script_shell",
+		"LOCPATH", "NLSPATH", "GLIBC_TUNABLES",
+	} {
+		assert.NotContains(t, sb.Env, key, "a resolver set %s on the backend subprocess", key)
+	}
+
+	out := buf.String()
+	assert.Contains(t, out, "LD_PRELOAD", "a refused key has to be named, or nobody can find the resolver that sent it")
+	assert.Contains(t, out, "NODE_OPTIONS")
+	assert.NotContains(t, out, secret, "the reply's values are credential material")
+	assert.NotContains(t, out, "/tmp/evil.so", "a refused value is as secret as an accepted one")
+}
+
+// TestBuildBackendRefusesThePlaceholderIdentity is the same refusal reached
+// through the other spelling of "no identity".
+//
+// The proxy leaves CredSet empty for a shared server, so the empty string is
+// what arrives today — but "_" is what the rest of the gateway calls an
+// unattributed caller, and a credential-identity boundary should not depend on
+// which of the two a caller happened to construct.
+func TestBuildBackendRefusesThePlaceholderIdentity(t *testing.T) {
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "helper-ran")
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\ntouch \"$MARKER\"\necho '{\"headers\":{\"a\":\"b\"}}'\n"), 0o755))
+
+	resolver := cred.Cached(&cred.Exec{
+		Command: helper, Env: map[string]string{"MARKER": marker}, Timeout: 10 * time.Second,
+	}, 0)
+	srv := config.Server{
+		Transport: "stdio", Command: "true",
+		Auth: &config.Auth{Mode: config.AuthExec, Command: helper},
+	}
+	require.True(t, srv.Auth.PerUser(), "fixture must be a per-user server")
+
+	_, err := buildBackend(
+		backend.Key{Server: "aws", Tenant: "acme", CredSet: wire.UserUnattributed},
+		srv, resolver, testLogger(),
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, cred.ErrIdentityRequired)
+	_, statErr := os.Stat(marker)
+	assert.True(t, os.IsNotExist(statErr),
+		"the resolver must not be asked for the placeholder identity at all")
+}
+
+// TestBuildBackendCredentialFailureCarriesTheCredentialCode holds the
+// factory's resolve failure to the same wire code as the request path's.
+//
+// A bare error from here is the pool's error, which the proxy reports as
+// -32010 — "the stream broke, re-issue" (pkg/wire/frame.go) — so
+// CallerMessage's "do not retry" ended up inside the one code that promises
+// retrying helps, and a client switching on the code retry-loops a permanent
+// refusal. Reachable whenever the proxy's resolve hits the cache and this one
+// misses it: a TTL boundary, or a concurrent 401 Invalidate.
+func TestBuildBackendCredentialFailureCarriesTheCredentialCode(t *testing.T) {
+	const secret = "sts assume-role arn:aws:iam::918273:role/prod failed (token AKIAWOULDBEBAD)"
+	dir := t.TempDir()
+	helper := filepath.Join(dir, "helper.sh")
+	require.NoError(t, os.WriteFile(helper,
+		[]byte("#!/bin/sh\necho '"+secret+"' >&2\nexit 1\n"), 0o755))
+
+	shared := false
+	srv := config.Server{
+		Transport: "stdio", Command: "true",
+		Auth: &config.Auth{Mode: config.AuthExec, Command: helper, PerUserOverride: &shared},
+	}
+	resolver := cred.Cached(&cred.Exec{Command: helper, Timeout: 10 * time.Second}, 0)
+
+	_, err := buildBackend(backend.Key{Server: "github", Tenant: "acme"}, srv, resolver, testLogger())
+	require.Error(t, err)
+
+	var credErr *cred.Unavailable
+	require.ErrorAs(t, err, &credErr,
+		"the proxy maps this to -32014 by the type, not by reading the message")
+	assert.Contains(t, err.Error(), "acme/github")
+	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
+	assert.NotContains(t, err.Error(), "AKIAWOULDBEBAD", "the helper's stderr reached the caller")
+}
+
+// TestWarnPerUserGrainNamesTheServersOnce covers the boot diagnostic for the
+// grain that fails closed.
+//
+// A per-user server refuses every unattributed caller with -32014, and a
+// deployment without per-user NATS auth sends the documented "_" on every
+// request — so the whole server set can be unreachable with a valid config, a
+// clean boot log and no clue which servers are involved. It repeats only when
+// the set changes: the fetch source re-applies on every poll tick, and a
+// warning that re-fires forever is one operators filter out.
+func TestWarnPerUserGrainNamesTheServersOnce(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	parse := func(doc string) *config.Config {
+		t.Helper()
+		cfg, err := config.Parse([]byte(doc))
+		require.NoError(t, err)
+		return cfg
+	}
+
+	cfg := parse(`{"servers":{
+		"helper":{"command":"x","auth":{"mode":"exec","command":"/h"}},
+		"tenantwide":{"command":"x","auth":{"mode":"exec","command":"/h","perUser":false}},
+		"plain":{"command":"x"}}}`)
+
+	reported := warnPerUserGrain(log, cfg, "")
+	out := buf.String()
+	assert.Contains(t, out, "helper", "the operator has to learn WHICH servers refuse an unattributed caller")
+	assert.NotContains(t, out, "tenantwide", "an opted-out server serves every caller in the tenant")
+	assert.NotContains(t, out, "plain")
+	assert.Contains(t, out, "-32014", "the line has to be findable from the error a user reports")
+
+	buf.Reset()
+	assert.Equal(t, reported, warnPerUserGrain(log, cfg, reported))
+	assert.Empty(t, buf.String(), "an unchanged set must not re-warn on every poll tick")
+
+	// A reload that adds one warns again, naming the new set.
+	buf.Reset()
+	next := parse(`{"servers":{
+		"helper":{"command":"x","auth":{"mode":"exec","command":"/h"}},
+		"tokens":{"command":"x","auth":{"mode":"oauth-token-exchange","tokenUrl":"https://idp/t","subjectTokenFile":"/t/{user}"}}}}`)
+	warnPerUserGrain(log, next, reported)
+	assert.Contains(t, buf.String(), "tokens")
+
+	// Nothing to say when no server asks for it.
+	buf.Reset()
+	assert.Empty(t, warnPerUserGrain(log, parse(`{"servers":{"plain":{"command":"x"}}}`), ""))
+	assert.Empty(t, buf.String())
+}
+
+// TestBootParamsRejectsNegativeDurationFlags mirrors config.validate()'s
+// rejection onto the flag path.
+//
+// These flags are the fetch source's ONLY route to pool and claim sizing — its
+// document arrives after the pool is built — and every consumer substitutes
+// its own default for anything <= 0. So "-30m" is not a shorter TTL: it is the
+// default, silently, with nothing logged for the operator who asked for
+// something else.
+func TestBootParamsRejectsNegativeDurationFlags(t *testing.T) {
+	for _, tt := range []struct {
+		flag string
+		cmd  GatewayCmd
+	}{
+		{"--pool-idle-ttl", GatewayCmd{ConfigSubject: "cfg", PoolIdleTTL: -30 * time.Minute}},
+		{"--pool-max-lifetime", GatewayCmd{ConfigSubject: "cfg", PoolMaxLifetime: -time.Hour}},
+		{"--claim-max-age", GatewayCmd{ConfigSubject: "cfg", ClaimMaxAge: -time.Second}},
+		{"--claim-max-bytes", GatewayCmd{ConfigSubject: "cfg", ClaimMaxBytes: -1}},
+	} {
+		t.Run(tt.flag, func(t *testing.T) {
+			_, err := tt.cmd.bootParams(sourceFetch)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.flag)
+			assert.Contains(t, err.Error(), "negative")
+		})
+	}
+
+	// Zero stays legal on every one of them: it is the "use the default"
+	// sentinel each flag's help text advertises.
+	_, err := (&GatewayCmd{ConfigSubject: "cfg"}).bootParams(sourceFetch)
+	require.NoError(t, err)
+}
+
 // TestTokenSourceDoesNotEchoTheResolverDetail covers the third resolve site,
 // and the only one on the request path.
 //
@@ -1538,4 +1768,166 @@ func TestTokenSourceDoesNotEchoTheResolverDetail(t *testing.T) {
 	assert.NotContains(t, err.Error(), "/var/run/secrets", "a pod path reached the caller")
 	assert.NotContains(t, err.Error(), "arn:aws:iam", "an internal identity reached the caller")
 	assert.Contains(t, err.Error(), "gateway ref ", "the operator needs a handle to correlate")
+}
+
+// The shim's own credentials variable must not refuse the gateway's boot. The
+// README runs both on one host, and #17 made each subcommand accept the other's
+// name so a value on the "wrong" one stops being silently ignored — which
+// handed the file-source guard a variable it then read as a conflicting
+// fetch-only flag. Every deployment matching the documented layout failed to
+// boot on upgrade, and the error named NATSMCP_NATS_CREDS, which the operator
+// had never set.
+func TestSharedEnvVarsDoNotRefuseTheFileSourceBoot(t *testing.T) {
+	clearNATSMCPEnv(t)
+	path := writeConfig(t, `{"servers":{}}`)
+
+	parse := func(t *testing.T) *GatewayCmd {
+		t.Helper()
+		var cli CLI
+		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, err)
+		_, err = parser.Parse([]string{"gateway", "--config", path})
+		require.NoError(t, err)
+		return &cli.Gateway
+	}
+
+	for _, tc := range []struct {
+		name, env, value, mentions string
+	}{
+		{"shim credentials", "NATSMCP_CREDS", "/creds/client.creds", "nats.credsFile"},
+		{"gateway credentials", "NATSMCP_NATS_CREDS", "/creds/gw.creds", "nats.credsFile"},
+		{"inbox prefix", "NATSMCP_INBOX_PREFIX", "_INBOX_acme", "nats.inboxPrefix"},
+		{"nats url", "NATSMCP_NATS_URL", "nats://prod:4222", "nats.url"},
+		{"subject prefix", "NATSMCP_SUBJECT_PREFIX", "mcp.v2", "nats.subjectPrefix"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(tc.env, tc.value)
+			boot, err := parse(t).bootParams(sourceFile)
+			require.NoError(t, err, "a variable shared with the shim must not refuse the boot")
+			require.Len(t, boot.ignoredFlags, 1, "dropping it silently is what left an unfenced inbox unexplained")
+			assert.Contains(t, boot.ignoredFlags[0], tc.env, "the warning must name the variable actually exported")
+			assert.Contains(t, boot.ignoredFlags[0], tc.mentions)
+		})
+	}
+
+	// A NATS URL carries its credential inline, and this text reaches the log
+	// on the ignored path and an operator's terminal on the fatal one. The
+	// message that reports a dropped setting must not be the thing that
+	// publishes it.
+	t.Run("neither path prints the credential", func(t *testing.T) {
+		t.Setenv("NATSMCP_NATS_URL", "nats://gw:s3cr3t@prod:4222")
+		boot, err := parse(t).bootParams(sourceFile)
+		require.NoError(t, err)
+		require.Len(t, boot.ignoredFlags, 1)
+		assert.NotContains(t, boot.ignoredFlags[0], "s3cr3t")
+		assert.Contains(t, boot.ignoredFlags[0], "prod:4222", "the host is the whole point of the line")
+
+		var cli CLI
+		parser, perr := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, perr)
+		// A value the env did not supply, so this takes the fatal path rather
+		// than the ignored one.
+		_, perr = parser.Parse([]string{"gateway", "--config", path, "--nats-url", "nats://gw:fl4gs3cret@other:4222"})
+		require.NoError(t, perr)
+		_, err = cli.Gateway.bootParams(sourceFile)
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), "fl4gs3cret")
+		assert.Contains(t, err.Error(), "other:4222")
+	})
+
+	// A creds path is not a URL. Redacting by shape rewrote one containing an
+	// "@" into a path nobody configured, in the message whose whole purpose is
+	// to name the value in force.
+	t.Run("a credentials path is reported intact", func(t *testing.T) {
+		const path = "/creds/user@corp.com/gw.creds"
+		t.Setenv("NATSMCP_CREDS", path)
+		boot, err := parse(t).bootParams(sourceFile)
+		require.NoError(t, err)
+		require.Len(t, boot.ignoredFlags, 1)
+		assert.Contains(t, boot.ignoredFlags[0], path)
+	})
+
+	// The same setting aimed at THIS process still fails: an argv the operator
+	// typed is not one exported once for the host, and silently dropping it
+	// would be the original defect.
+	t.Run("explicit flag still refuses", func(t *testing.T) {
+		var cli CLI
+		parser, err := kong.New(&cli, kong.Name("natsmcp"), kong.Exit(func(int) {}))
+		require.NoError(t, err)
+		_, err = parser.Parse([]string{"gateway", "--config", path, "--inbox-prefix", "_INBOX_acme"})
+		require.NoError(t, err)
+		_, err = cli.Gateway.bootParams(sourceFile)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nats.inboxPrefix")
+	})
+
+	// Scope is untouched by any of this: it is the reason the guard exists, it
+	// is gateway-only, and an unscoped boot serves every tenant.
+	t.Run("scope still refuses", func(t *testing.T) {
+		t.Setenv("NATSMCP_SCOPE_TENANT", "acme")
+		_, err := parse(t).bootParams(sourceFile)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "nats.tenant")
+	})
+}
+
+// Everything after the apply is conditional on it: pruning a rejected revision
+// would retire resolvers the config still in force is using, and warning on one
+// would name servers nobody is serving. The dedupe state has to survive across
+// revisions too — the fetch source re-applies on every tick, which is exactly
+// how the nats-drift line came to warn forever.
+func TestApplyRevisionReportsOnlyWhatApplied(t *testing.T) {
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+
+	perUser := func(t *testing.T) *config.Config {
+		t.Helper()
+		cfg, err := config.Parse([]byte(`{"servers":{"gh":{"command":"x","auth":{"mode":"exec","command":"h"}}}}`))
+		require.NoError(t, err)
+		return cfg
+	}
+
+	var applyErr error
+	var pruned int
+	apply := func(*config.Config) (reconcile.Delta, error) { return reconcile.Delta{}, applyErr }
+	prune := func(map[string]config.Server) { pruned++ }
+	run := applyRevision(log, apply, prune)
+
+	// A rejected revision reports nothing and prunes nothing.
+	applyErr = errors.New("refused")
+	require.Error(t, run(perUser(t)))
+	assert.Zero(t, pruned, "a rejected revision must not retire the live config's resolvers")
+	assert.Empty(t, buf.String())
+
+	// The same revision, once it applies.
+	applyErr = nil
+	require.NoError(t, run(perUser(t)))
+	assert.Equal(t, 1, pruned)
+	assert.Contains(t, buf.String(), "gh", "the per-user servers are named once they are being served")
+
+	// A nil revision is one Apply accepts — "every server removed" — so this
+	// callback sees it on the success path and must not dereference it.
+	pruned = 0
+	require.NotPanics(t, func() { require.NoError(t, run(nil)) })
+	assert.Equal(t, 1, pruned, "a nil revision still retires the resolvers of the servers it removed")
+
+	// And the fetch source's next tick says nothing new.
+	before := buf.Len()
+	require.NoError(t, run(perUser(t)))
+	assert.Equal(t, before, buf.Len(), "an unchanged revision must not re-warn on every tick")
+}
+
+// The bound was reachable only from Go, so a deployment whose helper backgrounds
+// a refresh — a cloud CLI holding the pipe past the default — had no way to say
+// so from the document that configures the helper.
+func TestExecResolverCarriesTheConfiguredWaitDelay(t *testing.T) {
+	r := buildResolver(&config.Auth{Mode: config.AuthExec, Command: "h", WaitDelay: "30s"}, nil, "")
+	e, ok := r.(*cred.Exec)
+	require.True(t, ok)
+	assert.Equal(t, 30*time.Second, e.WaitDelay)
+
+	// Unset stays zero, which is how Exec spells "take the default" — pinning a
+	// number here would silently become the default's second definition.
+	r = buildResolver(&config.Auth{Mode: config.AuthExec, Command: "h"}, nil, "")
+	assert.Zero(t, r.(*cred.Exec).WaitDelay)
 }

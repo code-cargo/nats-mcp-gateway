@@ -326,3 +326,29 @@ func TestOversizeCancelIsTypedTooLarge(t *testing.T) {
 		"the last unchecked publish must not surface as a bare nats.ErrMaxPayload")
 	assert.Equal(t, ErrCodePayloadTooLarge, werr.Code)
 }
+
+// micro.Request.Error refuses an empty description with ErrArgRequired, and by
+// then errWithID has claimed the stream: the terminal frame never goes out and
+// the caller is left on the same inactivity deadline. A backend returning a
+// bare errors.New("") is all it takes.
+func TestEmptyHandlerErrorStillTerminates(t *testing.T) {
+	nc := runNATS(t, &server.Options{MaxPayload: boundaryMaxPayload})
+	serve(t, nc, ServerConfig{}, func(ctx context.Context, in *Inbound, w StreamWriter) error {
+		return errors.New("")
+	})
+
+	const inactivity = 3 * time.Second
+	start := time.Now()
+	s, err := client(t, nc, inactivity).Do(context.Background(), testRequest("1", "tools/call"))
+	require.NoError(t, err)
+	frames := collect(t, s)
+
+	require.Len(t, frames, 1)
+	require.Equal(t, FrameErr, frames[0].Kind)
+	m, err := jsonrpc.Decode(frames[0].Body)
+	require.NoError(t, err)
+	require.NotNil(t, m.Error)
+	assert.NotEmpty(t, m.Error.Message, "an empty description is what micro refuses to publish")
+	assert.Less(t, time.Since(start), inactivity,
+		"the failure must be reported, not waited out on the inactivity deadline")
+}

@@ -131,12 +131,14 @@ type httpConn struct {
 	// client is one page, and what the pages after it hold is exactly the
 	// question being answered.
 	annotationsKnown bool
-	// annotationsTruncated records that a probe hit the page cap with the
-	// listing unfinished. Distinct from annotationsKnown: it says "we looked
-	// and could not see it all", which is not grounds to believe there are no
-	// annotations, but is grounds to stop re-reading the same pages — the
-	// backend chooses when its cursor ends.
-	annotationsTruncated bool
+	// annotationsTruncatedAt records when a probe last hit the page cap with
+	// the listing unfinished. Distinct from annotationsKnown: it says "we
+	// looked and could not see it all", which is not grounds to believe there
+	// are no annotations, but is grounds not to re-read the same pages for a
+	// while. A timestamp rather than a flag because the backend chooses when
+	// its cursor ends and may start ending it — a listing that shrinks back
+	// under the cap has to be reachable again without replacing the conn.
+	annotationsTruncatedAt time.Time
 	// refreshGen counts completed out-of-band schema fetches, so concurrent
 	// callers can tell whether one they waited on covered their need.
 	refreshGen uint64
@@ -447,14 +449,18 @@ func (c *httpConn) retryWithParamHeaders(ctx context.Context, rpcErr *jsonrpc.Me
 	c.mu.Lock()
 	_, toolKnown := c.annotations[name]
 	known := c.annotationsKnown && (toolKnown || len(c.annotations) == 0)
-	// A truncated probe counts as done for this purpose. It read every page
-	// the cap allows, so another one reads the same ones and learns nothing
-	// new — and the backend chooses when the cursor ends, so without this a
-	// listing that never terminates makes each rejected call re-sweep the
-	// whole toolset.
-	truncated := c.annotationsTruncated
+	// A recent truncation damps this probe rather than forbidding it. Another
+	// probe inside the window reads the same pages and stops in the same
+	// place, so without a bound a listing that never terminates makes each
+	// rejected call re-sweep the whole toolset; once the window passes, a
+	// backend whose listing has since come back under the cap is worth one
+	// more look. Refusing forever would trade that runaway cost for a conn
+	// that can never recover, however long it lives and whatever the backend
+	// does next.
+	cooling := !c.annotationsTruncatedAt.IsZero() &&
+		time.Since(c.annotationsTruncatedAt) < annotationTruncationCooldown
 	c.mu.Unlock()
-	if known || truncated {
+	if known || cooling {
 		return false
 	}
 	if err := c.refreshAnnotations(ctx, gen); err != nil {
@@ -705,6 +711,12 @@ const (
 	// annotationProbeMaxPages bounds cursor following on a paginated
 	// tools/list, so a server with a runaway cursor cannot loop us forever.
 	annotationProbeMaxPages = 50
+	// annotationTruncationCooldown is how long a probe stopped by that cap
+	// suppresses the next one. It cannot be forever — the listing is the
+	// backend's to change, and a conn outlives the truncation that provoked
+	// this — and it cannot be zero, which is the full sweep per rejected call
+	// the cap exists to bound. One sweep per window is what both allow.
+	annotationTruncationCooldown = time.Minute
 )
 
 // absorbToolsList learns each tool's x-mcp-header annotations and removes any
@@ -852,16 +864,20 @@ func (c *httpConn) refreshAnnotations(ctx context.Context, gen uint64) error {
 	// again.
 	if cursor == "" {
 		c.annotationsKnown = true
+		// A listing that ends retires any earlier truncation outright: the
+		// condition that justified damping the probe is demonstrably gone.
+		c.annotationsTruncatedAt = time.Time{}
 	} else {
 		// Read as far as the cap allows and the listing still had more. We
 		// cannot conclude "this server publishes no annotations" from that —
 		// the tools we never saw may carry some — but we also must not keep
-		// paying for the attempt: the next probe reads the same pages and
+		// paying for the attempt: a probe issued now reads the same pages and
 		// stops in the same place, so a backend that never terminates its
-		// cursor would turn every -32020 into another full sweep. Recording
-		// the truncation is what makes the recovery give up on a retry that
-		// cannot succeed, without claiming knowledge it does not have.
-		c.annotationsTruncated = true
+		// cursor would turn every -32020 into another full sweep. Timed, not
+		// latched: that reasoning holds only while the listing is the one we
+		// just read, and a backend that comes back under the cap must be able
+		// to recover the retry without waiting for the conn to be replaced.
+		c.annotationsTruncatedAt = time.Now()
 	}
 	c.refreshGen++
 	c.mu.Unlock()

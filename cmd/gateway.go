@@ -119,6 +119,11 @@ type bootParams struct {
 	// sources): bootParams has to parse it to read pool/claimCheck, so the
 	// source reuses that parse rather than doing a second one.
 	inline *config.Config
+	// ignoredFlags are the file-source settings supplied by an env var the shim
+	// and call commands share, which this source drops instead of refusing.
+	// Dropping them silently is what left an unfenced inbox with nothing in the
+	// log to explain it, so runGateway says so at boot.
+	ignoredFlags []string
 }
 
 // poolFromConfig converts the config schema's pool block to the pool's own
@@ -157,6 +162,15 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	if err != nil {
 		return err
 	}
+	for _, ignored := range boot.ignoredFlags {
+		log.Warn("file source ignores a setting supplied by a shared environment variable", "detail", ignored)
+	}
+
+	// Before the connect, not after: this warns that a credential is ABOUT to
+	// cross an unencrypted hop, and nats.Connect puts it in the CONNECT frame.
+	// Logged later it describes something already done, and a boot that fails
+	// anywhere between would never print it at all.
+	warnPlaintextNATSURL(log, boot.url)
 
 	opts := []nats.Option{nats.Name("natsmcp-gateway"), nats.MaxReconnects(-1)}
 	if boot.credsFile != "" {
@@ -305,13 +319,7 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 
 	// Run the config loop. It returns when ctx is cancelled (signal) or on a
 	// fatal initial-config error.
-	runErr := configsource.Run(ctx, log, source, func(cfg *config.Config) error {
-		_, err := rec.Apply(cfg)
-		if err == nil {
-			registry.prune(cfg.Servers)
-		}
-		return err
-	})
+	runErr := configsource.Run(ctx, log, source, applyRevision(log, rec.Apply, registry.prune))
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
@@ -321,6 +329,71 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		return runErr // a real error, not a clean signal-driven shutdown
 	}
 	return drainErr
+}
+
+// applyRevision builds the config-source callback: one revision applied, and
+// the consequences of it reported.
+//
+// Named rather than written inline at the Run call because the ordering is the
+// content. Everything after apply runs only for a revision that took: pruning
+// on a rejected one would retire resolvers the config still in force is using,
+// and warning on one would name servers nobody is serving. The dedupe state
+// lives in the closure for the same reason it exists at all — the fetch source
+// re-applies on every tick, and a warning per tick is the defect this batch
+// removed from the drift line.
+func applyRevision(log *slog.Logger, apply func(*config.Config) (reconcile.Delta, error), prune func(map[string]config.Server)) func(*config.Config) error {
+	var perUserWarned string
+	return func(cfg *config.Config) error {
+		if _, err := apply(cfg); err != nil {
+			return err
+		}
+		// Apply takes a nil revision as "every server removed", and the
+		// configsource package doc advertises a fetch returning (nil, nil) as
+		// the way to write one — so this callback sees nil on a revision that
+		// APPLIED, and dereferencing it here would take the process down one
+		// statement after the apply succeeded.
+		var servers map[string]config.Server
+		if cfg != nil {
+			servers = cfg.Servers
+		}
+		prune(servers)
+		perUserWarned = warnPerUserGrain(log, cfg, perUserWarned)
+		return nil
+	}
+}
+
+// warnPerUserGrain names the servers whose credentials are resolved per caller.
+//
+// That grain is the setting that turns an unattributed request into a -32014
+// refusal, and nothing else in the gateway's output says which servers carry
+// it: a deployment without per-user NATS auth sends the documented "_" token
+// on every request, so the first symptom is every call to those servers
+// failing at once, with a remedy the deployment may have no way to reach. It
+// is a warning rather than an error because the fail-closed refusal is
+// deliberate — this is the line an operator greps for after the first -32014.
+//
+// last is the set already reported, returned so the caller can suppress the
+// repeat: the fetch source re-applies on every poll tick, and a warning that
+// re-fires forever is one operators filter out.
+func warnPerUserGrain(log *slog.Logger, cfg *config.Config, last string) string {
+	if cfg == nil {
+		return last
+	}
+	var names []string
+	for _, name := range cfg.ServerNames() {
+		if cfg.Servers[name].Auth.PerUser() {
+			names = append(names, name)
+		}
+	}
+	cur := strings.Join(names, ",")
+	if cur == "" || cur == last {
+		return cur
+	}
+	log.Warn("servers resolve credentials per caller; requests carrying the unattributed user token are refused with -32014",
+		"servers", cur,
+		"needs", "per-user NATS auth, so each caller publishes under its own {user} token",
+		"opt_out", `"perUser": false (exec, nats) or a path without {user} (file, oauth-*)`)
+	return cur
 }
 
 // bootParams resolves the non-reloadable boot settings for the selected mode.
@@ -351,9 +424,11 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 			}
 			boot.claimMaxBytes = cc.MaxBytes
 		}
-		if err := c.checkFileSourceFlags(boot); err != nil {
+		ignored, err := c.checkFileSourceFlags(boot)
+		if err != nil {
 			return bootParams{}, err
 		}
+		boot.ignoredFlags = ignored
 		return boot, nil
 	}
 	// Fetch and inline sources: connection, prefix, queue group and scope come
@@ -370,9 +445,10 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	if c.ScopeUser != "" && !wire.TokenSafe(c.ScopeUser) {
 		return bootParams{}, fmt.Errorf("--scope-user %q is not subject-token safe (%s)", c.ScopeUser, `A-Za-z0-9_-`)
 	}
-	// The wire prefix has no downstream check at all: micro accepts a "*" in an
-	// endpoint subject and NATS binds it, so "mcp.*" would subscribe this
-	// instance to every prefix in the account without ever failing.
+	// wire.Serve rejects this too — this is what names the flag, and what fails
+	// before we open a connection. Nothing below the wire objects: micro
+	// accepts a "*" in an endpoint subject and NATS binds it, so "mcp.*" would
+	// subscribe this instance to every prefix in the account.
 	if c.SubjectPrefix != "" {
 		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
 			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
@@ -387,15 +463,40 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 	// misses spaces, and its "invalid custom prefix" names neither the setting
 	// nor the value.
 	if c.InboxPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+		if err := wire.ValidateInboxPrefix(c.InboxPrefix); err != nil {
 			return bootParams{}, fmt.Errorf("--inbox-prefix: %w", err)
 		}
 	}
-	// wire.Serve rejects this too — this is what names the flag, and what
-	// fails before we open a connection.
-	if c.SubjectPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.SubjectPrefix); err != nil {
-			return bootParams{}, fmt.Errorf("--subject-prefix: %w", err)
+	// The same rejection config.validate() makes for the document's durations,
+	// on the path that is the fetch source's ONLY route to pool sizing. Every
+	// consumer substitutes its default for anything <= 0, so "-30m" is not a
+	// shorter TTL — it is the default, silently, with nothing logged for the
+	// operator who asked for something else.
+	for _, d := range []struct {
+		flag string
+		val  time.Duration
+	}{
+		{"--pool-idle-ttl", c.PoolIdleTTL},
+		{"--pool-max-lifetime", c.PoolMaxLifetime},
+		{"--claim-max-age", c.ClaimMaxAge},
+	} {
+		if d.val < 0 {
+			return bootParams{}, fmt.Errorf("%s must not be negative (got %s)", d.flag, d.val)
+		}
+	}
+	// The pool's two counts as well, for exactly the same reason: PoolConfig
+	// substitutes 32 and 16 for anything <= 0, so a negative is the default
+	// rather than a smaller pool.
+	for _, n := range []struct {
+		flag string
+		val  int64
+	}{
+		{"--pool-max-concurrent", int64(c.PoolMaxConcurrent)},
+		{"--pool-max-procs-per-tenant", int64(c.PoolMaxProcsPerTenant)},
+		{"--claim-max-bytes", c.ClaimMaxBytes},
+	} {
+		if n.val < 0 {
+			return bootParams{}, fmt.Errorf("%s must not be negative (got %d)", n.flag, n.val)
 		}
 	}
 
@@ -500,8 +601,8 @@ const (
 // steer the fetch source's own polling, the job --reload-interval does for this
 // source, and nothing about the connection, the scope or the served subjects
 // rides on them.
-func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
-	var dropped []string
+func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) ([]string, error) {
+	var dropped, ignored []string
 	// flag and env are how the operator supplied the value; field is the
 	// document key that governs instead. inDoc is what that key resolved to,
 	// which is the whole point of the message: it names the value in force.
@@ -512,10 +613,43 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 		dropped = append(dropped, fmt.Sprintf("--%s=%s (%s) but %s=%s",
 			flag, settingValue(got), env, field, settingValue(inDoc)))
 	}
-	check("nats-url", "NATSMCP_NATS_URL", "nats.url",
-		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url)
-	check("nats-creds", "NATSMCP_NATS_CREDS", "nats.credsFile",
-		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile)
+	// checkShared is check for a setting whose env var the shim and call
+	// commands read too. One value exported once for a host is the ordinary
+	// deployment — the README's own layout runs a shim beside a file-source
+	// gateway — so a value that arrived that way is reported and dropped
+	// rather than refused: refusing breaks a working fleet to correct a
+	// setting this source was never going to read, which is the trade the
+	// comment above already declines to make. An explicit flag still fails,
+	// because that one was aimed at this process.
+	checkShared := func(flag, env, field string, conflict bool, got, inDoc string, isURL bool) {
+		if !conflict {
+			return
+		}
+		// isURL rather than sniffing the value, because which settings carry
+		// a credential inline is known HERE and unknowable from the string: a
+		// creds path like /creds/user@corp.com/gw.creds is not a URL, and a
+		// redactor guessing from shape rewrote it into a path nobody
+		// configured. Compared raw and reported redacted — the comparison asks
+		// which variable supplied this, which only the exact bytes answer.
+		shown, shownDoc := got, inDoc
+		if isURL {
+			shown, shownDoc = redactNATSURL(got), redactNATSURL(inDoc)
+		}
+		if suppliedByEnv(env, got) {
+			ignored = append(ignored, fmt.Sprintf("--%s=%s (%s) is ignored by the file source; %s=%s is in force",
+				flag, settingValue(shown), env, field, settingValue(shownDoc)))
+			return
+		}
+		check(flag, env, field, conflict, shown, shownDoc)
+	}
+	checkShared("nats-url", "NATSMCP_NATS_URL", "nats.url",
+		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url, true)
+	// Either name may have supplied this: the pair are aliases of each other on
+	// every subcommand, so the message has to name the one the operator
+	// actually exported. Naming the other sends them to unset a variable they
+	// never set, which does not clear the error.
+	checkShared("nats-creds", credsEnvName(c.NatsCreds), "nats.credsFile",
+		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile, false)
 	// Against the prefix the wire will actually bind, for the same reason the
 	// queue group and the pool are: wire.Serve owns this default, so a document
 	// that omits the field is not asking for the empty prefix.
@@ -523,11 +657,11 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 	if effPrefix == "" {
 		effPrefix = wire.DefaultPrefix
 	}
-	check("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
+	checkShared("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
 		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != effPrefix,
-		c.SubjectPrefix, effPrefix)
-	check("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
-		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
+		c.SubjectPrefix, effPrefix, false)
+	checkShared("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
+		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix, false)
 	// Compared against the group the wire will actually join, not against the
 	// document's silence: wire.DefaultQueueGroup owns this default precisely so
 	// every source gets it, so pinning a flag to the value it already computes
@@ -587,10 +721,31 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) error {
 	}
 
 	if len(dropped) == 0 {
-		return nil
+		return ignored, nil
 	}
-	return fmt.Errorf("config: %s: %s — the file source takes its connection, scope, pool and claim-check settings from this document; set them there, or drop the flag and its env var (only --config-subject and --config-json read them)",
+	return ignored, fmt.Errorf("config: %s: %s — the file source takes its connection, scope, pool and claim-check settings from this document; set them there, or drop the flag and its env var (only --config-subject and --config-json read them)",
 		c.Config, strings.Join(dropped, "; "))
+}
+
+// suppliedByEnv reports whether name is what gave this setting its value, so a
+// variable exported once for a whole host can be told apart from a flag aimed
+// at this process. Kong has already collapsed the two into one field by the
+// time anything here runs, and an operator who passes the flag AND exports the
+// same value gets the gentler of the two readings, which is the right way for
+// this to be wrong.
+func suppliedByEnv(name, got string) bool {
+	return got != "" && os.Getenv(name) == got
+}
+
+// credsEnvName is the credentials variable that actually supplied the value,
+// preferring the gateway's own documented name when both are set to it.
+func credsEnvName(got string) string {
+	for _, name := range gatewayCredsEnv {
+		if suppliedByEnv(name, got) {
+			return name
+		}
+	}
+	return gatewayCredsEnv[0]
 }
 
 // settingValue renders a setting for that error, quoting strings so an empty
@@ -632,19 +787,24 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 	blog := log.With("server", key.Server, "tenant", key.Tenant)
 
 	credUser := key.CredSet
-	if credUser == "" {
-		// An empty CredSet means the pool key was minted without a per-user
-		// identity, and mapping it to the unattributed placeholder is only
-		// right when the server does not ask for one. The proxy refuses that
-		// combination on the request path, but this factory runs later and
-		// re-reads the config, so a reload flipping a server shared -> per-user
-		// mid-request arrives here with a key the new mode cannot satisfy.
+	if credUser == "" || credUser == wire.UserUnattributed {
+		// The pool key was minted without a per-user identity, and mapping it
+		// to the unattributed placeholder is only right when the server does
+		// not ask for one. The proxy refuses that combination on the request
+		// path, but this factory runs later and re-reads the config, so a
+		// reload flipping a server shared -> per-user mid-request arrives here
+		// with a key the new mode cannot satisfy.
+		//
+		// Both spellings of "no identity" are caught. Only the empty CredSet
+		// is reachable today (the proxy leaves it unset for a shared server),
+		// but the placeholder means the same thing everywhere else in the
+		// gateway, and a credential-identity boundary should not rest on which
+		// of the two an unrelated caller happened to construct.
 		//
 		// Checked against the grain rather than left to the generation
 		// comparison below. That comparison does reject it today — a
 		// resolver-less key carries CredVersion 0 and globalGen starts at 1 —
-		// but that is an accident of numbering, and a credential-identity
-		// boundary should not rest on one. Refusing here also means the
+		// but that is an accident of numbering. Refusing here also means the
 		// resolver is never asked for "_", so an exec helper with side effects
 		// does not run under an identity nothing will accept.
 		if s.Auth.PerUser() {
@@ -665,14 +825,21 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 			// The factory's error is the pool's error, which the proxy hands
 			// the caller: the same detail suppression the request path applies
 			// is owed here, and through the same function so the two cannot
-			// drift. CallerMessage's retry advice earns its place on this path
-			// rather than duplicating the error code's: a pool failure arrives
-			// as -32010, whose contract tells the client to re-issue, and a
-			// terminal credential refusal is exactly the case that has to
-			// contradict it.
+			// drift.
+			//
+			// Returned as cred.Unavailable so it also arrives under the
+			// same wire code. A bare error from here reaches the caller as
+			// -32010, "the stream broke, re-issue" — and CallerMessage's "do
+			// not retry" would then sit inside the one code that promises
+			// retrying helps, so a client switching on the code (the reason
+			// codes exist) retry-loops a permanent refusal. Reachable whenever
+			// the proxy's resolve hits the cache and this one misses it: a TTL
+			// boundary, or a concurrent 401 Invalidate.
 			ref := cred.FailureRef()
 			blog.Warn("credential resolution failed while spawning backend", "err", err, "ref", ref)
-			return nil, fmt.Errorf("%s/%s: %s", key.Tenant, key.Server, cred.CallerMessage(err, ref))
+			return nil, &cred.Unavailable{
+				Message: fmt.Sprintf("%s/%s: %s", key.Tenant, key.Server, cred.CallerMessage(err, ref)),
+			}
 		}
 		if gen != key.CredVersion {
 			// The credentials rotated between the proxy's resolve and ours:
@@ -701,10 +868,12 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		env := s.Env
 		if creds != nil && len(creds.Env) > 0 {
 			// Merge, not replace: config env keeps non-secrets (AWS_REGION),
-			// resolved credentials override.
-			env = make(map[string]string, len(s.Env)+len(creds.Env))
+			// resolved credentials override — but only the ones a resolver is
+			// entitled to set (see safeCredEnv).
+			resolved := safeCredEnv(creds.Env, blog)
+			env = make(map[string]string, len(s.Env)+len(resolved))
 			maps.Copy(env, s.Env)
-			maps.Copy(env, creds.Env)
+			maps.Copy(env, resolved)
 		}
 		inner = &backend.StdioBackend{Command: s.Command, Args: s.Args, Env: env, Logger: blog}
 	}
@@ -728,6 +897,114 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 		out = &expiringBackend{Backend: out, expiresAt: creds.ExpiresAt}
 	}
 	return out, nil
+}
+
+// A credential resolver is trusted to supply CREDENTIALS, not code. Its reply's
+// env is merged over the config's and handed to StdioBackend as the child's
+// entire environment, so a variable the dynamic loader or a language runtime
+// reads at startup would promote the resolver from "supplies credentials" to
+// "runs code in the gateway pod, at the gateway's uid": for mode "nats" that is
+// a compromised controller, for mode "file" whatever writes the mounted file —
+// neither of which is the party that authored the config. (mode "exec" is
+// already local execution and gains nothing here, but this merge point should
+// not have to know the mode to be safe.)
+//
+// The config's own env block is deliberately NOT filtered. A document that
+// names the command and its args already chooses what runs, so filtering its
+// env would buy nothing and would break the operator who set
+// NODE_OPTIONS=--max-old-space-size on a server they wrote themselves.
+//
+// What this covers is the loader plus the startup hooks of the runtimes a
+// stdio backend is actually built on (node, python, shells, and the
+// interpreters behind an npx/uvx server). It is deliberately not a list of
+// every program's exec hook — a backend that shells out to git still honors
+// GIT_SSH_COMMAND, and nothing here can know that it does. The boundary it
+// draws is that a credential reply cannot redirect what the child itself loads
+// and runs before its first line of MCP code.
+var (
+	credEnvBlockedPrefixes = []string{
+		"LD_",        // glibc/musl loader: LD_PRELOAD, LD_AUDIT, LD_LIBRARY_PATH
+		"DYLD_",      // macOS loader: DYLD_INSERT_LIBRARIES and friends
+		"BASH_FUNC_", // exported shell functions, defined before the script runs
+		// npm reads its whole config from the environment, and the README's
+		// own stdio examples are npx. npm_config_script_shell picks the shell
+		// every lifecycle script runs under, and npm_config_node_options
+		// reaches node the same way NODE_OPTIONS does — both before any MCP
+		// code runs.
+		"NPM_CONFIG_",
+	}
+	credEnvBlocked = map[string]struct{}{
+		// Which binary "command" resolves to, and where every runtime looks
+		// for the rc/config files it reads at startup. StdioBackend sets both
+		// deliberately (the gateway's PATH, a private empty HOME), so these
+		// are also the two the reply would be overriding rather than adding.
+		"PATH": {}, "HOME": {},
+		// The glibc path family, which all name somewhere it loads from or
+		// reads before main: charset modules, locale archives, message
+		// catalogs, and the tunables that steer the loader itself.
+		"GCONV_PATH": {}, "LOCPATH": {}, "NLSPATH": {}, "GLIBC_TUNABLES": {},
+		// node
+		"NODE_OPTIONS": {}, "NODE_PATH": {}, "NODE_REPL_EXTERNAL_MODULE": {},
+		"NODE_EXTRA_CA_CERTS": {}, // TLS trust is a control, not a credential
+		// python
+		"PYTHONPATH": {}, "PYTHONHOME": {}, "PYTHONSTARTUP": {},
+		"PYTHONEXECUTABLE": {}, "PYTHONBREAKPOINT": {},
+		// sh/bash
+		"BASH_ENV": {}, "ENV": {}, "SHELLOPTS": {},
+		// perl, ruby
+		"PERL5OPT": {}, "PERL5LIB": {}, "PERLLIB": {}, "PERL5DB": {},
+		"RUBYOPT": {}, "RUBYLIB": {},
+		// jvm, .net
+		"JAVA_TOOL_OPTIONS": {}, "_JAVA_OPTIONS": {}, "JDK_JAVA_OPTIONS": {}, "CLASSPATH": {},
+		"DOTNET_STARTUP_HOOKS": {}, "CORECLR_ENABLE_PROFILING": {},
+		"CORECLR_PROFILER": {}, "CORECLR_PROFILER_PATH": {},
+	}
+)
+
+// safeCredEnv is the resolver's env with those keys removed, one WARN per
+// refusal. The key is named and the value never is: a refused value is exactly
+// as secret as an accepted one, and the operator needs the key to find the
+// resolver that sent it.
+func safeCredEnv(env map[string]string, log *slog.Logger) map[string]string {
+	out := make(map[string]string, len(env))
+	for k, v := range env {
+		if credEnvRefused(k) {
+			log.Warn("dropping a credential-supplied environment variable: a resolver may not redirect the backend's code execution",
+				"key", k)
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+func credEnvRefused(key string) bool {
+	// A key holding "=" sets a variable other than the one it names, because
+	// StdioBackend joins them as k+"="+v — which would make both this filter
+	// and the warning above a statement about the wrong variable. A NUL fails
+	// the spawn outright, and an empty key names nothing.
+	if key == "" || strings.ContainsAny(key, "=\x00") {
+		return true
+	}
+	// Case-insensitively, and the tables above are written upper-case to suit
+	// it. Unix environment variables ARE case-sensitive and most of these
+	// consumers read one exact spelling, so this is broader than it strictly
+	// has to be — but npm is not one of them: it folds case on its prefix, so
+	// npm_config_script_shell, NPM_CONFIG_SCRIPT_SHELL and NpM_cOnFiG_… are one
+	// setting to it and enumerating spellings would leave the rest through.
+	// Windows env vars are case-insensitive outright. What this costs is a
+	// resolver naming a credential that differs from a loader hook only in
+	// case, which is not a thing any of them is called.
+	key = strings.ToUpper(key)
+	if _, refused := credEnvBlocked[key]; refused {
+		return true
+	}
+	for _, p := range credEnvBlockedPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // expiringBackend tells the pool (backend.Expiring) to clamp the entry's
@@ -875,7 +1152,8 @@ func (r *credRegistry) lookup(name string, s config.Server) (*cred.CachedResolve
 func buildResolver(a *config.Auth, nc *nats.Conn, prefix string) cred.Resolver {
 	switch a.Mode {
 	case config.AuthExec:
-		return &cred.Exec{Command: a.Command, Args: a.Args, Env: a.Env}
+		waitDelay, _ := time.ParseDuration(a.WaitDelay) // validated at config load; 0 takes the default
+		return &cred.Exec{Command: a.Command, Args: a.Args, Env: a.Env, WaitDelay: waitDelay}
 	case config.AuthFile:
 		ttl, _ := time.ParseDuration(a.TTL) // validated at config load
 		return &cred.File{Path: a.Path, TTL: ttl}

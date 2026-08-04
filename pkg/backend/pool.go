@@ -153,6 +153,12 @@ type spawn struct {
 	// stale is set (under p.mu) when EvictServer retires the key while this
 	// spawn runs: what it produces was built from the superseded definition.
 	stale bool
+	// built is when the factory handed back this spawn's backend — the
+	// in-flight spawn's counterpart to entry.born, and what evictServer filters
+	// on for the same reason. Written under p.mu once the factory returns; the
+	// zero value means the definition may still be read, so a since-filtered
+	// eviction has to assume the worst of it.
+	built time.Time
 }
 
 type entry struct {
@@ -163,6 +169,13 @@ type entry struct {
 	mux      *Mux
 	born     time.Time
 	deadline time.Time // born + MaxLifetime, clamped to credential expiry
+	// defined is when this backend's DEFINITION was read — when the factory
+	// ran, not when Connect finished. The eviction window is a statement about
+	// which config a backend came from, so it has to be measured at the moment
+	// that was decided: born is minutes later for a cold npx spawn, which put
+	// the same backend on either side of the same cutoff depending only on
+	// whether it happened to finish starting first.
+	defined  time.Time
 	lastUsed time.Time
 	inflight int
 	// waiters counts Gets blocked on the sem that have not yet incremented
@@ -391,6 +404,15 @@ func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, erro
 		p.releasePending(key.Tenant)
 		return nil, err
 	}
+	// Stamped after the factory read the definition and before Connect, which
+	// is the slow half: a cold `npx` spawn is minutes of Connect behind a
+	// definition read microseconds after the Get. Stamping it later would date
+	// this spawn by how long the subprocess took to come up and put it inside
+	// eviction windows that opened long after its definition was fixed.
+	p.mu.Lock()
+	sp.built = time.Now()
+	p.mu.Unlock()
+
 	conn, err := b.Connect(ctx)
 	if err != nil {
 		// Unconditional: ctx is the pool's, so nothing in this count is a
@@ -446,8 +468,17 @@ func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, erro
 			}
 		}
 		e = &entry{
-			key:      key,
-			mux:      NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			key:     key,
+			defined: sp.built,
+			mux:     NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			// lastUsed starts at born, not at the zero Time. The reaper reads
+			// now.Sub(e.lastUsed) and nothing else marks an entry young, so a
+			// zero value here is ~2000 years idle: an entry installed by a spawn
+			// whose caller has already given up would be reaped on the very next
+			// tick, which is precisely the backend runSpawn keeps alive so the
+			// next request starts warm. Get sets it again on the way through;
+			// this is the value that has to survive an unattended spawn.
+			lastUsed: born,
 			born:     born,
 			deadline: deadline,
 			sem:      make(chan struct{}, p.cfg.MaxConcurrent),
@@ -626,11 +657,21 @@ func (p *Pool) EvictServerSince(server string, t time.Time) {
 
 // evictServer drops every connection for the server born after since. The zero
 // time matches everything, which is what EvictServer wants.
+// definedAfter reports whether this entry's definition was read after since.
+// It falls back to born for an entry whose spawn predates the stamp, where the
+// two differ only by one Connect and born is the conservative answer.
+func (e *entry) definedAfter(since time.Time) bool {
+	if e.defined.IsZero() {
+		return e.born.After(since)
+	}
+	return e.defined.After(since)
+}
+
 func (p *Pool) evictServer(server string, since time.Time) {
 	p.mu.Lock()
 	var victims []*Mux
 	for k, e := range p.entries {
-		if k.Server == server && e.born.After(since) {
+		if k.Server == server && e.definedAfter(since) {
 			victims = append(victims, e.mux)
 			delete(p.entries, k)
 		}
@@ -641,7 +682,7 @@ func (p *Pool) evictServer(server string, since time.Time) {
 	// server with its old credentials.
 	kept := p.orphans[:0]
 	for _, e := range p.orphans {
-		if e.key.Server == server && e.born.After(since) {
+		if e.key.Server == server && e.definedAfter(since) {
 			victims = append(victims, e.mux)
 		} else {
 			kept = append(kept, e)
@@ -653,11 +694,28 @@ func (p *Pool) evictServer(server string, since time.Time) {
 			delete(p.broken, k)
 		}
 	}
-	// A spawn already running for this server captured the OLD definition.
-	// Marking it stale makes it close what it produces rather than install
-	// it, so the Get waiting behind it retries onto the new definition.
+	// A spawn already running for this server captured the definition live when
+	// its factory ran. Marking it stale makes it close what it produces rather
+	// than install it, so the Get waiting behind it retries onto the new
+	// definition.
+	//
+	// Filtered by the same cutoff as the entries, and owed to the caller for the
+	// same reason: a spawn whose definition was read before the window opened is
+	// provably from the config that is live again, and discarding it costs a
+	// waiting Get one of its getMaxAttempts and restarts a cold subprocess that
+	// was about to finish.
+	//
+	// An unstamped spawn has not reached its factory yet, and is marked stale
+	// on purpose even though the caller's rollback has usually already restored
+	// the definition it is about to read. Nothing orders that read against this
+	// loop: the reconciler publishes and then evicts, but a third apply may
+	// publish again in between, and this package cannot see which config the
+	// factory will find. Paying a respawn for a spawn that would have been fine
+	// is the cheap side of that; installing one built from a definition nobody
+	// wants is the expensive side, and it is the side this eviction exists to
+	// prevent.
 	for k, sp := range p.spawning {
-		if k.Server == server {
+		if k.Server == server && (sp.built.IsZero() || sp.built.After(since)) {
 			sp.stale = true
 		}
 	}

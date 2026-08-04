@@ -28,22 +28,42 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/code-cargo/nats-mcp-gateway/pkg/backend"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
+
+// Pool is the part of *backend.Pool that reconciliation drives. Narrow because
+// eviction is the only thing an apply does to the pool, and a test that has to
+// observe exactly which evictions a revision decided on cannot get that from a
+// live pool. *backend.Pool satisfies it.
+type Pool interface {
+	EvictServer(server string)
+	EvictServerSince(server string, t time.Time)
+}
 
 // Reconciler owns the currently-applied config and drives the wire + pool to
 // match a new one.
 type Reconciler struct {
 	ws   *wire.Server
-	pool *backend.Pool
+	pool Pool
 	log  *slog.Logger
 
 	cur atomic.Pointer[config.Config]
 
-	// mu serializes Apply so concurrent reloads can't interleave a wire update
-	// with a pool eviction.
+	// mu serializes Apply end to end — the diff, the wire update, the publish
+	// through cur, AND the eviction those decide on.
+	//
+	// Holding it across the eviction costs latency: closing a backend waits out
+	// its terminate grace, and a queued apply pays for it. That was split off
+	// once, onto a second lock taken under this one and released after the pool
+	// work, and it is back because the split is unsound and buys nothing here.
+	// Unsound: an apply publishes inside the critical section but evicts after
+	// leaving it, so a later apply's revision can go live first and then have
+	// its backends killed by the earlier apply's eviction — which for an
+	// adopted revision has no window to be bounded by. Buys nothing: Run
+	// applies serially in one goroutine, so a queued apply waiting on the lock
+	// is a shape the gateway never produces. Concurrent Apply is what this
+	// lock is FOR, and it is exactly the case the split broke.
 	mu sync.Mutex
 
 	// bootNATS is the `nats` block of the FIRST applied revision — the settings
@@ -53,11 +73,18 @@ type Reconciler struct {
 	// everything else Apply reads and writes.
 	bootNATS config.NATS
 	bootSeen bool
+
+	// failed identifies the revision whose apply failed most recently, by
+	// content — a source hands out a fresh pointer per delivery, so identity
+	// says nothing. failedSeen separates "none has failed" from a revision that
+	// could not be identified. Any adopted revision clears both.
+	failed     string
+	failedSeen bool
 }
 
 // New builds a Reconciler over a running wire server and pool. The pool's
 // factory should read the live config via Current.
-func New(ws *wire.Server, pool *backend.Pool, log *slog.Logger) *Reconciler {
+func New(ws *wire.Server, pool Pool, log *slog.Logger) *Reconciler {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -96,6 +123,8 @@ func (d Delta) Empty() bool {
 // evicts the pools of removed and changed servers and publishes the new config
 // as current.
 //
+// A nil next is a revision like any other: "every server removed".
+//
 // The server set is all that reconciles. A revision whose `nats` block has
 // moved away from the running gateway's is reported (see warnNATSDrift) and
 // otherwise ignored — that connection cannot be rebuilt underneath a serving
@@ -103,16 +132,59 @@ func (d Delta) Empty() bool {
 func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	d, ev, err := r.transition(next)
+	r.evict(ev)
+	return d, err
+}
 
-	r.warnNATSDrift(next)
+// eviction is the pool work one apply decided on, deferred out of the critical
+// section that decided it.
+type eviction struct {
+	servers []string
+	// since bounds the eviction to backends born after it. The zero time
+	// matches every backend, which is what an adopted revision wants; a
+	// rollback sets the window in which its rejected revision was reachable.
+	since time.Time
+}
+
+// evict runs the pool work the transition decided on, under mu.
+func (r *Reconciler) evict(ev eviction) {
+	for _, name := range ev.servers {
+		if ev.since.IsZero() {
+			r.pool.EvictServer(name)
+			continue
+		}
+		r.pool.EvictServerSince(name, ev.since)
+	}
+}
+
+// transition decides what one revision changes: the diff, the wire update and
+// the publish through cur. Called with mu held; the eviction it returns runs
+// under the same lock, so nothing it decided can be overtaken before it runs.
+func (r *Reconciler) transition(next *config.Config) (Delta, eviction, error) {
+	// A nil revision is a legitimate one — "every server removed" — and the
+	// package doc advertises a fetch returning (nil, nil) as the way to write
+	// one. Substituting an empty config keeps the nil out of everything this
+	// apply goes on to do: the diff, ServerNames, and the value it publishes.
+	//
+	// It does NOT make Current non-nil in general — the rollback below restores
+	// prev, which is nil before anything has applied, and Current starts nil in
+	// any case. Callers still have to handle that; cmd's factory and registry
+	// do. warnNATSDrift sees the original for a different reason: nil asserts
+	// nothing about the `nats` block where an empty document asserts an empty
+	// one.
+	rev := next
+	if rev == nil {
+		rev = &config.Config{}
+	}
 
 	prev := r.cur.Load()
-	d := diffServers(prev, next)
+	d := diffServers(prev, rev)
 
 	if d.Empty() {
-		r.cur.Store(next)
+		r.adopt(rev, next)
 		r.log.Debug("config unchanged")
-		return d, nil
+		return d, eviction{}, nil
 	}
 
 	// Publish the new config BEFORE (re)registering endpoints: a newly-added
@@ -121,22 +193,41 @@ func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 	// therefore already be the new config. Roll back on failure so a bad
 	// revision leaves the previous config live.
 	//
-	// windowStart is the instant next becomes reachable through Current, and
+	// windowStart is the instant rev becomes reachable through Current, and
 	// so the earliest a backend could be built from it. The rollback below
-	// needs it to tell next's backends from prev's.
+	// needs it to tell rev's backends from prev's.
+	//
+	// A revision that already failed its last apply is published nowhere. Run
+	// re-delivers a failed revision on the source's next trigger, so a config
+	// the wire refuses arrives again every tick for as long as the operator
+	// leaves it in place, and every publish opens another window in which a
+	// request can pool a backend the rollback then has to kill. The first
+	// attempt is worth that: the revision is expected to apply. A repeat is
+	// not, and the cost if it does apply is one moment between SetServers
+	// binding an added server and the store below, in which that server
+	// resolves out of the previous config — an error the caller retries,
+	// against backend churn on every tick until the operator fixes the file.
 	windowStart := time.Now()
-	r.cur.Store(next)
-	if err := r.ws.SetServers(next.ServerNames()); err != nil {
+	publish := !r.failedBefore(rev)
+	if publish {
+		r.cur.Store(rev)
+	}
+	if err := r.ws.SetServers(rev.ServerNames()); err != nil {
+		r.recordFailed(rev)
+		if !publish {
+			// Nothing became reachable, so there is nothing to undo.
+			return Delta{}, eviction{}, err
+		}
 		r.cur.Store(prev)
-		// next was briefly the live config, so a request racing this apply
+		// rev was briefly the live config, so a request racing this apply
 		// could have pooled a backend built from a definition that is now
 		// rolled back. Nothing downstream would ever collect it: the pool is
 		// keyed by (server, tenant), and once prev is live again its
 		// definition matches, so no later diff calls the server changed. Drop
-		// what next could have spawned — for a changed server that costs a
+		// what rev could have spawned — for a changed server that costs a
 		// respawn from prev, and for an added one it is the only chance to
 		// notice at all. A removed server needs nothing: it is absent from
-		// next, so the factory refused to build it to begin with.
+		// rev, so the factory refused to build it to begin with.
 		//
 		// Only what was born in the window, though. prev is live again and its
 		// definition never changed, so an older backend is serving exactly what
@@ -145,33 +236,74 @@ func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 		// either config — from prev if its Get read Current just before the
 		// store — and dropping one of those costs a respawn, which is the
 		// cheaper side of the trade.
-		for _, name := range d.Changed {
-			r.pool.EvictServerSince(name, windowStart)
-		}
-		for _, name := range d.Added {
-			r.pool.EvictServerSince(name, windowStart)
-		}
-		// This narrows the window; it cannot close it. A Get that resolved
-		// next and is still spawning when the loops above run inserts its
-		// backend afterwards, and nothing collects that one. Closing it for
-		// real means stamping entries with the revision they were built from
-		// and rejecting stale inserts — the pool has no such notion today.
-		return Delta{}, err
+		//
+		// This narrows the window; it cannot close it. A Get that resolved rev
+		// and is still spawning when the eviction runs inserts its backend
+		// afterwards, and nothing collects that one. Closing it for real means
+		// stamping entries with the revision they were built from and rejecting
+		// stale inserts — the pool has no such notion today.
+		ev := eviction{servers: concat(d.Changed, d.Added), since: windowStart}
+		// Named separately from the caller's own failure line, which knows only
+		// that the apply returned an error: "the last good config keeps
+		// serving" is the whole truth about the wire and none of it about the
+		// pools, and a revision that reached them is exactly the case an
+		// operator reading a repeating failure has to be able to rule out.
+		r.log.Warn("config revision refused and rolled back; the previous config is live again, "+
+			"and any backend the revision managed to start is dropped",
+			"servers", ev.servers, "err", err)
+		return Delta{}, ev, err
 	}
+	r.adopt(rev, next)
 
 	// Removed and changed servers drop their pooled backends: removed so
 	// nothing lingers, changed so the next call spawns from the new definition
 	// (e.g. rotated credentials).
-	for _, name := range d.Removed {
-		r.pool.EvictServer(name)
-	}
-	for _, name := range d.Changed {
-		r.pool.EvictServer(name)
-	}
+	ev := eviction{servers: concat(d.Removed, d.Changed)}
 
 	r.log.Info("config reloaded",
 		"added", d.Added, "removed", d.Removed, "changed", d.Changed)
-	return d, nil
+	return d, ev, nil
+}
+
+// adopt makes rev the live config and takes the bookkeeping every revision the
+// gateway accepts needs. next is the caller's own pointer, which warnNATSDrift
+// needs in order to tell a nil revision from an empty one.
+func (r *Reconciler) adopt(rev, next *config.Config) {
+	r.cur.Store(rev)
+	r.failed, r.failedSeen = "", false
+	r.warnNATSDrift(next)
+}
+
+// failedBefore reports whether rev is the revision whose apply failed last.
+func (r *Reconciler) failedBefore(rev *config.Config) bool {
+	key, ok := revisionKey(rev)
+	return ok && r.failedSeen && key == r.failed
+}
+
+// recordFailed remembers a revision the wire refused. One that cannot be
+// marshalled is never recognised as a repeat: there is no value that could
+// stand for a revision nothing can identify, and treating an unidentifiable one
+// as "the same again" would suppress a publish that has to happen.
+func (r *Reconciler) recordFailed(rev *config.Config) {
+	r.failed, r.failedSeen = revisionKey(rev)
+}
+
+// revisionKey identifies a revision by content, for the reason serverEqual
+// marshals: a field-by-field comparison would rot as config.Config grows.
+func revisionKey(c *config.Config) (string, bool) {
+	b, err := json.Marshal(c)
+	if err != nil {
+		return "", false
+	}
+	return string(b), true
+}
+
+func concat(a, b []string) []string {
+	if len(a)+len(b) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(a)+len(b))
+	return append(append(out, a...), b...)
 }
 
 // warnNATSDrift reports a `nats` block that has moved away from the one the
@@ -187,9 +319,16 @@ func (r *Reconciler) Apply(next *config.Config) (Delta, error) {
 //
 // Measured against the FIRST applied revision rather than the predecessor: the
 // divergence is from what is RUNNING, and a later unrelated edit must not make
-// an already-diverged block look settled. That costs no repetition in practice,
-// because sources emit on content change (see pkg/configsource), so this is one
-// line per edit rather than one per poll.
+// an already-diverged block look settled.
+//
+// Called only for a revision the gateway ADOPTS, which is what keeps it to one
+// line per edit rather than one per poll. Sources emit on content change, so an
+// adopted revision arrives once; a REFUSED one arrives every tick, because Run
+// hands it back to the source to re-deliver (see configsource.Retryable), and
+// warning from the top of an apply would report the same unapplied block for as
+// long as the operator left it in the file. The same call site is what makes
+// the boot block the first block the gateway actually ran on, rather than
+// whatever the first attempt happened to say.
 func (r *Reconciler) warnNATSDrift(next *config.Config) {
 	if next == nil {
 		return // a nil revision is "every server removed"; it asserts nothing

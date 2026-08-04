@@ -62,7 +62,7 @@ type NATS struct {
 	// Logger is optional; boot retries log at warn.
 	Logger *slog.Logger
 
-	changeFilter
+	filterSet
 }
 
 func (s *NATS) requestTimeout() time.Duration {
@@ -129,8 +129,10 @@ func (s *NATS) fetch(ctx context.Context) (*config.Config, error) {
 // Watch implements Source.
 func (s *NATS) Watch(ctx context.Context) <-chan Update {
 	out := make(chan Update)
+	filter, release := s.attach()
 	go func() {
 		defer close(out)
+		defer release()
 
 		// Subscribe to change events BEFORE the initial fetch so a change
 		// racing startup can't be missed; events just coalesce into a pending
@@ -151,7 +153,7 @@ func (s *NATS) Watch(ctx context.Context) <-chan Update {
 		}
 
 		emitIfChanged := func(cfg *config.Config) {
-			if !s.changed(cfg) {
+			if !filter.changed(cfg) {
 				return
 			}
 			send(ctx, out, Update{Config: cfg})

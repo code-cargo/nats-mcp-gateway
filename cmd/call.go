@@ -90,7 +90,7 @@ func runCall(c *CallCmd, g *Globals) error {
 		opts = append(opts, nats.UserCredentials(c.Creds))
 	}
 	if c.InboxPrefix != "" {
-		if err := wire.ValidateSubjectPrefix(c.InboxPrefix); err != nil {
+		if err := wire.ValidateInboxPrefix(c.InboxPrefix); err != nil {
 			return fmt.Errorf("--inbox-prefix: %w", err)
 		}
 		opts = append(opts, nats.CustomInboxPrefix(c.InboxPrefix))

@@ -18,6 +18,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
@@ -78,7 +80,7 @@ func TokenSafe(s string) bool {
 // check permits "*" anywhere and NATS binds the result, so "mcp.*" quietly
 // subscribes this instance to every prefix in the account.
 func ValidateSubjectPrefix(s string) error {
-	return validateTokenRun("subject prefix", s)
+	return validateTokenRun("subject prefix", s, wireTokenSafe, "")
 }
 
 // ValidateQueueGroup checks that s is usable as a NATS queue group — the same
@@ -92,23 +94,72 @@ func ValidateSubjectPrefix(s string) error {
 // naming neither the setting nor the value, by which point the process has
 // connected and looks healthy.
 func ValidateQueueGroup(s string) error {
-	return validateTokenRun("queue group", s)
+	return validateTokenRun("queue group", s, wireTokenSafe, "")
+}
+
+// ValidateInboxPrefix checks an inbox prefix, which is held to the narrow
+// alphabet the other two are not: nats.CustomInboxPrefix is the consumer, the
+// setting has been validated since before it had company, and no deployment
+// was relying on a wider one.
+func ValidateInboxPrefix(s string) error {
+	return validateTokenRun("inbox prefix", s, TokenSafe, `A-Za-z0-9_-`)
 }
 
 // validateTokenRun walks a dotted run of literal subject tokens. what names
-// the run in the error ("subject prefix", "queue group").
-func validateTokenRun(what, s string) error {
+// the run in the error ("subject prefix", "queue group"); safe decides the
+// alphabet, which differs by who wrote the value; alphabet spells that
+// alphabet out for the caller whose rule is small enough to state, and is
+// empty for the ones whose rule is "what the wire carries" — naming a set
+// there would be a longer and less true answer than naming what is wrong.
+func validateTokenRun(what, s string, safe func(string) bool, alphabet string) error {
 	for _, tok := range strings.Split(s, ".") {
 		switch {
 		case tok == "":
 			return fmt.Errorf("invalid %s %q: empty token (leading, doubled, or trailing dot)", what, s)
 		case strings.ContainsAny(tok, "*>"):
 			return fmt.Errorf("invalid %s %q: wildcards (* and >) are not allowed", what, s)
-		case !TokenSafe(tok):
-			return fmt.Errorf("invalid %s %q: token %q is not subject-token safe (%s)", what, s, tok, `A-Za-z0-9_-`)
+		case !safe(tok):
+			if alphabet != "" {
+				return fmt.Errorf("invalid %s %q: token %q is not usable as a subject token (%s)", what, s, tok, alphabet)
+			}
+			return fmt.Errorf("invalid %s %q: token %q is not usable as a subject token", what, s, tok)
 		}
 	}
 	return nil
+}
+
+// wireTokenSafe is what the WIRE carries in a token, as opposed to what this
+// project generates.
+//
+// TokenSafe stays narrow on purpose: it guards names that arrive from a caller
+// — tenant, user, server, claim id — where a small alphabet is itself the
+// security property. A subject prefix, a queue group and an auth subject are
+// none of those. They are typed once into a config by the operator, two of
+// them went unvalidated until the checks were added, and NATS carries far more
+// than A-Za-z0-9_- in a token. Holding them to the caller-derived alphabet
+// refuses "$MCP.v1", "mcp:v1", "tenant.acmé", "mcpgw/acme" and "ctl:creds" —
+// values that were being served before anything validated them. On the fetch
+// path that refusal is fatal at boot but survivable on reload, so the fleet
+// keeps running and only restarting pods fail, which is the worst way to find
+// out.
+//
+// What the checks are FOR is unchanged, because the hazard was never the
+// alphabet: a wildcard, a space or an empty token in the wire prefix widens
+// the authz-bearing subscription. validateTokenRun still refuses those, and a
+// NUL would truncate the subject at the socket.
+func wireTokenSafe(tok string) bool {
+	// Valid UTF-8 first, because ContainsFunc decodes an invalid byte as
+	// utf8.RuneError and unicode.IsPrint(U+FFFD) is true — so without this a
+	// raw 0x80 or a lone surrogate byte passes both tests below, and the
+	// regexp this replaced refused it. "What the wire carries" is a wider
+	// alphabet than TokenSafe's, not a licence to bind a subject that is not a
+	// valid string.
+	if !utf8.ValidString(tok) {
+		return false
+	}
+	return !strings.ContainsFunc(tok, func(r rune) bool {
+		return unicode.IsSpace(r) || !unicode.IsPrint(r)
+	})
 }
 
 // NameToken maps a raw MCP name (tool name, prompt name, resource URI) to its
