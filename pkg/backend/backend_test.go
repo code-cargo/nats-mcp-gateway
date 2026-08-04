@@ -1137,3 +1137,43 @@ func TestAnUnattendedSpawnIsNotBornIdle(t *testing.T) {
 	require.NotNil(t, p.entries[key],
 		"a backend that had just finished starting was reaped as idle for over %s", 5*time.Minute)
 }
+
+// The eviction window is a statement about which config a backend came from,
+// so both halves of the pool have to be dated by the same event. An in-flight
+// spawn is filtered on when its factory ran; an installed entry used to be
+// filtered on when Connect finished, which for a cold npx spawn is minutes
+// later — so the same backend was spared or killed depending only on whether
+// it happened to finish starting before the eviction ran.
+func TestEvictionDatesAnEntryByItsDefinitionNotItsConnect(t *testing.T) {
+	gate := make(chan struct{})
+	var arrived atomic.Int32
+	p := NewPool(PoolConfig{}, func(Key) (Backend, error) {
+		return &gatedBackend{Backend: fakeBackend(nil), arrived: &arrived, gate: gate}, nil
+	}, nil)
+	t.Cleanup(p.Shutdown)
+
+	key := Key{Server: "s", Tenant: "t"}
+	got := make(chan error, 1)
+	go func() {
+		_, release, err := p.Get(context.Background(), key)
+		if release != nil {
+			release()
+		}
+		got <- err
+	}()
+	require.Eventually(t, func() bool { return arrived.Load() == 1 },
+		10*time.Second, time.Millisecond, "the spawn never reached Connect")
+
+	// The window opens AFTER the definition was read, and Connect finishes
+	// after that — the interleaving a slow backend produces every time.
+	windowStart := time.Now()
+	close(gate)
+	require.NoError(t, <-got)
+
+	p.EvictServerSince("s", windowStart)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	require.NotNil(t, p.entries[key],
+		"a backend whose definition predates the window was evicted for finishing late")
+}

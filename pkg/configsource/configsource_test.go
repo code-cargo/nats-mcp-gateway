@@ -724,6 +724,8 @@ func TestFileRetryRefiresASpentTrigger(t *testing.T) {
 	// through the source.
 	filter, release := f.attach()
 	defer release()
+	reload, unwatch := f.addWatcher()
+	defer unwatch()
 
 	require.True(t, filter.changed(cfgWith("a")), "the revision Run is applying")
 	require.False(t, filter.changed(cfgWith("a")), "a HUP lands mid-apply and is swallowed")
@@ -731,16 +733,16 @@ func TestFileRetryRefiresASpentTrigger(t *testing.T) {
 	f.Retry()
 	// require, not assert: the drain below would block forever otherwise, and a
 	// regression should fail the test, not hang the package.
-	require.Len(t, f.reload, 1, "Retry must replace the trigger the suppressed emit spent")
+	require.Len(t, reload, 1, "Retry must replace the trigger the suppressed emit spent")
 
 	// It must not manufacture one, either — that is what keeps a config that
 	// fails every time from spinning: the re-fired reload emits (the baseline
 	// is clear), which is not a suppression, so the next failure re-arms
 	// nothing.
-	<-f.reload
+	<-reload
 	require.True(t, filter.changed(cfgWith("a")))
 	f.Retry()
-	assert.Empty(t, f.reload, "Retry must not invent a trigger when none was lost")
+	assert.Empty(t, reload, "Retry must not invent a trigger when none was lost")
 }
 
 // Watch owes EVERY consumer an initial config — "the first Update is the
@@ -864,4 +866,42 @@ func TestRunFailedApplyLineDoesNotImplyTheBackendsWereUntouched(t *testing.T) {
 	require.Len(t, got, 1)
 	assert.Contains(t, got[0], "backend pools",
 		"the line has to point at what the apply did to the pools, not just the wire")
+}
+
+// Reload has to reach every live Watch. One shared trigger channel delivers a
+// SIGHUP to whichever goroutine happens to receive it, so a second Watch never
+// re-reads the file — the same contract the per-Watch baseline exists to keep,
+// broken one layer down.
+func TestFileReloadReachesEveryWatch(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gw.json")
+	require.NoError(t, os.WriteFile(path, []byte(`{"servers":{"a":{"transport":"stdio","command":"cmd-a"}}}`), 0o600))
+	f := NewFile(path, 0) // HUP-only: the mode where a lost trigger is lost for good
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	first, second := f.Watch(ctx), f.Watch(ctx)
+
+	for i, ch := range []<-chan Update{first, second} {
+		select {
+		case u := <-ch:
+			require.NoError(t, u.Err)
+			require.NotNil(t, u.Config, "watch %d got no initial config", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("watch %d never received its initial config", i)
+		}
+	}
+
+	require.NoError(t, os.WriteFile(path, []byte(`{"servers":{"b":{"transport":"stdio","command":"cmd-b"}}}`), 0o600))
+	f.Reload()
+
+	for i, ch := range []<-chan Update{first, second} {
+		select {
+		case u := <-ch:
+			require.NoError(t, u.Err)
+			_, ok := u.Config.Servers["b"]
+			assert.True(t, ok, "watch %d got the wrong revision", i)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("watch %d never saw the reload: one shared trigger reaches one watcher", i)
+		}
+	}
 }

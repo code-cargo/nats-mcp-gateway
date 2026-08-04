@@ -1648,7 +1648,7 @@ func TestBuildBackendCredentialFailureCarriesTheCredentialCode(t *testing.T) {
 	_, err := buildBackend(backend.Key{Server: "github", Tenant: "acme"}, srv, resolver, testLogger())
 	require.Error(t, err)
 
-	var credErr *proxy.CredentialError
+	var credErr *cred.Unavailable
 	require.ErrorAs(t, err, &credErr,
 		"the proxy maps this to -32014 by the type, not by reading the message")
 	assert.Contains(t, err.Error(), "acme/github")

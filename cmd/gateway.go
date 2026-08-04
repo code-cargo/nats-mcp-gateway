@@ -827,7 +827,7 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 			// is owed here, and through the same function so the two cannot
 			// drift.
 			//
-			// Returned as proxy.CredentialError so it also arrives under the
+			// Returned as cred.Unavailable so it also arrives under the
 			// same wire code. A bare error from here reaches the caller as
 			// -32010, "the stream broke, re-issue" — and CallerMessage's "do
 			// not retry" would then sit inside the one code that promises
@@ -837,7 +837,7 @@ func buildBackend(key backend.Key, s config.Server, resolver *cred.CachedResolve
 			// boundary, or a concurrent 401 Invalidate.
 			ref := cred.FailureRef()
 			blog.Warn("credential resolution failed while spawning backend", "err", err, "ref", ref)
-			return nil, &proxy.CredentialError{
+			return nil, &cred.Unavailable{
 				Message: fmt.Sprintf("%s/%s: %s", key.Tenant, key.Server, cred.CallerMessage(err, ref)),
 			}
 		}

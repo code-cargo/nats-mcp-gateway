@@ -353,7 +353,7 @@ func TestFactoryCredentialFailureIsACredentialFailure(t *testing.T) {
 	const detail = "helper stderr: sts assume-role failed (token AKIAWOULDBEBAD)"
 	_, wc := stackFactory(t, nil, nil, func(key backend.Key) (backend.Backend, error) {
 		ref := cred.FailureRef()
-		return nil, &CredentialError{Message: fmt.Sprintf("%s/%s: %s", key.Tenant, key.Server,
+		return nil, &cred.Unavailable{Message: fmt.Sprintf("%s/%s: %s", key.Tenant, key.Server,
 			cred.CallerMessage(cred.Terminal(errors.New(detail)), ref))}
 	})
 

@@ -169,6 +169,13 @@ type entry struct {
 	mux      *Mux
 	born     time.Time
 	deadline time.Time // born + MaxLifetime, clamped to credential expiry
+	// defined is when this backend's DEFINITION was read — when the factory
+	// ran, not when Connect finished. The eviction window is a statement about
+	// which config a backend came from, so it has to be measured at the moment
+	// that was decided: born is minutes later for a cold npx spawn, which put
+	// the same backend on either side of the same cutoff depending only on
+	// whether it happened to finish starting first.
+	defined  time.Time
 	lastUsed time.Time
 	inflight int
 	// waiters counts Gets blocked on the sem that have not yet incremented
@@ -461,8 +468,9 @@ func (p *Pool) spawnEntry(ctx context.Context, key Key, sp *spawn) (*entry, erro
 			}
 		}
 		e = &entry{
-			key: key,
-			mux: NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
+			key:     key,
+			defined: sp.built,
+			mux:     NewMux(conn, p.log.With("server", key.Server, "tenant", key.Tenant)),
 			// lastUsed starts at born, not at the zero Time. The reaper reads
 			// now.Sub(e.lastUsed) and nothing else marks an entry young, so a
 			// zero value here is ~2000 years idle: an entry installed by a spawn
@@ -649,11 +657,21 @@ func (p *Pool) EvictServerSince(server string, t time.Time) {
 
 // evictServer drops every connection for the server born after since. The zero
 // time matches everything, which is what EvictServer wants.
+// definedAfter reports whether this entry's definition was read after since.
+// It falls back to born for an entry whose spawn predates the stamp, where the
+// two differ only by one Connect and born is the conservative answer.
+func (e *entry) definedAfter(since time.Time) bool {
+	if e.defined.IsZero() {
+		return e.born.After(since)
+	}
+	return e.defined.After(since)
+}
+
 func (p *Pool) evictServer(server string, since time.Time) {
 	p.mu.Lock()
 	var victims []*Mux
 	for k, e := range p.entries {
-		if k.Server == server && e.born.After(since) {
+		if k.Server == server && e.definedAfter(since) {
 			victims = append(victims, e.mux)
 			delete(p.entries, k)
 		}
@@ -664,7 +682,7 @@ func (p *Pool) evictServer(server string, since time.Time) {
 	// server with its old credentials.
 	kept := p.orphans[:0]
 	for _, e := range p.orphans {
-		if e.key.Server == server && e.born.After(since) {
+		if e.key.Server == server && e.definedAfter(since) {
 			victims = append(victims, e.mux)
 		} else {
 			kept = append(kept, e)

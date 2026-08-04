@@ -32,20 +32,6 @@ import (
 	"github.com/code-cargo/nats-mcp-gateway/pkg/wire"
 )
 
-// CredentialError marks a pool-path failure that is really a credential
-// failure. The pool's factory sits below the layer that owns wire error codes,
-// so everything it returns otherwise reaches the caller as ErrCodeStreamLost —
-// documented at pkg/wire/frame.go as "the stream broke, re-issue", which a
-// client switching on the code will do forever against a refusal that never
-// clears.
-//
-// Message is what the caller is told and nothing more: the factory renders it
-// with cred.CallerMessage, so it carries the category and a correlation ref
-// while the resolver's own text stays in the gateway's log.
-type CredentialError struct{ Message string }
-
-func (e *CredentialError) Error() string { return e.Message }
-
 // CredLookup returns the credential resolver for a server (nil when its
 // credentials are static — the config env/headers path needs no resolution
 // here) and whether they are per-user. Per-user servers are pooled per
@@ -193,14 +179,14 @@ func (p *Proxy) Handler() wire.Handler {
 				return fail(wire.ErrCodeCredentialUnavailable,
 					"backend credentials temporarily unavailable, retry later: "+err.Error(), nil)
 			}
-			var credErr *CredentialError
-			if errors.As(err, &credErr) {
+			var unavailable *cred.Unavailable
+			if errors.As(err, &unavailable) {
 				// The factory's resolve failed — the same failure the request
 				// path above answers, arriving one layer down because that
 				// resolve hit the cache and this one missed it (a TTL boundary,
 				// a concurrent 401 Invalidate). The factory has already logged
 				// the detail against the ref its message carries.
-				return fail(wire.ErrCodeCredentialUnavailable, credErr.Message, nil)
+				return fail(wire.ErrCodeCredentialUnavailable, unavailable.Message, nil)
 			}
 			// Everything else the pool can fail with: the factory's own errors
 			// (which name the backend's executable and argv, a gateway-pod temp

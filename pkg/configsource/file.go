@@ -16,6 +16,7 @@ package configsource
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/config"
@@ -28,28 +29,58 @@ import (
 type File struct {
 	path         string
 	pollInterval time.Duration
-	reload       chan struct{}
 	filterSet
+
+	// mu guards watchers: one trigger channel per live Watch, because Reload
+	// has to reach ALL of them. A single shared channel delivers one HUP to
+	// whichever goroutine happens to receive it, so a second Watch simply
+	// never re-reads — and Retry is worse, since the replacement trigger it
+	// fires for the Watch whose apply failed can be taken by a Watch that was
+	// fine, stranding the first on a revision it never adopted. Poll and NATS
+	// build their triggers per Watch already; this is File catching up.
+	mu       sync.Mutex
+	watchers map[chan struct{}]struct{}
 }
 
 // NewFile builds a file source. pollInterval <= 0 disables polling (reload
 // then comes only from Reload / the initial read); the default when > 0 is the
 // caller's value.
 func NewFile(path string, pollInterval time.Duration) *File {
-	return &File{
-		path:         path,
-		pollInterval: pollInterval,
-		reload:       make(chan struct{}, 1),
-	}
+	return &File{path: path, pollInterval: pollInterval}
 }
 
 // Reload asks the source to re-read the file now. Non-blocking and coalescing:
 // several rapid calls collapse into one reload. Safe to call from a signal
 // handler.
 func (f *File) Reload() {
-	select {
-	case f.reload <- struct{}{}:
-	default:
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for w := range f.watchers {
+		// Coalescing per watcher, not across them: a watcher already holding
+		// an unread trigger will re-read once, which is what several rapid
+		// HUPs ask for anyway.
+		select {
+		case w <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// addWatcher registers one Watch's trigger channel and returns its remover.
+// Called in Watch rather than in the goroutine, so a Reload arriving the
+// instant Watch returns cannot land before the channel exists.
+func (f *File) addWatcher() (chan struct{}, func()) {
+	w := make(chan struct{}, 1)
+	f.mu.Lock()
+	if f.watchers == nil {
+		f.watchers = make(map[chan struct{}]struct{})
+	}
+	f.watchers[w] = struct{}{}
+	f.mu.Unlock()
+	return w, func() {
+		f.mu.Lock()
+		delete(f.watchers, w)
+		f.mu.Unlock()
 	}
 }
 
@@ -76,9 +107,11 @@ func (f *File) Retry() {
 func (f *File) Watch(ctx context.Context) <-chan Update {
 	out := make(chan Update)
 	filter, release := f.attach()
+	reload, unwatch := f.addWatcher()
 	go func() {
 		defer close(out)
 		defer release()
+		defer unwatch()
 		emit := func() {
 			cfg, err := config.Load(f.path)
 			if err != nil {
@@ -103,7 +136,7 @@ func (f *File) Watch(ctx context.Context) <-chan Update {
 			select {
 			case <-ctx.Done():
 				return
-			case <-f.reload:
+			case <-reload:
 				emit()
 			case <-tick:
 				emit()
