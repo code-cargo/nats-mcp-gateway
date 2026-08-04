@@ -575,6 +575,16 @@ func (c *Config) validate() error {
 		}
 	}
 	if c.Pool.IdleTTL != "" {
+		// The counts share the durations' rule and their reason: the pool
+		// substitutes its default for anything <= 0, so a negative here is not
+		// a smaller pool, it is 32/16 with nothing said about the value that
+		// was asked for.
+		if c.Pool.MaxConcurrent < 0 {
+			return fmt.Errorf("pool.maxConcurrent: must not be negative (got %d)", c.Pool.MaxConcurrent)
+		}
+		if c.Pool.MaxProcsPerTenant < 0 {
+			return fmt.Errorf("pool.maxProcsPerTenant: must not be negative (got %d)", c.Pool.MaxProcsPerTenant)
+		}
 		if err := validateDuration("pool.idleTtl", c.Pool.IdleTTL); err != nil {
 			return err
 		}

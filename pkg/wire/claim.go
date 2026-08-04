@@ -54,6 +54,12 @@ const (
 	// claimOpTimeout bounds one store operation regardless of caller ctx.
 	claimOpTimeout = 30 * time.Second
 
+	// claimEagerDeleteCooldown is how long one failed cleanup delete suppresses
+	// the next. Long enough that a read-only grant pays it about once per
+	// bucket-TTL window, short enough that a transient failure costs at most
+	// one window of un-deleted claims.
+	claimEagerDeleteCooldown = time.Minute
+
 	// claimEagerDeleteTimeout bounds only the cleanup delete at the end of a
 	// Fetch, which the caller is waiting on with the body already in hand.
 	//
@@ -118,14 +124,19 @@ type ObjectClaims struct {
 	mu      sync.Mutex
 	buckets map[string]jetstream.ObjectStore // tenant -> handle (Put side)
 
-	// noEagerDelete latches once a cleanup delete has failed, so the cost
-	// above is paid once per process rather than once per claimed response.
-	// A delete that failed is either refused — the documented read-only grant,
-	// which is a permanent property of this identity — or the store is
-	// unhealthy; the next attempt costs the same and achieves the same
-	// nothing. Never unlatched, because the bucket TTL is the backstop by
-	// design and the eager delete is an optimization on top of it.
-	noEagerDelete atomic.Bool
+	// eagerDeleteRetryAt (unix nanos) suppresses the cleanup delete for a
+	// while after one fails, so the cost above is paid once per cooldown
+	// rather than once per claimed response.
+	//
+	// A cooldown and not a latch. The failure this is for IS permanent — the
+	// documented read-only client grant cannot delete, ever — but the same
+	// signal arrives from a leadership blip or a store slow enough to miss the
+	// bound, and those are not. Latching on one of those disabled eager
+	// cleanup for every tenant for the life of the process, leaving every
+	// claim to the bucket TTL and walking the bucket toward maxBytes, past
+	// which Put fails and oversize responses degrade to -32012 on a store that
+	// is perfectly healthy. Re-probing costs one delete per cooldown.
+	eagerDeleteRetryAt atomic.Int64
 }
 
 // Put implements ClaimStore. It creates the tenant's bucket on first use.
@@ -247,18 +258,21 @@ func (o *ObjectClaims) Fetch(ctx context.Context, tenant, id string) ([]byte, er
 		return nil, fmt.Errorf("wire: claim exceeds the %d byte limit", claimMaxBody)
 	}
 	// Eager cleanup; TTL is the backstop when this is denied or we die here.
-	if !o.noEagerDelete.Load() {
+	if now := time.Now(); now.UnixNano() >= o.eagerDeleteRetryAt.Load() {
 		dctx, dcancel := context.WithTimeout(ctx, claimEagerDeleteTimeout)
 		err := obs.Delete(dctx, id)
 		dcancel()
-		// Latched only for a failure of OURS. The caller's context ending is
-		// the ordinary shape of an MCP client that cancelled or went away
-		// microseconds after its body was read, and it says nothing about
-		// whether this identity may delete — reading it as a refusal would let
-		// one impatient client disable eager cleanup for every tenant this
-		// process serves, for the rest of its life.
-		if err != nil && ctx.Err() == nil {
-			o.noEagerDelete.Store(true)
+		switch {
+		case err == nil:
+			o.eagerDeleteRetryAt.Store(0)
+		case ctx.Err() == nil:
+			// Counted only for a failure of OURS. The caller's context ending
+			// is the ordinary shape of an MCP client that cancelled or went
+			// away microseconds after its body was read, and says nothing
+			// about whether this identity may delete — reading it as a refusal
+			// would let one impatient client suppress cleanup for every tenant
+			// this process serves.
+			o.eagerDeleteRetryAt.Store(now.Add(claimEagerDeleteCooldown).UnixNano())
 		}
 	}
 	return body, nil

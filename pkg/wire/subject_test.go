@@ -182,7 +182,9 @@ func TestOperatorTokenRunsAcceptWhatTheWireCarries(t *testing.T) {
 		"mcp.*", "mcp.>", // subscribes this instance to every prefix in the account
 		"mcp..v1", ".mcp", "mcp.", // an empty token is not the subject that was written
 		"mcp v1", "mcp.\tv1", // micro rejects this at the first apply, anonymously
-		"mcp.v\x001", // a NUL truncates the subject at the socket
+		"mcp.v\x001",       // a NUL truncates the subject at the socket
+		"mcp.v\x80",        // not valid UTF-8 at all
+		"mcp.\xed\xa0\x80", // a lone surrogate
 	} {
 		assert.Error(t, ValidateSubjectPrefix(s), s)
 		assert.Error(t, ValidateQueueGroup(s), s)

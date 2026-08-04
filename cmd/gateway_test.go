@@ -1535,6 +1535,9 @@ func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
 				"BASH_ENV":              "/tmp/evil.sh",
 				"PERL5OPT":              "-Mevil",
 				"BASH_FUNC_ls%%":        "() { evil; }",
+				"LOCPATH":               "/tmp/evil",
+				"NLSPATH":               "/tmp/evil/%N",
+				"GLIBC_TUNABLES":        "glibc.malloc.check=1",
 				// npx is the README's own stdio shape, and npm takes its whole
 				// config from the environment — folding case on the prefix, so
 				// no list of spellings would have covered it.
@@ -1573,6 +1576,7 @@ func TestCredentialEnvCannotRedirectCodeExecution(t *testing.T) {
 		"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PATH", "HOME",
 		"PYTHONPATH", "BASH_ENV", "PERL5OPT", "BASH_FUNC_ls%%", "NOT=A KEY",
 		"npm_config_script_shell", "NPM_CONFIG_NODE_OPTIONS", "NpM_cOnFiG_script_shell",
+		"LOCPATH", "NLSPATH", "GLIBC_TUNABLES",
 	} {
 		assert.NotContains(t, sb.Env, key, "a resolver set %s on the backend subprocess", key)
 	}
@@ -1829,6 +1833,18 @@ func TestSharedEnvVarsDoNotRefuseTheFileSourceBoot(t *testing.T) {
 		require.Error(t, err)
 		assert.NotContains(t, err.Error(), "fl4gs3cret")
 		assert.Contains(t, err.Error(), "other:4222")
+	})
+
+	// A creds path is not a URL. Redacting by shape rewrote one containing an
+	// "@" into a path nobody configured, in the message whose whole purpose is
+	// to name the value in force.
+	t.Run("a credentials path is reported intact", func(t *testing.T) {
+		const path = "/creds/user@corp.com/gw.creds"
+		t.Setenv("NATSMCP_CREDS", path)
+		boot, err := parse(t).bootParams(sourceFile)
+		require.NoError(t, err)
+		require.Len(t, boot.ignoredFlags, 1)
+		assert.Contains(t, boot.ignoredFlags[0], path)
 	})
 
 	// The same setting aimed at THIS process still fails: an argv the operator

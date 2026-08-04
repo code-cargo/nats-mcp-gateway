@@ -335,9 +335,22 @@ func (c *CachedResolver) Invalidate(tenant, user, server string) {
 	if time.Now().Before(e.invalidateAt) {
 		return
 	}
-	if e.creds != nil {
-		e.gone = e.creds
+	// Nothing cached to drop: either a previous Invalidate dropped it and no
+	// refetch has answered, or the source has never answered at all. The
+	// promise still holds — the next resolve refetches immediately, backoff
+	// cleared — because that is how a key recovers the moment its source does.
+	// But it is bounded here rather than in store, which a FAILED refetch
+	// never reaches: without a window, a source that is down has its backoff
+	// cleared by every rejection at request rate, which is the hammering the
+	// window exists to stop.
+	if e.creds == nil {
+		e.fails, e.lastErr, e.retryAt = 0, nil, time.Time{}
+		e.futile++
+		e.invalidateAt = time.Now().Add(failBackoff(e.futile))
+		e.epoch++
+		return
 	}
+	e.gone = e.creds
 	e.creds = nil
 	// The count as well as the deadline, because the next deadline is computed
 	// from the count. Clearing only retryAt admits one immediate attempt and

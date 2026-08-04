@@ -166,6 +166,12 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 		log.Warn("file source ignores a setting supplied by a shared environment variable", "detail", ignored)
 	}
 
+	// Before the connect, not after: this warns that a credential is ABOUT to
+	// cross an unencrypted hop, and nats.Connect puts it in the CONNECT frame.
+	// Logged later it describes something already done, and a boot that fails
+	// anywhere between would never print it at all.
+	warnPlaintextNATSURL(log, boot.url)
+
 	opts := []nats.Option{nats.Name("natsmcp-gateway"), nats.MaxReconnects(-1)}
 	if boot.credsFile != "" {
 		opts = append(opts, nats.UserCredentials(boot.credsFile))
@@ -310,7 +316,6 @@ func runGateway(c *GatewayCmd, g *Globals, version string) error {
 	}()
 
 	log.Info("gateway starting", "nats", redactNATSURL(boot.url), "source", kind.describe(c))
-	warnPlaintextNATSURL(log, boot.url)
 
 	// Run the config loop. It returns when ctx is cancelled (signal) or on a
 	// fatal initial-config error.
@@ -479,8 +484,20 @@ func (c *GatewayCmd) bootParams(kind sourceKind) (bootParams, error) {
 			return bootParams{}, fmt.Errorf("%s must not be negative (got %s)", d.flag, d.val)
 		}
 	}
-	if c.ClaimMaxBytes < 0 {
-		return bootParams{}, fmt.Errorf("--claim-max-bytes must not be negative (got %d)", c.ClaimMaxBytes)
+	// The pool's two counts as well, for exactly the same reason: PoolConfig
+	// substitutes 32 and 16 for anything <= 0, so a negative is the default
+	// rather than a smaller pool.
+	for _, n := range []struct {
+		flag string
+		val  int64
+	}{
+		{"--pool-max-concurrent", int64(c.PoolMaxConcurrent)},
+		{"--pool-max-procs-per-tenant", int64(c.PoolMaxProcsPerTenant)},
+		{"--claim-max-bytes", c.ClaimMaxBytes},
+	} {
+		if n.val < 0 {
+			return bootParams{}, fmt.Errorf("%s must not be negative (got %d)", n.flag, n.val)
+		}
 	}
 
 	boot := bootParams{
@@ -604,25 +621,35 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) ([]string, error) {
 	// setting this source was never going to read, which is the trade the
 	// comment above already declines to make. An explicit flag still fails,
 	// because that one was aimed at this process.
-	checkShared := func(flag, env, field string, conflict bool, got, inDoc string) {
+	checkShared := func(flag, env, field string, conflict bool, got, inDoc string, isURL bool) {
 		if !conflict {
 			return
 		}
+		// isURL rather than sniffing the value, because which settings carry
+		// a credential inline is known HERE and unknowable from the string: a
+		// creds path like /creds/user@corp.com/gw.creds is not a URL, and a
+		// redactor guessing from shape rewrote it into a path nobody
+		// configured. Compared raw and reported redacted — the comparison asks
+		// which variable supplied this, which only the exact bytes answer.
+		shown, shownDoc := got, inDoc
+		if isURL {
+			shown, shownDoc = redactNATSURL(got), redactNATSURL(inDoc)
+		}
 		if suppliedByEnv(env, got) {
 			ignored = append(ignored, fmt.Sprintf("--%s=%s (%s) is ignored by the file source; %s=%s is in force",
-				flag, settingValue(got), env, field, settingValue(inDoc)))
+				flag, settingValue(shown), env, field, settingValue(shownDoc)))
 			return
 		}
-		check(flag, env, field, conflict, got, inDoc)
+		check(flag, env, field, conflict, shown, shownDoc)
 	}
 	checkShared("nats-url", "NATSMCP_NATS_URL", "nats.url",
-		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url)
+		c.NatsURL != "" && c.NatsURL != defaultNatsURL && c.NatsURL != boot.url, c.NatsURL, boot.url, true)
 	// Either name may have supplied this: the pair are aliases of each other on
 	// every subcommand, so the message has to name the one the operator
 	// actually exported. Naming the other sends them to unset a variable they
 	// never set, which does not clear the error.
 	checkShared("nats-creds", credsEnvName(c.NatsCreds), "nats.credsFile",
-		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile)
+		c.NatsCreds != "" && c.NatsCreds != boot.credsFile, c.NatsCreds, boot.credsFile, false)
 	// Against the prefix the wire will actually bind, for the same reason the
 	// queue group and the pool are: wire.Serve owns this default, so a document
 	// that omits the field is not asking for the empty prefix.
@@ -632,9 +659,9 @@ func (c *GatewayCmd) checkFileSourceFlags(boot bootParams) ([]string, error) {
 	}
 	checkShared("subject-prefix", "NATSMCP_SUBJECT_PREFIX", "nats.subjectPrefix",
 		c.SubjectPrefix != "" && c.SubjectPrefix != defaultSubjectPrefix && c.SubjectPrefix != effPrefix,
-		c.SubjectPrefix, effPrefix)
+		c.SubjectPrefix, effPrefix, false)
 	checkShared("inbox-prefix", "NATSMCP_INBOX_PREFIX", "nats.inboxPrefix",
-		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix)
+		c.InboxPrefix != "" && c.InboxPrefix != boot.inboxPrefix, c.InboxPrefix, boot.inboxPrefix, false)
 	// Compared against the group the wire will actually join, not against the
 	// document's silence: wire.DefaultQueueGroup owns this default precisely so
 	// every source gets it, so pinning a flag to the value it already computes
@@ -725,13 +752,7 @@ func credsEnvName(got string) string {
 // document field reads as "" rather than as nothing at all.
 func settingValue(v any) string {
 	if s, ok := v.(string); ok {
-		// Redacted because two of the settings rendered here are NATS URLs and
-		// a NATS URL carries its credential inline — the README's own canonical
-		// form is nats://gw:pw@nats:4222. This text is built on both paths: the
-		// fatal one, which a person reads once, and the ignored one, which goes
-		// to the log. Non-URL values are unaffected; redactNATSURL only rewrites
-		// an authority that has userinfo in it.
-		return fmt.Sprintf("%q", redactNATSURL(s))
+		return fmt.Sprintf("%q", s)
 	}
 	return fmt.Sprint(v)
 }
@@ -918,7 +939,10 @@ var (
 		// deliberately (the gateway's PATH, a private empty HOME), so these
 		// are also the two the reply would be overriding rather than adding.
 		"PATH": {}, "HOME": {},
-		"GCONV_PATH": {}, // glibc loads charset modules from it
+		// The glibc path family, which all name somewhere it loads from or
+		// reads before main: charset modules, locale archives, message
+		// catalogs, and the tunables that steer the loader itself.
+		"GCONV_PATH": {}, "LOCPATH": {}, "NLSPATH": {}, "GLIBC_TUNABLES": {},
 		// node
 		"NODE_OPTIONS": {}, "NODE_PATH": {}, "NODE_REPL_EXTERNAL_MODULE": {},
 		"NODE_EXTRA_CA_CERTS": {}, // TLS trust is a control, not a credential

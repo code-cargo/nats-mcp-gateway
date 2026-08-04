@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/code-cargo/nats-mcp-gateway/pkg/mcpspec"
 )
@@ -147,6 +148,15 @@ func validateTokenRun(what, s string, safe func(string) bool, alphabet string) e
 // the authz-bearing subscription. validateTokenRun still refuses those, and a
 // NUL would truncate the subject at the socket.
 func wireTokenSafe(tok string) bool {
+	// Valid UTF-8 first, because ContainsFunc decodes an invalid byte as
+	// utf8.RuneError and unicode.IsPrint(U+FFFD) is true — so without this a
+	// raw 0x80 or a lone surrogate byte passes both tests below, and the
+	// regexp this replaced refused it. "What the wire carries" is a wider
+	// alphabet than TokenSafe's, not a licence to bind a subject that is not a
+	// valid string.
+	if !utf8.ValidString(tok) {
+		return false
+	}
 	return !strings.ContainsFunc(tok, func(r rune) bool {
 		return unicode.IsSpace(r) || !unicode.IsPrint(r)
 	})

@@ -432,6 +432,6 @@ func TestCallerCancellationDoesNotLatchOffEagerDelete(t *testing.T) {
 	require.Equal(t, []byte("payload"), body)
 	require.Error(t, short.Err(), "the caller's deadline must have expired inside the delete")
 
-	assert.False(t, client.noEagerDelete.Load(),
+	assert.False(t, client.eagerDeleteRetryAt.Load() != 0,
 		"a caller's own deadline disabled eager cleanup for every tenant this process serves")
 }

@@ -1183,3 +1183,48 @@ func assertReaped(t *testing.T, pid int) {
 	}, 10*time.Second, 20*time.Millisecond,
 		"pid %d survived the group kill and still holds the helper's stdout", pid)
 }
+
+// A relative auth.command resolved against the gateway's cwd until the helper
+// was given a scratch working directory; os/exec resolves a command holding a
+// separator against Cmd.Dir, so pointing Dir anywhere turns a working
+// "./scripts/get-creds.sh" into "no such file or directory" on every resolve.
+func TestExecAcceptsARelativeCommand(t *testing.T) {
+	dir := t.TempDir()
+	script := filepath.Join(dir, "creds.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf '{\"env\":{\"K\":\"v\"}}'\n"), 0o755))
+
+	cwd, err := os.Getwd()
+	require.NoError(t, err)
+	require.NoError(t, os.Chdir(dir))
+	t.Cleanup(func() { _ = os.Chdir(cwd) })
+
+	e := &Exec{Command: "./creds.sh"}
+	creds, err := e.Resolve(context.Background(), "acme", "u1", "github")
+	require.NoError(t, err, "a relative helper path must keep working")
+	assert.Equal(t, "v", creds.Env["K"])
+}
+
+// invalidateAt is written by store, which a FAILED refetch never reaches. So
+// with the credential source down, every rejection cleared the failure backoff
+// again — one forced resolve per request against an IdP that is already
+// refusing, which is the hammering the rate limit exists to stop.
+func TestInvalidateDoesNotClearTheBackoffWhileTheSourceIsDown(t *testing.T) {
+	var calls atomic.Int64
+	inner := ResolveFunc(func(context.Context, string, string, string) (*Credentials, error) {
+		calls.Add(1)
+		return nil, errors.New("idp unavailable")
+	})
+	c := Cached(inner, 0)
+
+	// Seed the entry, then let the source start failing.
+	_, _, err := c.ResolveGen(context.Background(), "acme", "u1", "github")
+	require.Error(t, err)
+	first := calls.Load()
+
+	for range 20 {
+		c.Invalidate("acme", "u1", "github")
+		_, _, _ = c.ResolveGen(context.Background(), "acme", "u1", "github")
+	}
+	assert.Less(t, calls.Load()-first, int64(3),
+		"a repeated rejection against a source that is down must not clear the backoff each time")
+}

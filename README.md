@@ -788,6 +788,15 @@ form](#configuration) and [`allowPlaintext`](#configuration).
   stdio backends already made their workdir the same way, but a pod with a
   read-only root filesystem fronting only HTTP backends never touched one.
   Mount an `emptyDir`, or point `TMPDIR` at one.
+- **`oauth-token-exchange` and `oauth-refresh` with a placeholder-free token
+  path are now SHARED, not per-user.** Their grain is read from the path, the
+  way `file`'s always was: one containing `{user}` still resolves per caller,
+  a fixed one is a provably shared credential and is treated as one. That is
+  the fix for those deployments taking `-32014` on every request — but it also
+  changes pooling, since a shared credential no longer keys a backend per
+  caller, so callers in a tenant now share one subprocess or HTTP session
+  where they previously had their own. If you relied on that isolation, put
+  `{user}` in the token path or set `"perUser": true`.
 - **A helper's stdout must close within 3s of the helper itself exiting.**
   Anything it left running that inherited that pipe — a daemon it starts on
   demand, an agent — holds it open, and reaching the delay fails the resolve

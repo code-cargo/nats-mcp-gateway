@@ -216,7 +216,12 @@ func urlSecrets(raw string) []string {
 		if n := strings.Index(u, "://"); n >= 0 {
 			u = u[n+3:]
 		}
-		at := strings.LastIndex(u, "@")
+		// The SAME rule redactNATSURL uses, deliberately: connectFailure's
+		// comment says this exists so there is only one derivation, and two
+		// that disagree is the drift it was written to prevent. A bare
+		// last-"@" reads "gw:pw@host/a" out of "nats://gw:pw@host/a@b" and
+		// scrubs a span that is mostly not the secret.
+		at := userinfoEnd(u)
 		if at < 0 {
 			continue
 		}

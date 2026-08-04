@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -139,7 +141,18 @@ func (e *Exec) Resolve(ctx context.Context, tenant, user, server string) (*Crede
 	}
 	defer func() { _ = os.RemoveAll(home) }()
 
-	cmd := exec.CommandContext(ctx, e.Command, e.Args...)
+	// Resolved against the gateway's cwd BEFORE Dir moves it. os/exec runs a
+	// command containing a separator relative to Cmd.Dir, so pointing Dir at
+	// the scratch home below turns a working "./scripts/get-creds.sh" into
+	// "no such file or directory" on every resolve. A bare name is untouched:
+	// it goes through PATH, which Dir does not affect.
+	command := e.Command
+	if strings.ContainsRune(command, os.PathSeparator) && !filepath.IsAbs(command) {
+		if abs, err := filepath.Abs(command); err == nil {
+			command = abs
+		}
+	}
+	cmd := exec.CommandContext(ctx, command, e.Args...)
 	// The same directory again as the working directory, which is the other
 	// half of that boundary and the one StdioBackend already draws (cmd.Dir =
 	// workDir). Without it the helper runs in the gateway's cwd, so every
